@@ -1,3 +1,12 @@
+/*
+本程序演示如何使用原始UDP套接字发送RoCEv2报文（目前仅发送功能）
+目前本程序仅做到相同设备内的回环发送，未实现完整的RDMA语义（如读写、注册内存等）
+若验证是否成功发送RoCEv2报文，可使用以下命令监听回环设备进行抓包
+sudo tcpdump -i lo -n udp port 4791 -vv
+
+*/
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
