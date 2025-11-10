@@ -99,7 +99,7 @@ int main() {
     qp_attr.path_mtu = IBV_MTU_1024;       // 与接收端一致的 MTU
     qp_attr.dest_qp_num = DEST_QP_NUM;     // 目标 QP 号（接收端 QP 号）
     qp_attr.rq_psn = 0;                    // 接收端起始序
-    qp_flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS | IBV_QP_PATH_MTU | ;  // 新增：添加 IBV_QP_ACCESS_FLAGS 标志
+    qp_flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS | IBV_QP_PATH_MTU  ;  // 新增：添加 IBV_QP_ACCESS_FLAGS 标志
 
 if (ibv_modify_qp(qp, &qp_attr, qp_flags)) { 
     perror("ibv_modify_qp (RTR) failed"); 

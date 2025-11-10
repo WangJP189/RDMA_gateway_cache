@@ -6,6 +6,13 @@
 1、缓存流程：接收报文后，按连接标识（IP、端口、QP 等）存入对应哈希表项的双向链表，链表按 PSN 排序。
 2、滑动窗口：通过维护每个连接的 PSN 范围（min_psn/max_psn）实现类似滑动窗口的机制，NACK 重传时从指定 PSN 开始重传后续报文。
 3、哈希流程：用connection_key作为哈希键，通过哈希表快速定位连接缓存，解决哈希冲突采用链表法。
+
+编译命令：
+gcc pkt_cache.c -o pkt_cache -lpthread -lrdmacm -libverbs
+
+运行命令：
+sudo ./pkt_cache
+
 */
 
 #include <pthread.h>
