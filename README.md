@@ -70,3 +70,51 @@
 
     全局哈希表操作使用 mgr->global_lock 保护（查找、插入 entry、删除 entry 时）。每个 connection_cache 有自己的 cache->lock 保护链表的并发访问与统计更新。
 
+
+
+## 每个代码文件
+
+### rdma-opcode.h
+
+``用途：``定义 RC（Reliable Connected）服务类型的一组 RDMA 操作码（opcode）枚举、报文类型枚举、以及一系列用于判定 opcode 分类的宏（如 RDMA_OP_IS_SEND、RDMA_OP_IS_ACK 等）；对外声明
+
+``如何实现：``通过 enum 定义一组常量值（0x00..0x18 等），并用宏封装范围比较/等于判断以便上层快速分类操作码；提供报文类型枚举（PKT_TYPE_DATA、PKT_TYPE_ACK、PKT_TYPE_NACK 等）供解析模块使用。
+
+
+### rdma_opcode.c
+
+``用途：``实现对操作码的高层判定与描述函数：判断报文类型（get_packet_type_rc）、获取操作码对应的字符串或描述、判断是否需要 AETH 等。
+
+``如何实现：``
+get_packet_type_rc(uint8_t opcode)：使用 rdma_opcode.h 中的分类宏判断属于 DATA/ACK/NACK/READ_RESPONSE/CONTROL 或 UNKNOWN。
+rdma_opcode_rc_to_string / rdma_opcode_get_description：将枚举/opcode 转为可读字符串（便于日志调试）。
+rdma_opcode_is_request / rdma_opcode_is_response：辅助判断请求/响应。
+is_aeth_expected(opcode)：判断给定 opcode 是否应该带 AETH（ACK/NAK/READ_RESP 等返回 true）。
+
+
+### pkt_recv.c
+
+``用途：``：主要负责在用户态通过 AF_PACKET 原始套接字捕获以太网帧，解析 IPv4/UDP + RoCEv2 BTH/AETH，判定报文类型并分派给对应处理器（数据包缓存、ACK 处理、NAK/重传触发等）。代码包含捕获循环、BTH/AETH 解析、对不同 packet type 的业务分支（process_data_packet、process_ack_packet、process_nack_packet）。
+
+``如何实现：``
+创建 raw socket，开启接口混杂模式（create_promiscuous_socket）。
+recvfrom 循环读取帧，快速检查 Ethernet->IP->UDP 层并过滤 RoCEv2 端口（UDP 4791）。
+解析 BTH（12 字节），通过 get_packet_type_rc() 分派到不同 handler。
+Data path：提取应用数据并调用 add_to_connection_cache(...) 将应用数据缓存到连接缓存（缓存结构和操作在另一个源码文件实现）。
+ACK path：解析 AETH，调用 handle_ack_received(...) 以释放缓存中已确认的 PSN。
+NACK path：解析 AETH，调用 handle_nack_received(...) 触发重传逻辑或 fallback 重传（容错策略）。
+
+
+### pkt_recv_internal.h
+
+``用途：``声明 pkt_recv.c 中使用但需要在其它文件中可见的内部函数原型（如 handle_ack_received、handle_nack_received、get_nack_error_description 等）。
+
+
+### pkt_cache.c
+
+``用途：``管理连接级缓存（connection cache），用于存放从发送端捕获的 RDMA 数据报文（按 PSN 有序保存），以实现 ACK 清理、NAK 触发重传、批量/精确重传等功能；可能还包含全局缓存管理（hash 表、全局锁等）。
+
+``如何实现：``
+维护 g_cache_mgr（全局缓存管理器）包含 hash 表数组，每个 hash bucket 链表中保存 hash_table_entry（键+cache）。
+connection_cache 支持双向链表存放 cached_packet（含 psn、dest_qp、data_len、app_data 等），并带有 mutex 保护。
+提供 API：add_to_connection_cache、find_packets_by_psn_range、free_cached_packets、get_connection_psn_range、retransmit_rdma_packet、calculate_hash、create_connection_key、connection_keys_equal 等。
