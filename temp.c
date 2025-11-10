@@ -14,9 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <arpa/inet.h>  
+#include <arpa/inet.h>  // 补充缺失的头文件
 
-// 缓存报文结构
+// 缓存报文结构（保持不变）
 struct cached_packet {
     unsigned char *app_data;          // 应用数据载荷
     int data_len;                     // 数据长度
@@ -27,7 +27,7 @@ struct cached_packet {
     struct cached_packet *prev;       // 前一个节点（双向链表）
 };
 
-// 每个连接的缓存队列
+// 每个连接的缓存队列（保持不变）
 struct connection_cache {
     struct cached_packet *head;       // 队列头（最小PSN）
     struct cached_packet *tail;       // 队列尾（最大PSN）
@@ -41,7 +41,7 @@ struct connection_cache {
     pthread_mutex_t lock;             // 连接级锁
 };
 
-// IPv4连接标识键
+// IPv4连接标识键（保持不变）
 struct connection_key {
     uint32_t src_ip;                  // 源IP
     uint32_t dst_ip;                  // 目的IP
@@ -53,14 +53,14 @@ struct connection_key {
     uint16_t pkey;                    // 分区键
 };
 
-// 哈希表节点
+// 哈希表节点（保持不变）
 struct hash_table_entry {
     struct connection_key key;        // 连接标识
     struct connection_cache *cache;   // 对应的缓存队列
     struct hash_table_entry *next;    // 哈希冲突链表
 };
 
-// 全局缓存管理器
+// 全局缓存管理器（保持不变）
 struct cache_manager {
     struct hash_table_entry **hash_table;   // 哈希表
     size_t hash_table_size;                 // 哈希表大小
@@ -73,22 +73,10 @@ struct cache_manager {
 };
 
 // 哈希计算函数（优化哈希分布）
-/*
- * calculate_hash
- * 目的：根据连接键生成哈希槽索引，用于在全局哈希表中快速定位连接缓存。
- * 输入：
- *   - key: 指向 connection_key 的指针，包含 src/dst IP、端口、QP、service_type、pkey 等字段
- *   - table_size: 哈希表大小（槽数），返回值为 [0, table_size-1]
- * 输出：返回哈希索引（uint32_t）
- * 实现要点与注意事项：
- *   - 使用简单的 djb2 风格的混合（移位+加法）来混合多个字段，包含 src_qp 和 dest_qp
- *   - 必须保证对所有字段的组合具有足够的离散性以减少冲突
- *   - 不对网络字节序/主机字节序做额外转换，调用方需要在创建 key 时使用一致的字节序
- */
 uint32_t calculate_hash(const struct connection_key *key, size_t table_size)
 {
     uint32_t hash = 5381;
-    /* 将关键字段累加进哈希，顺序决定了分布特性 */
+    // 增加src_qp和dest_qp参与哈希计算（原代码遗漏）
     hash = ((hash << 5) + hash) + key->src_ip;
     hash = ((hash << 5) + hash) + key->dst_ip;
     hash = ((hash << 5) + hash) + key->src_port;
@@ -97,18 +85,11 @@ uint32_t calculate_hash(const struct connection_key *key, size_t table_size)
     hash = ((hash << 5) + hash) + key->dest_qp;
     hash = ((hash << 5) + hash) + key->service_type;
     hash = ((hash << 5) + hash) + key->pkey;
-
+    
     return hash % table_size;
 }
 
 // 连接键比较（补充新增字段比较）
-/*
- * connection_keys_equal
- * 目的：判断两个 connection_key 是否表示同一条连接。
- * 输入：指向两个 key 的指针。
- * 输出：相等返回非 0， 否则返回 0。
- * 注意：比较包含 QP 和 service_type、pkey，确保连接粒度足够细。
- */
 int connection_keys_equal(const struct connection_key *a,
                           const struct connection_key *b)
 {
@@ -123,15 +104,6 @@ int connection_keys_equal(const struct connection_key *a,
 }
 
 // 创建连接键（补充新增字段初始化）
-/*
- * create_connection_key
- * 目的：根据可读的 IP/端口/qp 等信息构造内部使用的 connection_key
- * 输入：字符串形式的 src_ip/dst_ip、端口、src/dest qp、service_type、pkey
- * 输出：返回填充好的 connection_key（按值返回）
- * 注意事项：
- *  - 使用 inet_pton 将 IPv4 文本地址转换为 uint32_t（网络字节序）并写入 key
- *  - 返回的 key 可直接用于 calculate_hash 和 connection_keys_equal
- */
 struct connection_key create_connection_key(const char *src_ip, const char *dst_ip,
                                             uint16_t src_port, uint16_t dst_port,
                                             uint32_t src_qp, uint32_t dest_qp,
@@ -139,7 +111,7 @@ struct connection_key create_connection_key(const char *src_ip, const char *dst_
 {
     struct connection_key key;
     memset(&key, 0, sizeof(key));  // 初始化所有字段
-
+    
     inet_pton(AF_INET, src_ip, &key.src_ip);
     inet_pton(AF_INET, dst_ip, &key.dst_ip);
     key.src_port = src_port;
@@ -148,24 +120,18 @@ struct connection_key create_connection_key(const char *src_ip, const char *dst_
     key.dest_qp = dest_qp;         // 新增字段赋值
     key.service_type = service_type;
     key.pkey = pkey;
-
+    
     return key;
 }
 
 // 打印连接键信息（补充新增字段）
-/*
- * print_connection_key
- * 目的：以可读格式打印 connection_key，用于日志/调试
- * 输入：key 指针
- * 输出：在 stdout 打印连接信息，不修改任何状态
- */
 void print_connection_key(const struct connection_key *key) {
     char src_ip[INET_ADDRSTRLEN];
     char dst_ip[INET_ADDRSTRLEN];
-
+    
     inet_ntop(AF_INET, &key->src_ip, src_ip, INET_ADDRSTRLEN);
     inet_ntop(AF_INET, &key->dst_ip, dst_ip, INET_ADDRSTRLEN);
-
+    
     printf("连接: %s:%d (QP=%u) -> %s:%d (QP=%u), 服务类型=%d, pkey=0x%04x",
            src_ip, key->src_port, key->src_qp,
            dst_ip, key->dst_port, key->dest_qp,
@@ -176,18 +142,6 @@ void print_connection_key(const struct connection_key *key) {
 static struct cache_manager *g_cache_mgr = NULL;
 
 // 初始化缓存管理器（补充滑动窗口默认值）
-/*
- * init_cache_manager
- * 目的：分配并初始化全局缓存管理器 (g_cache_mgr)
- * 输入：
- *   - hash_size: 哈希表槽的数量
- *   - max_conns: 支持的最大连接数
- *   - max_packets_per_conn: 每个连接允许缓存的报文数量上限
- *   - max_bytes_per_conn_mb: 每连接最大缓存字节数（以 MB 为单位传入）
- *   - conn_timeout_seconds: 连接空闲超时时间（秒）
- * 返回：成功返回指向已初始化的 cache_manager，失败返回 NULL
- * 关键点：会分配哈希表数组并初始化全局互斥锁。
- */
 struct cache_manager* init_cache_manager(size_t hash_size, 
                                         size_t max_conns,
                                         size_t max_packets_per_conn,
@@ -227,17 +181,7 @@ struct cache_manager* init_cache_manager(size_t hash_size,
     return mgr;
 }
 
-/*
- * create_connection_cache
- * 目的：为单个连接分配并初始化一个 connection_cache 结构，包含
- *       - 双向链表头尾指针
- *       - 计数器与字节统计
- *       - 滑动窗口相关字段（window_start/window_size）
- *       - 锁与最后活动时间
- * 输入：window_size - 该连接的滑动窗口大小（PSN 个数）
- * 返回：指向已初始化 connection_cache 的指针，失败返回 NULL
- * 注意：调用方应在全局锁或适当上下文中调用此函数以避免竞态。
- */
+// 创建新的连接缓存（初始化滑动窗口）
 struct connection_cache* create_connection_cache(uint32_t window_size)
 {
     struct connection_cache *cache = malloc(sizeof(struct connection_cache));
@@ -265,13 +209,7 @@ struct connection_cache* create_connection_cache(uint32_t window_size)
     return cache;
 }
 
-/*
- * destroy_connection_cache
- * 目的：释放 connection_cache 及其包含的所有缓存报文内存并销毁锁
- * 输入：cache - 需要被销毁的连接缓存
- * 行为：在释放前会对 cache 加锁以确保线程安全，然后逐一 free 节点
- * 注意：调用后不要再访问该 cache 指针
- */
+// 销毁连接缓存（保持不变）
 void destroy_connection_cache(struct connection_cache *cache)
 {
     if (!cache) return;
@@ -291,21 +229,10 @@ void destroy_connection_cache(struct connection_cache *cache)
     free(cache);
 }
 
-/*
- * get_or_create_connection_cache
- * 目的：在全局哈希表中查找给定 key 的连接缓存，若不存在则创建新的
- * 输入：
- *   - mgr: 全局缓存管理器
- *   - key: 连接键
- *   - window_size: 新建连接时的滑动窗口大小
- * 返回：指向 connection_cache 的指针（若查找或创建成功），失败返回 NULL
- * 关键点：
- *   - 在查找或插入哈希表时使用 mgr->global_lock 保护结构一致性
- *   - 在返回现有 cache 时会更新 last_activity 时间
- */
+// 查找或创建连接缓存（适配滑动窗口）
 struct connection_cache* get_or_create_connection_cache(
-    struct cache_manager *mgr, const struct connection_key *key,
-    uint32_t window_size)  // 新增窗口大小参数
+        struct cache_manager *mgr, const struct connection_key *key,
+        uint32_t window_size)  // 新增窗口大小参数
 {
     uint32_t hash_index = calculate_hash(key, mgr->hash_table_size);
     
@@ -360,13 +287,7 @@ struct connection_cache* get_or_create_connection_cache(
     return new_cache;
 }
 
-/*
- * slide_window
- * 目的：根据 cache->window_start 和 window_size 维护滑动窗口，清理
- *       所有 PSN 小于 window_start 的报文，释放空间并更新统计信息。
- * 输入：cache - 需要进行窗口滑动清理的连接缓存
- * 说明：该函数仅在持有 cache->lock 的情况下或由上层在安全上下文调用
- */
+// 滑动窗口清理（新增函数）
 static void slide_window(struct connection_cache *cache)
 {
     // 计算窗口上限
@@ -405,21 +326,7 @@ static void slide_window(struct connection_cache *cache)
     }
 }
 
-/*
- * insert_packet_sorted
- * 目的：将新报文按 PSN 有序插入 connection_cache 的双向链表中，保证链表
- *       从 head 到 tail 的 PSN 单调递增
- * 输入：
- *   - cache: 目标连接缓存
- *   - new_packet: 待插入的缓存节点（caller 已分配并填充 app_data、psn 等字段）
- * 返回：0 成功，-1 失败（例如超出窗口、缓存已满或内存问题）
- * 主要步骤：
- *   1) 检查 new_packet 是否在滑动窗口范围内
- *   2) 检查每连接的最大报文数与字节数限制
- *   3) 在链表中找到插入位置（保持有序），并处理重复 PSN 的替换逻辑
- *   4) 更新统计信息与 last_activity
- * 注意：函数内部会持有并释放 cache->lock，调用方无需额外加锁
- */
+// 有序插入缓存报文（集成滑动窗口）
 int insert_packet_sorted(struct connection_cache *cache, 
                          struct cached_packet *new_packet)
 {
@@ -502,23 +409,7 @@ int insert_packet_sorted(struct connection_cache *cache,
     return 0;
 }
 
-/*
- * add_to_connection_cache
- * 目的：外部调用接口，将收到的应用数据封装为 cached_packet 并插入对应连接的缓存
- * 输入：
- *   - src_ip/dst_ip: 源/目的 IPv4 文本地址
- *   - src_port/dst_port: 源/目的端口
- *   - src_qp/dest_qp: 源/目的 QP 编号（用于区分不同 RDMA 会话）
- *   - service_type/pkey: RDMA 服务类型与分区键
- *   - psn: 该报文的包序列号
- *   - app_data/data_len: 指向应用数据及其长度（函数会复制数据）
- * 返回：0 成功，-1 失败
- * 行为：
- *   1) 构造 connection_key 并通过 get_or_create_connection_cache 获取连接缓存
- *   2) 为 cached_packet 分配内存并复制应用数据
- *   3) 调用 insert_packet_sorted 将节点插入缓存
- * 注意：该接口是线程安全的（内部使用了全局锁 + 连接级锁）
- */
+// 添加报文到连接缓存（适配新增字段）
 int add_to_connection_cache(const char *src_ip, const char *dst_ip,
                            uint16_t src_port, uint16_t dst_port,
                            uint32_t src_qp, uint32_t dest_qp,  // 新增参数
@@ -576,16 +467,7 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
     return 0;
 }
 
-/*
- * find_packets_by_psn_range
- * 目的：为重传或回放提供接口，从指定连接缓存中按 PSN 范围复制一组报文
- * 输入：
- *   - key: 连接键
- *   - start_psn, end_psn: 查找的 PSN 范围（包含边界）
- *   - found_count: 输出参数，返回找到的报文数量
- * 返回：指向复制出的链表头（调用方负责释放），若未找到返回 NULL
- * 要点：函数不会修改原缓存（只是复制数据），因此不会影响原有缓存结构
- */
+// 查找PSN范围报文（不摘除原报文）
 struct cached_packet* find_packets_by_psn_range(const struct connection_key *key,
                                                uint32_t start_psn, uint32_t end_psn,
                                                int *found_count)
@@ -638,15 +520,7 @@ struct cached_packet* find_packets_by_psn_range(const struct connection_key *key
     return result_head;
 }
 
-/*
- * update_window_start
- * 目的：更新指定连接的滑动窗口起始 PSN，并触发对窗口外报文的清理（slide_window）
- * 输入：
- *   - key: 连接键
- *   - new_start: 新的窗口起始 PSN
- * 返回：0 成功，-1 未找到对应连接
- * 说明：若 new_start 大于当前 window_start，则会将 window_start 前移并清理过期报文
- */
+// 更新滑动窗口起始位置（新增函数）
 int update_window_start(const struct connection_key *key, uint32_t new_start)
 {
     if (!g_cache_mgr) return -1;
@@ -677,14 +551,7 @@ int update_window_start(const struct connection_key *key, uint32_t new_start)
     return -1;  // 未找到连接
 }
 
-/*
- * handle_nack_batch_retransmit
- * 目的：当收到 NACK（带 ePSN）时，触发对该 ePSN 及之后报文的重传（批量）
- * 输入：
- *   - key: 代表该连接的连接键（通常来自对端 ACK/NACK 报文的源/目的信息）
- *   - nack_epsn: 需要重传的起始 PSN（ePSN）
- * 行为：遍历缓存并打印重传信息；真实部署应在此处调用实际的重传发送逻辑
- */
+// NACK处理函数（修复编译错误）
 void handle_nack_batch_retransmit(const struct connection_key *key,
                                   uint32_t nack_epsn)
 {
@@ -720,13 +587,7 @@ void handle_nack_batch_retransmit(const struct connection_key *key,
     pthread_mutex_unlock(&g_cache_mgr->global_lock);
 }
 
-/*
- * cleanup_expired_connections
- * 目的：遍历哈希表，清理空闲时间超过超时阈值或没有缓存报文的连接条目
- * 行为：对每个需要删除的 entry，先从哈希链中摘除，再销毁其 connection_cache，
- *       并释放 hash_table_entry 的内存，保证全局连接计数正确更新
- * 注意：会使用全局锁并在每个 connection_cache 上加锁以保证线程安全
- */
+// 清理过期连接（保持不变）
 void cleanup_expired_connections()
 {
     if (!g_cache_mgr) return;
@@ -766,11 +627,7 @@ void cleanup_expired_connections()
     pthread_mutex_unlock(&g_cache_mgr->global_lock);
 }
 
-/*
- * print_all_connections_status
- * 目的：以友好格式输出当前全局缓存管理器中的连接统计信息与每个连接的窗口/PSN 状态
- * 用途：用于人工检查、调试和验证缓存行为
- */
+// 打印连接状态（补充窗口信息）
 void print_all_connections_status() {
     if (!g_cache_mgr) return;
     
@@ -805,15 +662,7 @@ void print_all_connections_status() {
     printf("================\n");
 }
 
-/*
- * retransmit_rdma_packet
- * 目的：占位函数，用于模拟/占用真实环境下的 RDMA 重传逻辑
- * 输入：
- *   - key: 连接信息
- *   - data/len: 待重传的数据（当前实现不实际发送，仅打印）
- *   - dest_qp/psn: 目标 QP 和报文的 PSN
- * 说明：在生产环境中需要替换为真实的发送逻辑（例如修改 AF_PACKET 数据包并发送，或通过 RDMA verbs 发送）
- */
+// 重传函数占位实现
 void retransmit_rdma_packet(const struct connection_key *key, 
                            const unsigned char *data, int len, 
                            uint32_t dest_qp, uint32_t psn) {
@@ -824,57 +673,35 @@ void retransmit_rdma_packet(const struct connection_key *key,
 }
 
 // 主函数测试
-/*
- * main - 测试和演示入口
- * 目的：演示如何初始化缓存管理器、插入报文、触发 NACK 重传、滑动窗口并查看状态。
- * 操作流程（手动验证步骤）：
- *  1) 编译程序：
- *       gcc pkt_cache.c -o pkt_cache -lpthread -lrdmacm -libverbs
- *  2) 运行：
- *       sudo ./pkt_cache
- *     程序会输出以下流程：
- *       - 初始化缓存管理器信息
- *       - 为示例连接插入若干 PSN（1..5）的测试报文
- *       - 模拟 NACK（从 PSN=3 开始）并打印需要重传的报文信息（在真实实现中这里会触发发送）
- *       - 更新滑动窗口起始到 4，并清理窗口外的报文（PSN < 4 将被释放）
- *       - 打印所有连接当前状态（包含窗口/PSN 范围）
- *       - 最后执行一次过期连接清理
- *  验证要点：
- *   - 在插入 5 个报文后，打印应显示缓存成功的日志
- *   - handle_nack_batch_retransmit 应打印出 PSN>=3 的报文信息
- *   - update_window_start(&key,4) 后，print_all_connections_status 中的报文数应减少，min_psn 应至少为 4
- *   - 若将 retransmit_rdma_packet 替换为真实发送逻辑，可以结合抓包工具（tcpdump）验证重传数据包
- * 注意：该 main 只作为本模块的单机自测示例，真实环境中报文来源应来自 pkt_recv 等解析模块或真实网卡抓取
- */
 int main() {
     // 初始化缓存管理器
     g_cache_mgr = init_cache_manager(1024, 1000, 1000, 100, 300);
     if (!g_cache_mgr) return 1;
-
-    /* 测试数据准备：构造一个示例连接 key 并插入 5 个连续 PSN 的报文 */
+    
+    // 测试添加报文
     unsigned char data[] = "test_rdma_packet";
     struct connection_key key = create_connection_key("192.168.1.100", "192.168.1.200",
                                                      1234, 5678, 10, 20, 0, 0xffff);
-
-    // 添加测试报文 PSN=1..5
+    
+    // 添加测试报文
     for (uint32_t psn = 1; psn <= 5; psn++) {
         add_to_connection_cache("192.168.1.100", "192.168.1.200",
                                1234, 5678, 10, 20, 0, 0xffff,
                                psn, data, sizeof(data));
     }
-
+    
     // 模拟NACK触发重传
     printf("\n触发NACK重传（PSN=3及以后）:\n");
     handle_nack_batch_retransmit(&key, 3);
-
+    
     // 模拟窗口滑动
     printf("\n更新窗口起始到4:\n");
     update_window_start(&key, 4);
-
-    // 打印状态供人工检查
+    
+    // 打印状态
     print_all_connections_status();
-
-    // 清理并退出
+    
+    // 清理
     cleanup_expired_connections();
     return 0;
 }
