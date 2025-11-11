@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "ib_user_verbs.h": "c",
+        "pthread.h": "c"
+    }
+}

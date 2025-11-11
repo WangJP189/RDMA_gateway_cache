@@ -1,3 +1,9 @@
+/*
+编译命令：
+gcc recv_test_cache.c -o receiver -lpthread -libverbs
+*/
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +12,7 @@
 #include <sys/time.h>
 #include <rdma/rdma_verbs.h>
 #include <rdma/ib_user_verbs.h>
+#include <unistd.h>  // 解决 usleep 声明问题
 
 // 缓存报文结构（与发送端一致）
 struct cached_packet {
@@ -471,7 +478,17 @@ int init_recv_rdma() {
 
     // QP状态转换: INIT -> RTR
     attr.qp_state = IBV_QPS_RTR;
-    ret = ibv_modify_qp(recv_ctx.qp, &attr, IBV_QP_STATE);
+    // 对于UD类型QP，需要设置地址句柄属性
+    struct ibv_ah_attr ah_attr = {
+        .is_global = 1,               // 使用全局GID
+        .dgid = remote_gid,           // 发送端的GID（需要从发送端获取）
+        .sgid_index = 0,              // 本地GID索引
+        .port_num = 1,                // 端口号
+        .pkey_index = 0               // PKey索引
+    };
+    attr.ah_attr = ah_attr;  // 补充地址信息
+    ret = ibv_modify_qp(recv_ctx.qp, &attr, 
+                    IBV_QP_STATE | IBV_QP_AH_ATTR);  // 注意修改标志位
     if (ret != 0) {
         perror("ibv_modify_qp to RTR failed");
         goto cleanup;
@@ -571,7 +588,7 @@ int main() {
         inet_pton(AF_INET, "192.168.239.133", &key.dst_ip);  // 接收端IP
         key.src_port = 1234;
         key.dst_port = 5678;
-        key.src_qp = wc.udp.remote_qpn;  // 从完成队列获取发送端QP
+    key.src_qp = wc.src_qp;  // 从完成队列获取发送端QP (使用 wc.src_qp)
         key.dest_qp = recv_ctx.qp->qp_num;
         key.service_type = 0;
         key.pkey = 0xffff;
