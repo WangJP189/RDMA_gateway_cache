@@ -4,6 +4,11 @@ gcc pkt_cache_send.c -o pkt_cache_send -lpthread -lrdmacm -libverbs
 */
 
 
+#define RXE_ETH1_GUID 0x020c29fffe1001ff
+#define RXE_ETH3_GUID 0x020c29fffe10011d
+#define DEFAULT_QKEY 0x11111111  // 统一QKey
+#define DEFAULT_PKEY 0xffff      // 通用PKey
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -524,55 +529,56 @@ int init_rdma() {
 }
 
 // 初始化QP状态（修复UD类型配置）
+// 修改QP初始化函数（RTR和RTS阶段）
 int init_qp(uint32_t remote_qp_num, const union ibv_gid *remote_gid) {
     printf("\n=== 初始化QP状态 ===\n");
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     int ret;
-    // 查询PKey
-    uint16_t pkey;
-    if (ibv_query_pkey(rdma_ctx.ctx, 1, 0, &pkey) != 0) {
-        perror("ibv_query_pkey failed");
-        return -1;
-    }
-    printf("使用PKey[0] = 0x%04x\n", pkey);
+    
+    // 使用默认PKey
+    printf("使用PKey = 0x%04x\n", DEFAULT_PKEY);
+    
     // 切换到INIT状态
     attr.qp_state = IBV_QPS_INIT;
-    attr.pkey_index = 0;
+    attr.pkey_index = 0;  // 使用索引0的PKey
     attr.port_num = 1;
-    attr.qp_access_flags = 0;
+    // attr.qp_access_flags = 0;
     ret = ibv_modify_qp(rdma_ctx.qp, &attr,
-                       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+                       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT 
+                    //    IBV_QP_ACCESS_FLAGS
+                    );
     if (ret != 0) {
         perror("ibv_modify_qp to INIT failed");
         return -1;
     }
     printf("QP状态已切换到INIT\n");
-    // 切换到RTR状态（UD类型正确配置：使用AH和目标QP/QKey）
+    
+    // 切换到RTR状态（使用正确的GID和QKey）
     attr.qp_state = IBV_QPS_RTR;
-    // 配置地址句柄属性（替代原来的attr.ud.ah_attr）
     attr.ah_attr.is_global = 1;
-    attr.ah_attr.grh.dgid = *remote_gid;
+    attr.ah_attr.grh.dgid = *remote_gid;  // 接收端GID
     attr.ah_attr.grh.flow_label = 0;
     attr.ah_attr.grh.hop_limit = 1;
-    attr.ah_attr.grh.sgid_index = 0;
+    attr.ah_attr.grh.sgid_index = 0;      // 使用本地第一个GID
     attr.ah_attr.port_num = 1;
-    // 配置目标QP和QKey（使用通用字段，替代UD专用字段）
-    attr.dest_qp_num = remote_qp_num;  // 通用目标QP字段
-    attr.qkey = 0x11111111;           // 通用QKey字段
-    // 标志位使用通用宏（替代UD专用宏）
+    attr.dest_qp_num = remote_qp_num;     // 接收端QP号
+    attr.qkey = DEFAULT_QKEY;             // 统一QKey
+    
     ret = ibv_modify_qp(rdma_ctx.qp, &attr,
                        IBV_QP_STATE | IBV_QP_DEST_QPN | IBV_QP_QKEY | IBV_QP_AV);
     if (ret != 0) {
         perror("ibv_modify_qp to RTR failed");
         return -1;
     }
-    printf("QP状态已切换到RTR (远程QP=%u, QKey=0x11111111)\n", remote_qp_num);
-    // 切换到RTS状态
+    printf("QP状态已切换到RTR (远程QP=%u, QKey=0x%x)\n", 
+           remote_qp_num, DEFAULT_QKEY);
+    
+    // 切换到RTS状态（使用正确的初始PSN）
     attr.qp_state = IBV_QPS_RTS;
-    attr.sq_psn = 0;
+    attr.sq_psn = 0;  // 初始PSN从0开始
     attr.max_dest_rd_atomic = 1;
-    attr.min_rnr_timer = 0x12;
+    attr.min_rnr_timer = 0x12;  // 保持默认值
     ret = ibv_modify_qp(rdma_ctx.qp, &attr,
                        IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
     if (ret != 0) {
@@ -683,12 +689,16 @@ int main() {
         return 1;
     }
     // 手动配置接收端信息（请根据接收端输出填写）
-    uint32_t remote_qp_num = 0;  // 替换为接收端QP号（必填！）
+    // 手动配置接收端信息（使用rxe_eth3的GID）
+    uint32_t remote_qp_num = 0;  // 请替换为接收端实际QP号（从接收端输出获取）
+    
+    // rxe_eth3的GID（根据node_guid推导）
     union ibv_gid remote_gid;
     memset(&remote_gid, 0, sizeof(remote_gid));
-    // 示例GID（替换为接收端实际GID，从接收端输出复制）
-    unsigned char gid_bytes[16] = {0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                  0x00, 0x00, 0x00, 0x00, 0xc0, 0xa8, 0xef, 0x85};
+    unsigned char gid_bytes[16] = {
+        0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x0c, 0x29, 0xff, 0xfe, 0x10, 0x01, 0x1d  // 对应rxe_eth3的node_guid
+    };
     memcpy(&remote_gid, gid_bytes, 16);
     // 初始化QP状态
     if (init_qp(remote_qp_num, &remote_gid) != 0) {
