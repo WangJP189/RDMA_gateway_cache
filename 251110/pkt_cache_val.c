@@ -36,6 +36,8 @@ static volatile int running = 1;
 void signal_handler(int sig) {
     running = 0;
     printf("\n收到退出信号，正在清理...\n");
+    exit(0);
+    
 }
 
 // 定期打印缓存状态的线程函数
@@ -96,7 +98,7 @@ void *rdma_listener(void *arg) {
     }
 
     // 创建监听ID
-    if (rdma_create_id(ec, &listener, NULL, RDMA_PS_TCP)) {
+    if (rdma_create_id(ec, &listener, NULL, RDMA_PS_UDP)) {
         perror("rdma_create_id failed");
         rdma_destroy_event_channel(ec);
         return NULL;
@@ -122,23 +124,23 @@ void *rdma_listener(void *arg) {
     sin.sin_port = htons(18515);
     sin.sin_addr.s_addr = INADDR_ANY;  // 绑定到所有地址（设备已通过verbs指定）
 
-    // 如果指定了设备，尝试绑定到设备的IP（可选，不影响设备上下文）
-    if (device && strcmp(device, "") != 0) {
-        struct ifaddrs *ifaddr, *ifa;
-        if (getifaddrs(&ifaddr) == 0) {
-            for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-                if (!ifa->ifa_addr) continue;
-                if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, device) == 0) {
-                    struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-                    sin.sin_addr = sa->sin_addr;  // 绑定到设备的IP
-                    break;
-                }
-            }
-            freeifaddrs(ifaddr);
-        } else {
-            perror("getifaddrs failed");
-        }
-    }
+    // // 如果指定了设备，尝试绑定到设备的IP（可选，不影响设备上下文）
+    // if (device && strcmp(device, "") != 0) {
+    //     struct ifaddrs *ifaddr, *ifa;
+    //     if (getifaddrs(&ifaddr) == 0) {
+    //         for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    //             if (!ifa->ifa_addr) continue;
+    //             if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, device) == 0) {
+    //                 struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+    //                 sin.sin_addr = sa->sin_addr;  // 绑定到设备的IP
+    //                 break;
+    //             }
+    //         }
+    //         freeifaddrs(ifaddr);
+    //     } else {
+    //         perror("getifaddrs failed");
+    //     }
+    // }
 
     // 绑定地址（此时listener->verbs已通过设备名关联）
     if (rdma_bind_addr(listener, (struct sockaddr *)&sin)) {
@@ -218,7 +220,8 @@ void *rdma_listener(void *arg) {
             perror("rdma_get_cm_event failed");
             break;
         }
-
+        printf("收到RDMA事件：%s\n", rdma_event_str(event->event));  // 调试用
+        
         if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
             id = event->id;
             
