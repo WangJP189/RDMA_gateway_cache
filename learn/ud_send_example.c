@@ -1,3 +1,12 @@
+/*
+编译命令：
+gcc ud_send_example.c -o ud_send_example -lpthread -lrdmacm -libverbs
+
+运行命令：
+sudo ./ud_send_example <device_name> <dest_gid> <dest_qp>
+*/
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,17 +180,17 @@ int qp_init(struct ibv_qp *qp) {
 // 创建地址句柄
 struct ibv_ah *create_ah(struct ibv_pd *pd, union ibv_gid *dgid) {
     struct ibv_ah_attr ah_attr = {
-        .is_global = 1,
-        .dlid = 0,  // SoftRoCE中LID通常为0
-        .sl = 0,
-        .src_path_bits = 0,
-        .port_num = 1,
+        .is_global = 1,  // UD模式必须启用全局路由（使用GRH）
+        .port_num = 1,   // 端口号（rxe设备通常为1）
+        // 配置全局路由头部（GRH），UD模式必需
         .grh = {
-            .dgid = *dgid,
-            .sgid_index = 0,
-            .hop_limit = 64,
-            .flow_label = 0
+            .dgid = *dgid,        // 目标GID（接收端的GID）
+            .sgid_index = 0,      // 本地GID索引（通常为0）
+            .hop_limit = 1,       // 跳数限制（本地子网填1即可）
+            .flow_label = 0,      // 流标签（UD模式可设为0）
+            .traffic_class = 0    // 流量类别（默认0）
         }
+        // UD模式下不需要LID（dlid），软RoCE中LID无效
     };
     
     printf("创建AH，目标GID: ");
@@ -191,8 +200,7 @@ struct ibv_ah *create_ah(struct ibv_pd *pd, union ibv_gid *dgid) {
     struct ibv_ah *ah = ibv_create_ah(pd, &ah_attr);
     if (!ah) {
         perror("ibv_create_ah failed");
-        // 打印更详细的错误信息
-        fprintf(stderr, "错误详情: 可能是网络配置问题或GID不正确\n");
+        fprintf(stderr, "错误详情: 检查GID是否正确、端口号是否为1、GRH配置是否完整\n");
     }
     return ah;
 }

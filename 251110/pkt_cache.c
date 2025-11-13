@@ -180,7 +180,7 @@ void print_connection_key(const struct connection_key *key) {
 }
 
 // 全局缓存管理器实例
-static struct cache_manager *g_cache_mgr = NULL;
+struct cache_manager *g_cache_mgr = NULL;
 
 // 初始化缓存管理器（补充滑动窗口默认值）
 /*
@@ -203,14 +203,14 @@ struct cache_manager* init_cache_manager(size_t hash_size,
 {
     struct cache_manager *mgr = malloc(sizeof(struct cache_manager));
     if (!mgr) {
-        perror("malloc cache_manager");
+        perror("malloc cache_manager failed");  // 关键：打印错误原因
         return NULL;
     }
     
     mgr->hash_table_size = hash_size;
     mgr->hash_table = calloc(hash_size, sizeof(struct hash_table_entry*));
     if (!mgr->hash_table) {
-        perror("calloc hash_table");
+        perror("calloc hash_table failed");
         free(mgr);
         return NULL;
     }
@@ -222,7 +222,7 @@ struct cache_manager* init_cache_manager(size_t hash_size,
     mgr->total_connections = 0;
     
     if (pthread_mutex_init(&mgr->global_lock, NULL) != 0) {
-        perror("pthread_mutex_init global_lock");
+        perror("pthread_mutex_init failed");
         free(mgr->hash_table);
         free(mgr);
         return NULL;
@@ -853,35 +853,35 @@ void retransmit_rdma_packet(const struct connection_key *key,
  *   - 若将 retransmit_rdma_packet 替换为真实发送逻辑，可以结合抓包工具（tcpdump）验证重传数据包
  * 注意：该 main 只作为本模块的单机自测示例，真实环境中报文来源应来自 pkt_recv 等解析模块或真实网卡抓取
  */
-int main() {
-    // 初始化缓存管理器
-    g_cache_mgr = init_cache_manager(1024, 1000, 1000, 100, 300);
-    if (!g_cache_mgr) return 1;
+// int main() {
+//     // 初始化缓存管理器
+//     g_cache_mgr = init_cache_manager(1024, 1000, 1000, 100, 300);
+//     if (!g_cache_mgr) return 1;
 
-    /* 测试数据准备：构造一个示例连接 key 并插入 5 个连续 PSN 的报文 */
-    unsigned char data[] = "test_rdma_packet";
-    struct connection_key key = create_connection_key("192.168.1.100", "192.168.1.200",
-                                                     1234, 5678, 10, 20, 0, 0xffff);
+//     /* 测试数据准备：构造一个示例连接 key 并插入 5 个连续 PSN 的报文 */
+//     unsigned char data[] = "test_rdma_packet";
+//     struct connection_key key = create_connection_key("192.168.1.100", "192.168.1.200",
+//                                                      1234, 5678, 10, 20, 0, 0xffff);
 
-    // 添加测试报文 PSN=1..5
-    for (uint32_t psn = 1; psn <= 5; psn++) {
-        add_to_connection_cache("192.168.1.100", "192.168.1.200",
-                               1234, 5678, 10, 20, 0, 0xffff,
-                               psn, data, sizeof(data));
-    }
+//     // 添加测试报文 PSN=1..5
+//     for (uint32_t psn = 1; psn <= 5; psn++) {
+//         add_to_connection_cache("192.168.1.100", "192.168.1.200",
+//                                1234, 5678, 10, 20, 0, 0xffff,
+//                                psn, data, sizeof(data));
+//     }
 
-    // 模拟NACK触发重传
-    printf("\n触发NACK重传（PSN=3及以后）:\n");
-    handle_nack_batch_retransmit(&key, 3);
+//     // 模拟NACK触发重传
+//     printf("\n触发NACK重传（PSN=3及以后）:\n");
+//     handle_nack_batch_retransmit(&key, 3);
 
-    // 模拟窗口滑动
-    printf("\n更新窗口起始到4:\n");
-    update_window_start(&key, 4);
+//     // 模拟窗口滑动
+//     printf("\n更新窗口起始到4:\n");
+//     update_window_start(&key, 4);
 
-    // 打印状态供人工检查
-    print_all_connections_status();
+//     // 打印状态供人工检查
+//     print_all_connections_status();
 
-    // 清理并退出
-    cleanup_expired_connections();
-    return 0;
-}
+//     // 清理并退出
+//     cleanup_expired_connections();
+//     return 0;
+// }
