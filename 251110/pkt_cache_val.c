@@ -3,21 +3,13 @@
 gcc -g pkt_cache_val.c pkt_cache.o -o pkt_cache_val -lpthread -lrdmacm -libverbs
 
 运行命令：
-sudo ./pkt_cache_val
-
-使用debug运行命令：
-sudo gdb ./pkt_cache_val
-
-(gdb) run
-(gdb) backtrace
-(gdb) exit
-
+sudo ./pkt_cache_val rxe130  # 在130虚拟机上
+sudo ./pkt_cache_val rxe135  # 在135虚拟机上
 */
-
-
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
@@ -25,6 +17,8 @@ sudo gdb ./pkt_cache_val
 #include <infiniband/verbs.h>
 #include <netinet/in.h>
 #include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <errno.h>
 
 // 使用头文件而非直接包含源文件（避免main函数冲突）
 #include "pkt_cache.h"
@@ -36,8 +30,6 @@ static volatile int running = 1;
 void signal_handler(int sig) {
     running = 0;
     printf("\n收到退出信号，正在清理...\n");
-    exit(0);
-    
 }
 
 // 定期打印缓存状态的线程函数
@@ -50,6 +42,7 @@ void *status_printer(void *arg) {
     return NULL;
 }
 
+// 获取设备上下文
 static struct ibv_context* get_ibv_context_by_name(const char *device_name) {
     struct ibv_device **dev_list;
     struct ibv_context *ctx = NULL;
@@ -63,363 +56,493 @@ static struct ibv_context* get_ibv_context_by_name(const char *device_name) {
 
     // 查找目标设备
     for (int i = 0; i < num_devices; i++) {
+        printf("检查设备: %s\n", ibv_get_device_name(dev_list[i]));
         if (strcmp(ibv_get_device_name(dev_list[i]), device_name) == 0) {
             // 打开设备上下文
             ctx = ibv_open_device(dev_list[i]);
             if (!ctx) {
                 perror("ibv_open_device failed");
+            } else {
+                printf("成功打开设备: %s\n", device_name);
             }
             break;
         }
     }
 
-    ibv_free_device_list(dev_list);  // 释放设备列表
+    ibv_free_device_list(dev_list);
     return ctx;
 }
 
-// RDMA连接监听线程：捕获ib_send_bw的通信并缓存
-void *rdma_listener(void *arg) {
-    char *device = (char *)arg;
-    struct rdma_event_channel *ec;
-    struct rdma_cm_id *listener, *id;
-    struct rdma_conn_param conn_param = {0};
-    struct sockaddr_in sin;
-    struct ibv_qp_init_attr qp_attr = {0};
-    struct ibv_comp_channel *comp_chan;
-    struct ibv_cq *cq = NULL;
-    struct ibv_qp *qp;
+// 连接信息结构体
+struct connection_context {
+    struct rdma_cm_id *id;
+    struct ibv_mr *mr;
+    char *buffer;
+    uint32_t local_qp;
+    uint32_t remote_qp;
+    struct sockaddr_in remote_addr;
+};
+
+// 解析数据包并提取PSN（简化版本）
+uint32_t extract_psn_from_packet(const char *data, int length) {
+    // 在实际的RDMA数据包中，PSN位于BTH（Base Transport Header）中
+    // 这里我们使用一个简单的模拟方法：使用数据包的前4个字节作为PSN
+    if (length >= 4) {
+        return *(uint32_t*)data;
+    }
+    return 0;
+}
+
+// 处理数据接收
+void handle_rdma_traffic(struct connection_context *ctx) {
+    struct ibv_wc wc;
     int ret;
-
-    // 初始化事件通道
-    ec = rdma_create_event_channel();
-    if (!ec) {
-        perror("rdma_create_event_channel failed");
-        return NULL;
-    }
-
-    // 创建监听ID
-    if (rdma_create_id(ec, &listener, NULL, RDMA_PS_UDP)) {
-        perror("rdma_create_id failed");
-        rdma_destroy_event_channel(ec);
-        return NULL;
-    }
-
-    // 关键修改1：如果指定了设备名，获取并关联设备上下文
-    struct ibv_context *verbs = NULL;
-    if (device && strcmp(device, "") != 0) {
-        verbs = get_ibv_context_by_name(device);
-        if (!verbs) {
-            fprintf(stderr, "无法获取设备 %s 的上下文\n", device);
-            rdma_destroy_id(listener);
-            rdma_destroy_event_channel(ec);
-            return NULL;
-        }
-        // 手动关联设备上下文到监听ID
-        listener->verbs = verbs;
-    }
-
-    // 绑定到指定端口和地址
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(18515);
-    sin.sin_addr.s_addr = INADDR_ANY;  // 绑定到所有地址（设备已通过verbs指定）
-
-    // // 如果指定了设备，尝试绑定到设备的IP（可选，不影响设备上下文）
-    // if (device && strcmp(device, "") != 0) {
-    //     struct ifaddrs *ifaddr, *ifa;
-    //     if (getifaddrs(&ifaddr) == 0) {
-    //         for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-    //             if (!ifa->ifa_addr) continue;
-    //             if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, device) == 0) {
-    //                 struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-    //                 sin.sin_addr = sa->sin_addr;  // 绑定到设备的IP
-    //                 break;
-    //             }
-    //         }
-    //         freeifaddrs(ifaddr);
-    //     } else {
-    //         perror("getifaddrs failed");
-    //     }
-    // }
-
-    // 绑定地址（此时listener->verbs已通过设备名关联）
-    if (rdma_bind_addr(listener, (struct sockaddr *)&sin)) {
-        perror("rdma_bind_addr failed");
-        if (verbs) ibv_close_device(verbs);  // 释放设备上下文
-        rdma_destroy_id(listener);
-        rdma_destroy_event_channel(ec);
-        return NULL;
-    }
-
-    // 验证设备上下文（此时应非空）
-    if (!listener->verbs) {
-        fprintf(stderr, "listener->verbs is NULL (设备上下文无效)：可能设备名错误或未加载驱动\n");
-        if (verbs) ibv_close_device(verbs);
-        rdma_destroy_id(listener);
-        rdma_destroy_event_channel(ec);
-        return NULL;
-    }
-    printf("成功获取设备上下文: %p (设备名: %s)\n", listener->verbs, device ? device : "默认设备");
-
-    // 初始化QP属性
-    qp_attr.qp_type = IBV_QPT_RC;
+    uint32_t packet_count = 0;
     
-    // 创建完成通道
-    comp_chan = ibv_create_comp_channel(listener->verbs);
-    if (!comp_chan) {
-        perror("ibv_create_comp_channel failed");
-        rdma_destroy_id(listener);
-        rdma_destroy_event_channel(ec);
-        return NULL;
+    printf("🔍 开始处理RDMA流量...\n");
+    
+    // 持续轮询完成队列
+    while (running) {
+        ret = ibv_poll_cq(ctx->id->recv_cq, 1, &wc);
+        if (ret < 0) {
+            perror("ibv_poll_cq failed");
+            break;
+        } else if (ret > 0) {
+            if (wc.status == IBV_WC_SUCCESS) {
+                if (wc.opcode & IBV_WC_RECV) {
+                    packet_count++;
+                    
+                    // 获取地址信息
+                    struct sockaddr_in *local_addr = (struct sockaddr_in *)rdma_get_local_addr(ctx->id);
+                    
+                    char local_ip[INET_ADDRSTRLEN];
+                    char remote_ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &local_addr->sin_addr, local_ip, sizeof(local_ip));
+                    inet_ntop(AF_INET, &ctx->remote_addr.sin_addr, remote_ip, sizeof(remote_ip));
+                    
+                    // 提取PSN（模拟）
+                    uint32_t psn = extract_psn_from_packet(ctx->buffer, wc.byte_len);
+                    if (psn == 0) {
+                        psn = packet_count; // 如果提取失败，使用包计数作为PSN
+                    }
+                    
+                    printf("✅ [包%d] 收到RDMA数据包! 长度: %d bytes, QP: %d, PSN: %u\n", 
+                           packet_count, wc.byte_len, wc.qp_num, psn);
+                    
+                    printf("📡 连接信息: %s:%d -> %s:%d\n", 
+                           remote_ip, ntohs(ctx->remote_addr.sin_port),
+                           local_ip, ntohs(local_addr->sin_port));
+                    
+                    // 缓存接收到的数据包
+                    int cache_ret = add_to_connection_cache(
+                        remote_ip,
+                        local_ip,
+                        ntohs(ctx->remote_addr.sin_port),
+                        ntohs(local_addr->sin_port),
+                        ctx->remote_qp,  // 远程QP
+                        ctx->local_qp,   // 本地QP
+                        0,      // 服务类型
+                        0xffff, // pkey
+                        psn,    // PSN
+                        (unsigned char *)ctx->buffer,
+                        wc.byte_len
+                    );
+                    
+                    if (cache_ret == 0) {
+                        printf("✅ 成功缓存数据包到接收缓存\n");
+                        // 打印缓存的数据内容（前50字节）
+                        int print_len = wc.byte_len < 50 ? wc.byte_len : 50;
+                        printf("📦 数据内容(前%d字节): ", print_len);
+                        for (int i = 0; i < print_len; i++) {
+                            printf("%02x ", (unsigned char)ctx->buffer[i]);
+                            if ((i + 1) % 16 == 0) printf("\n                     ");
+                        }
+                        printf("\n");
+                    } else {
+                        printf("❌ 缓存数据包失败 (返回码: %d)\n", cache_ret);
+                    }
+                    
+                    // 重新投递接收请求
+                    struct ibv_recv_wr wr, *bad_wr;
+                    struct ibv_sge sge;
+                    
+                    sge.addr = (uintptr_t)ctx->buffer;
+                    sge.length = 65536;
+                    sge.lkey = ctx->mr->lkey;
+                    
+                    wr.wr_id = (uintptr_t)ctx->buffer;
+                    wr.next = NULL;
+                    wr.sg_list = &sge;
+                    wr.num_sge = 1;
+                    
+                    if (ibv_post_recv(ctx->id->qp, &wr, &bad_wr)) {
+                        perror("重新投递接收请求失败");
+                        break;
+                    }
+                }
+            } else {
+                printf("WC错误: %s\n", ibv_wc_status_str(wc.status));
+            }
+        } else {
+            // 没有完成项，短暂休眠
+            usleep(10000); // 10ms
+        }
     }
+    
+    printf("🔚 数据处理线程结束，共处理 %d 个数据包\n", packet_count);
+}
 
-    // 创建完成队列（CQ）
-    cq = ibv_create_cq(listener->verbs, 128, NULL, comp_chan, 0);
-    if (!cq) {
-        perror("ibv_create_cq failed");
-        ibv_destroy_comp_channel(comp_chan);
-        rdma_destroy_id(listener);
-        rdma_destroy_event_channel(ec);
-        return NULL;
+// 创建并配置QP
+int setup_qp(struct rdma_cm_id *id) {
+    struct ibv_qp_init_attr qp_attr;
+    memset(&qp_attr, 0, sizeof(qp_attr));
+    
+    // 创建完成队列
+    id->recv_cq = ibv_create_cq(id->verbs, 128, NULL, NULL, 0);
+    id->send_cq = ibv_create_cq(id->verbs, 128, NULL, NULL, 0);
+    if (!id->recv_cq || !id->send_cq) {
+        perror("创建CQ失败");
+        return -1;
     }
-
-    // 注册CQ通知（必须在CQ创建后调用）
-    if (ibv_req_notify_cq(cq, 0)) {
-        perror("ibv_req_notify_cq failed");
-        ibv_destroy_cq(cq);
-        ibv_destroy_comp_channel(comp_chan);
-        rdma_destroy_id(listener);
-        rdma_destroy_event_channel(ec);
-        return NULL;
-    }
-
-    // 设置QP的CQ属性
-    qp_attr.send_cq = cq;
-    qp_attr.recv_cq = cq;
+    
+    qp_attr.qp_type = IBV_QPT_RC;
     qp_attr.cap.max_send_wr = 128;
     qp_attr.cap.max_recv_wr = 128;
     qp_attr.cap.max_send_sge = 1;
     qp_attr.cap.max_recv_sge = 1;
+    qp_attr.cap.max_inline_data = 64;
+    qp_attr.recv_cq = id->recv_cq;
+    qp_attr.send_cq = id->send_cq;
+    
+    if (rdma_create_qp(id, id->pd, &qp_attr)) {
+        perror("rdma_create_qp失败");
+        return -1;
+    }
+    
+    return 0;
+}
 
-    // 开始监听连接（最大10个等待连接）
-    if (rdma_listen(listener, 10)) {
-        perror("rdma_listen failed");
-        ibv_destroy_cq(cq);
-        ibv_destroy_comp_channel(comp_chan);
-        rdma_destroy_id(listener);
-        rdma_destroy_event_channel(ec);
-        return NULL;
+// RDMA连接监听线程 - 使用被动监听方式
+void *rdma_listener(void *arg) {
+    char *device = (char *)arg;
+    struct rdma_event_channel *ec = NULL;
+    struct rdma_cm_id *listener = NULL;
+    struct ibv_context *verbs = NULL;
+    int ret;
+
+    printf("🚀 启动RDMA监听线程，设备: %s\n", device ? device : "默认");
+
+    // 初始化事件通道
+    ec = rdma_create_event_channel();
+    if (!ec) {
+        perror("❌ rdma_create_event_channel failed");
+        goto cleanup;
     }
 
-    printf("RDMA缓存监听已启动，等待ib_send_bw连接...\n");
+    // 创建CM ID - 使用RC模式
+    if (rdma_create_id(ec, &listener, NULL, RDMA_PS_TCP)) {
+        perror("❌ rdma_create_id failed");
+        goto cleanup;
+    }
 
-    // 处理连接事件
-    struct rdma_cm_event *event;
-    while (running) {
-        if (rdma_get_cm_event(ec, &event)) {
-            perror("rdma_get_cm_event failed");
-            break;
+    // 获取设备上下文
+    if (device && strcmp(device, "") != 0) {
+        verbs = get_ibv_context_by_name(device);
+        if (!verbs) {
+            fprintf(stderr, "❌ 无法获取设备 %s 的上下文\n", device);
+            goto cleanup;
         }
-        printf("收到RDMA事件：%s\n", rdma_event_str(event->event));  // 调试用
+        listener->verbs = verbs;
+        printf("✅ 成功关联设备上下文: %s\n", device);
+    }
+
+    // 绑定到任意可用端口 - 不指定具体端口
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;  // 让系统分配端口
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    printf("📡 绑定到任意可用端口...\n");
+    if (rdma_bind_addr(listener, (struct sockaddr *)&addr)) {
+        perror("❌ rdma_bind_addr failed");
+        goto cleanup;
+    }
+
+    // 获取实际绑定的端口
+    struct sockaddr_in bound_addr;
+    socklen_t len = sizeof(bound_addr);
+    if (getsockname(listener->pd, (struct sockaddr*)&bound_addr, &len) == 0) {
+        printf("📍 实际绑定端口: %d\n", ntohs(bound_addr.sin_port));
+    }
+
+    // 开始监听
+    if (rdma_listen(listener, 10)) {
+        perror("❌ rdma_listen failed");
+        goto cleanup;
+    }
+
+    printf("✅ RDMA缓存监听已启动，等待连接...\n");
+    printf("📍 监听地址: 0.0.0.0:%d\n", ntohs(bound_addr.sin_port));
+    printf("📍 设备: %s\n", device ? device : "默认");
+
+    // 事件处理循环
+    while (running) {
+        struct rdma_cm_event *event;
         
+        // 设置超时以避免永久阻塞
+        struct timeval tv = {2, 0}; // 2秒超时
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(ec->fd, &read_fds);
+        
+        ret = select(ec->fd + 1, &read_fds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (running && errno != EINTR) {
+                perror("select failed");
+            }
+            continue;
+        } else if (ret == 0) {
+            // 超时，继续循环
+            continue;
+        }
+        
+        // 有事件到达
+        if (rdma_get_cm_event(ec, &event)) {
+            if (running && errno != EINTR) {
+                perror("rdma_get_cm_event failed");
+            }
+            continue;
+        }
+
+        printf("📩 收到RDMA事件: %s\n", rdma_event_str(event->event));
+
         if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
-            id = event->id;
+            struct rdma_cm_id *client_id = event->id;
             
-            // 创建QP（使用正确的保护域）
-            if (rdma_create_qp(id, id->pd, &qp_attr)) {
-                perror("rdma_create_qp failed");
-                rdma_reject(id, NULL, 0);
+            printf("✅ 收到连接请求，准备建立连接...\n");
+            
+            // 保存远程地址信息
+            struct connection_context *conn_ctx = malloc(sizeof(struct connection_context));
+            if (!conn_ctx) {
+                perror("❌ 分配连接上下文失败");
+                rdma_reject(client_id, NULL, 0);
                 rdma_ack_cm_event(event);
                 continue;
             }
-            qp = id->qp;
-
-            // 准备接收缓冲区（64KB）
-            char *recv_buf = malloc(65536);
-            if (!recv_buf) {
-                perror("malloc recv_buf failed");
-                rdma_destroy_qp(id);
-                rdma_reject(id, NULL, 0);
+            
+            memset(conn_ctx, 0, sizeof(struct connection_context));
+            conn_ctx->id = client_id;
+            memcpy(&conn_ctx->remote_addr, rdma_get_peer_addr(client_id), sizeof(struct sockaddr_in));
+            
+            // 设置QP
+            if (setup_qp(client_id) != 0) {
+                fprintf(stderr, "❌ 设置QP失败\n");
+                free(conn_ctx);
+                rdma_reject(client_id, NULL, 0);
                 rdma_ack_cm_event(event);
                 continue;
             }
-
-            // 注册内存区域（MR）
-            struct ibv_mr *mr = ibv_reg_mr(
-                id->pd,
-                recv_buf,
-                65536,
-                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE
-            );
-            if (!mr) {
-                perror("ibv_reg_mr failed");
-                free(recv_buf);
-                rdma_destroy_qp(id);
-                rdma_reject(id, NULL, 0);
+            
+            // 分配接收缓冲区
+            conn_ctx->buffer = malloc(65536);
+            if (!conn_ctx->buffer) {
+                perror("❌ 分配缓冲区失败");
+                free(conn_ctx);
+                rdma_destroy_qp(client_id);
+                rdma_reject(client_id, NULL, 0);
                 rdma_ack_cm_event(event);
                 continue;
             }
-
-            // 初始化接收WR
+            
+            // 注册内存区域
+            conn_ctx->mr = ibv_reg_mr(client_id->pd, conn_ctx->buffer, 65536,
+                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+            if (!conn_ctx->mr) {
+                perror("❌ 注册MR失败");
+                free(conn_ctx->buffer);
+                free(conn_ctx);
+                rdma_destroy_qp(client_id);
+                rdma_reject(client_id, NULL, 0);
+                rdma_ack_cm_event(event);
+                continue;
+            }
+            
+            // 设置QP号
+            conn_ctx->local_qp = client_id->qp->qp_num;
+            
+            // 从连接请求中获取远程QP号（需要解析私有数据）
+            if (event->param.conn.private_data && event->param.conn.private_data_len >= 4) {
+                // 简化：假设私有数据的前4个字节包含远程QP号
+                conn_ctx->remote_qp = *(uint32_t*)event->param.conn.private_data;
+            } else {
+                conn_ctx->remote_qp = 0; // 未知
+            }
+            
+            printf("🔗 QP信息: 本地QP=%u, 远程QP=%u\n", conn_ctx->local_qp, conn_ctx->remote_qp);
+            
+            // 投递初始接收请求
             struct ibv_recv_wr wr, *bad_wr;
             struct ibv_sge sge;
-            sge.addr = (uint64_t)recv_buf;
+            
+            sge.addr = (uintptr_t)conn_ctx->buffer;
             sge.length = 65536;
-            sge.lkey = mr->lkey;
-
-            wr.wr_id = (uint64_t)recv_buf;  // 用缓冲区地址作为WR_ID标识
+            sge.lkey = conn_ctx->mr->lkey;
+            
+            wr.wr_id = (uintptr_t)conn_ctx;
             wr.next = NULL;
             wr.sg_list = &sge;
             wr.num_sge = 1;
-
-            // 投递接收请求
-            if (ibv_post_recv(qp, &wr, &bad_wr)) {
-                perror("ibv_post_recv failed");
-                ibv_dereg_mr(mr);
-                free(recv_buf);
-                rdma_destroy_qp(id);
-                rdma_reject(id, NULL, 0);
+            
+            if (ibv_post_recv(client_id->qp, &wr, &bad_wr)) {
+                perror("❌ 投递接收请求失败");
+                ibv_dereg_mr(conn_ctx->mr);
+                free(conn_ctx->buffer);
+                free(conn_ctx);
+                rdma_destroy_qp(client_id);
+                rdma_reject(client_id, NULL, 0);
                 rdma_ack_cm_event(event);
                 continue;
             }
-
+            
             // 接受连接
+            struct rdma_conn_param conn_param = {0};
             conn_param.responder_resources = 1;
             conn_param.initiator_depth = 1;
             conn_param.retry_count = 3;
-            if (rdma_accept(id, &conn_param)) {
-                perror("rdma_accept failed");
-                ibv_dereg_mr(mr);
-                free(recv_buf);
-                rdma_destroy_qp(id);
-                rdma_reject(id, NULL, 0);
+            
+            // 发送私有数据（包含我们的QP号）
+            uint32_t private_data = conn_ctx->local_qp;
+            conn_param.private_data = &private_data;
+            conn_param.private_data_len = sizeof(private_data);
+            
+            if (rdma_accept(client_id, &conn_param)) {
+                perror("❌ rdma_accept失败");
+                ibv_dereg_mr(conn_ctx->mr);
+                free(conn_ctx->buffer);
+                free(conn_ctx);
+                rdma_destroy_qp(client_id);
+                rdma_reject(client_id, NULL, 0);
                 rdma_ack_cm_event(event);
                 continue;
             }
-
-            printf("已建立RDMA连接，开始缓存数据包...\n");
-
-            // 处理数据接收循环
-            while (running) {
-                struct ibv_cq *cq_ptr;
-                void *cq_ctx;
-                struct ibv_wc wc;
-
-                // 获取CQ事件
-                ret = ibv_get_cq_event(comp_chan, &cq_ptr, &cq_ctx);
-                if (ret) {
-                    perror("ibv_get_cq_event failed");
-                    break;
-                }
-
-                // 确认CQ事件
-                ibv_ack_cq_events(cq, 1);
-                if (ibv_req_notify_cq(cq, 0)) {
-                    perror("ibv_req_notify_cq failed");
-                    break;
-                }
-
-                // 轮询完成队列
-                while (ibv_poll_cq(cq, 1, &wc) > 0) {
-                    if (wc.status != IBV_WC_SUCCESS) {
-                        printf("WC错误: %s\n", ibv_wc_status_str(wc.status));
-                        break;
-                    }
-
-                    if (wc.opcode == IBV_WC_RECV) {
-                        // 获取地址信息
-                        struct sockaddr_in *local_addr = (struct sockaddr_in *)rdma_get_local_addr(id);
-                        struct sockaddr_in *remote_addr = (struct sockaddr_in *)rdma_get_peer_addr(id);
-
-                        // 缓存数据包
-                        add_to_connection_cache(
-                            inet_ntoa(remote_addr->sin_addr),
-                            inet_ntoa(local_addr->sin_addr),
-                            ntohs(remote_addr->sin_port),
-                            ntohs(local_addr->sin_port),
-                            qp->qp_num,
-                            wc.qp_num,
-                            0,
-                            0xffff,
-                            wc.wr_id,  // 注意：实际PSN需从报文中解析，这里仅为示例
-                            (unsigned char *)recv_buf,
-                            wc.byte_len
-                        );
-
-                        // 重新投递接收请求
-                        if (ibv_post_recv(qp, &wr, &bad_wr)) {
-                            perror("ibv_post_recv failed (loop)");
-                            break;
-                        }
-                    }
-                }
+            
+            printf("✅ RDMA连接已建立!\n");
+            
+            // 启动数据处理线程
+            pthread_t data_thread;
+            if (pthread_create(&data_thread, NULL, (void *(*)(void *))handle_rdma_traffic, conn_ctx) != 0) {
+                perror("❌ 创建数据处理线程失败");
+                ibv_dereg_mr(conn_ctx->mr);
+                free(conn_ctx->buffer);
+                free(conn_ctx);
+            } else {
+                printf("✅ 启动数据处理线程\n");
+                pthread_detach(data_thread);
             }
-
-            // 清理当前连接资源
-            ibv_dereg_mr(mr);
-            free(recv_buf);
-            rdma_destroy_qp(id);
-
+            
+        } else if (event->event == RDMA_CM_EVENT_ESTABLISHED) {
+            printf("✅ RDMA连接已完全建立\n");
+            
         } else if (event->event == RDMA_CM_EVENT_DISCONNECTED) {
-            printf("连接已断开\n");
+            printf("🔌 RDMA连接已断开\n");
+            if (event->id->qp) {
+                rdma_destroy_qp(event->id);
+            }
             rdma_destroy_id(event->id);
+            
+        } else if (event->event == RDMA_CM_EVENT_REJECTED) {
+            printf("❌ 连接被拒绝\n");
+            
+        } else if (event->event == RDMA_CM_EVENT_CONNECT_ERROR) {
+            printf("❌ 连接错误\n");
+        } else if (event->event == RDMA_CM_EVENT_ADDR_RESOLVED) {
+            printf("🌐 地址解析完成\n");
+        } else if (event->event == RDMA_CM_EVENT_ROUTE_RESOLVED) {
+            printf("🗺️  路由解析完成\n");
         }
 
         rdma_ack_cm_event(event);
     }
 
-    // 清理全局资源
-    if (verbs) ibv_close_device(verbs);
-    rdma_destroy_id(listener);
-    rdma_destroy_event_channel(ec);
-    if (cq) ibv_destroy_cq(cq);
-    if (comp_chan) ibv_destroy_comp_channel(comp_chan);
-    
-    printf("RDMA监听线程已退出\n");
+cleanup:
+    printf("🧹 清理RDMA监听资源...\n");
+    if (listener) {
+        if (listener->qp) rdma_destroy_qp(listener);
+        rdma_destroy_id(listener);
+    }
+    if (ec) {
+        rdma_destroy_event_channel(ec);
+    }
+    if (verbs) {
+        ibv_close_device(verbs);
+    }
+    printf("✅ RDMA监听线程已退出\n");
     return NULL;
 }
 
 int main(int argc, char **argv) {
+    printf("🚀 ===== 启动RDMA缓存验证程序 =====\n");
+    
     // 注册信号处理
     signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
-    // 从命令行参数读取 RDMA 设备名（可选），例如：sudo ./pkt_cache_val rxe130
+    // 从命令行参数读取 RDMA 设备名
     char *rdma_device = NULL;
-    if (argc > 1) rdma_device = argv[1];
-
-    // 初始化缓存管理器
-    g_cache_mgr = init_cache_manager(
-        1024,    // 哈希表大小
-        10,     // 最大连接数
-        100,   // 每连接最大报文数
-        10,     // 每连接最大字节数(MB)
-        60       // 连接超时时间(秒)
-    );
-    if (!g_cache_mgr) {
-        fprintf(stderr, "初始化缓存管理器失败：init_cache_manager 返回 NULL\n");
+    if (argc > 1) {
+        rdma_device = argv[1];
+        printf("📡 使用设备: %s\n", rdma_device);
+    } else {
+        fprintf(stderr, "❌ 请指定RDMA设备名，例如: %s rxe130\n", argv[0]);
         return 1;
     }
-    printf("初始化缓存管理器成功：%p\n", g_cache_mgr);  // 打印地址，确认非空
+
+    // 初始化缓存管理器
+    printf("\n📦 初始化缓存管理器...\n");
+    g_cache_mgr = init_cache_manager(
+        1024,    // 哈希表大小
+        100,     // 最大连接数
+        1000,    // 每连接最大报文数
+        100,     // 每连接最大字节数(MB)
+        300      // 连接超时时间(秒)
+    );
+    if (!g_cache_mgr) {
+        fprintf(stderr, "❌ 初始化缓存管理器失败\n");
+        return 1;
+    }
+    printf("✅ 缓存管理器初始化成功\n");
 
     // 创建状态打印线程
     pthread_t printer_thread;
     if (pthread_create(&printer_thread, NULL, status_printer, NULL) != 0) {
-        perror("创建状态打印线程失败");
+        perror("❌ 创建状态打印线程失败");
         return 1;
     }
+    printf("✅ 状态打印线程已启动\n");
 
     // 创建RDMA监听线程
     pthread_t listener_thread;
     if (pthread_create(&listener_thread, NULL, rdma_listener, rdma_device) != 0) {
-        perror("创建RDMA监听线程失败");
+        perror("❌ 创建RDMA监听线程失败");
+        running = 0;
         pthread_join(printer_thread, NULL);
         return 1;
     }
+    printf("✅ RDMA监听线程已启动\n");
+
+    printf("\n🎯 等待RDMA连接...\n");
+    printf("📍 缓存程序正在监听动态分配的端口\n");
+    printf("📍 使用 Ctrl+C 退出程序\n\n");
 
     // 等待线程结束
     pthread_join(listener_thread, NULL);
+    printf("RDMA监听线程已结束\n");
+    
+    running = 0;
     pthread_join(printer_thread, NULL);
+    printf("状态打印线程已结束\n");
 
-    printf("程序已退出\n");
+    printf("\n🏁 程序已退出\n");
     return 0;
 }
