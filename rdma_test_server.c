@@ -10,7 +10,7 @@ gcc rdma_test_server.c -o rdma_test_server -lrdmacm -libverbs
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
 
-#define PORT "18515"
+#define PORT "4791"
 #define BUFFER_SIZE 65536
 
 int main() {

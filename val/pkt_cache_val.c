@@ -1,6 +1,6 @@
 /*
 编译命令：
-gcc -g pkt_cache_val.c pkt_cache.o -o pkt_cache_val -lpthread -lrdmacm -libverbs
+gcc -g pkt_cache_val.c ../251110/pkt_cache.o -o pkt_cache_val -lpthread -lrdmacm -libverbs
 
 运行命令：
 sudo ./pkt_cache_val rxe130  # 在130虚拟机上
@@ -21,10 +21,20 @@ sudo ./pkt_cache_val rxe135  # 在135虚拟机上
 #include <errno.h>
 
 // 使用头文件而非直接包含源文件（避免main函数冲突）
-#include "pkt_cache.h"
+#include "../251110/pkt_cache.h"
 
 // 全局标志：控制线程退出
 static volatile int running = 1;
+
+// 要监听的端口（根据wireshark抓包结果设置）
+#define LISTEN_PORT1 49441
+#define LISTEN_PORT2 4791
+
+// 在文件开头定义线程参数结构体
+typedef struct {
+    int port;               // 监听端口
+    const char *device_name; // RDMA设备名
+} ThreadArgs;
 
 // 信号处理函数：捕获Ctrl+C退出
 void signal_handler(int sig) {
@@ -222,15 +232,16 @@ int setup_qp(struct rdma_cm_id *id) {
     return 0;
 }
 
-// RDMA连接监听线程 - 使用被动监听方式
-void *rdma_listener(void *arg) {
-    char *device = (char *)arg;
+// RDMA连接监听函数 - 单个端口监听
+void *rdma_port_listener(void *arg) {
+    int *port = (int *)arg;
+    char *device = (char *)*(port + 1); // 获取设备名指针
     struct rdma_event_channel *ec = NULL;
     struct rdma_cm_id *listener = NULL;
     struct ibv_context *verbs = NULL;
     int ret;
 
-    printf("🚀 启动RDMA监听线程，设备: %s\n", device ? device : "默认");
+    printf("🚀 启动RDMA监听线程，设备: %s, 端口: %d\n", device ? device : "默认", *port);
 
     // 初始化事件通道
     ec = rdma_create_event_channel();
@@ -256,24 +267,17 @@ void *rdma_listener(void *arg) {
         printf("✅ 成功关联设备上下文: %s\n", device);
     }
 
-    // 绑定到任意可用端口 - 不指定具体端口
+    // 绑定到指定端口
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = 0;  // 让系统分配端口
+    addr.sin_port = htons(*port);  // 使用指定端口
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    printf("📡 绑定到任意可用端口...\n");
+    printf("📡 绑定到端口 %d...\n", *port);
     if (rdma_bind_addr(listener, (struct sockaddr *)&addr)) {
         perror("❌ rdma_bind_addr failed");
         goto cleanup;
-    }
-
-    // 获取实际绑定的端口
-    struct sockaddr_in bound_addr;
-    socklen_t len = sizeof(bound_addr);
-    if (getsockname(listener->pd, (struct sockaddr*)&bound_addr, &len) == 0) {
-        printf("📍 实际绑定端口: %d\n", ntohs(bound_addr.sin_port));
     }
 
     // 开始监听
@@ -283,7 +287,7 @@ void *rdma_listener(void *arg) {
     }
 
     printf("✅ RDMA缓存监听已启动，等待连接...\n");
-    printf("📍 监听地址: 0.0.0.0:%d\n", ntohs(bound_addr.sin_port));
+    printf("📍 监听地址: 0.0.0.0:%d\n", *port);
     printf("📍 设备: %s\n", device ? device : "默认");
 
     // 事件处理循环
@@ -315,7 +319,7 @@ void *rdma_listener(void *arg) {
             continue;
         }
 
-        printf("📩 收到RDMA事件: %s\n", rdma_event_str(event->event));
+        printf("📩 收到RDMA事件: %s (端口: %d)\n", rdma_event_str(event->event), *port);
 
         if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
             struct rdma_cm_id *client_id = event->id;
@@ -442,31 +446,31 @@ void *rdma_listener(void *arg) {
             }
             
         } else if (event->event == RDMA_CM_EVENT_ESTABLISHED) {
-            printf("✅ RDMA连接已完全建立\n");
+            printf("✅ RDMA连接已完全建立 (端口: %d)\n", *port);
             
         } else if (event->event == RDMA_CM_EVENT_DISCONNECTED) {
-            printf("🔌 RDMA连接已断开\n");
+            printf("🔌 RDMA连接已断开 (端口: %d)\n", *port);
             if (event->id->qp) {
                 rdma_destroy_qp(event->id);
             }
             rdma_destroy_id(event->id);
             
         } else if (event->event == RDMA_CM_EVENT_REJECTED) {
-            printf("❌ 连接被拒绝\n");
+            printf("❌ 连接被拒绝 (端口: %d)\n", *port);
             
         } else if (event->event == RDMA_CM_EVENT_CONNECT_ERROR) {
-            printf("❌ 连接错误\n");
+            printf("❌ 连接错误 (端口: %d)\n", *port);
         } else if (event->event == RDMA_CM_EVENT_ADDR_RESOLVED) {
-            printf("🌐 地址解析完成\n");
+            printf("🌐 地址解析完成 (端口: %d)\n", *port);
         } else if (event->event == RDMA_CM_EVENT_ROUTE_RESOLVED) {
-            printf("🗺️  路由解析完成\n");
+            printf("🗺️  路由解析完成 (端口: %d)\n", *port);
         }
 
         rdma_ack_cm_event(event);
     }
 
 cleanup:
-    printf("🧹 清理RDMA监听资源...\n");
+    printf("🧹 清理RDMA监听资源 (端口: %d)...\n", *port);
     if (listener) {
         if (listener->qp) rdma_destroy_qp(listener);
         rdma_destroy_id(listener);
@@ -477,7 +481,7 @@ cleanup:
     if (verbs) {
         ibv_close_device(verbs);
     }
-    printf("✅ RDMA监听线程已退出\n");
+    printf("✅ RDMA监听线程已退出 (端口: %d)\n", *port);
     return NULL;
 }
 
@@ -521,23 +525,43 @@ int main(int argc, char **argv) {
     }
     printf("✅ 状态打印线程已启动\n");
 
-    // 创建RDMA监听线程
-    pthread_t listener_thread;
-    if (pthread_create(&listener_thread, NULL, rdma_listener, rdma_device) != 0) {
-        perror("❌ 创建RDMA监听线程失败");
-        running = 0;
-        pthread_join(printer_thread, NULL);
-        return 1;
+    // 要监听的端口
+    int ports[] = {LISTEN_PORT1, LISTEN_PORT2};
+    pthread_t listener_threads[2];
+    
+    // 为每个端口创建独立的监听线程
+    for (int i = 0; i < 2; i++) {
+        // 为每个线程分配参数结构体
+        ThreadArgs *args = malloc(sizeof(ThreadArgs));
+        if (!args) {
+            perror("malloc ThreadArgs failed");
+            running = 0;
+            pthread_join(printer_thread, NULL);
+            return 1;
+        }
+        args->port = ports[i];               // 正确赋值端口
+        args->device_name = rdma_device;     // 正确传递字符串指针
+
+        // 创建线程，传递参数结构体指针
+        if (pthread_create(&listener_threads[i], NULL, rdma_port_listener, args) != 0) {
+            perror("创建RDMA监听线程失败");
+            free(args);  // 失败时释放内存
+            running = 0;
+            pthread_join(printer_thread, NULL);
+            return 1;
+        }
+        printf("✅ RDMA监听线程已启动 (端口: %d)\n", ports[i]);
     }
-    printf("✅ RDMA监听线程已启动\n");
 
     printf("\n🎯 等待RDMA连接...\n");
-    printf("📍 缓存程序正在监听动态分配的端口\n");
+    printf("📍 缓存程序正在监听端口: %d, %d\n", LISTEN_PORT1, LISTEN_PORT2);
     printf("📍 使用 Ctrl+C 退出程序\n\n");
 
-    // 等待线程结束
-    pthread_join(listener_thread, NULL);
-    printf("RDMA监听线程已结束\n");
+    // 等待所有监听线程结束
+    for (int i = 0; i < 2; i++) {
+        pthread_join(listener_threads[i], NULL);
+        printf("RDMA监听线程 (端口: %d) 已结束\n", ports[i]);
+    }
     
     running = 0;
     pthread_join(printer_thread, NULL);
