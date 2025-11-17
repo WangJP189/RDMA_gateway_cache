@@ -1,11 +1,10 @@
 /*
 编译命令：
-gcc pkt_cache_val2.c ../251110/pkt_cache.c -o pkt_cache_val2 -lpthread -lpcap
+gcc pkt_cache_val2_1117.c ../251117/pkt_cache.c -o pkt_cache_val2_1117 -lpthread -lpcap
 
 运行命令：
-sudo ./pkt_cache_val2
+sudo ./pkt_cache_val2_1117
 */
-
 
 // pkt_cache_val2.c - 监听eth0上目标端口4791的RDMA报文并缓存
 #include <stdio.h>
@@ -17,9 +16,9 @@ sudo ./pkt_cache_val2
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <time.h>
-#include<unistd.h>
+#include <unistd.h>
 
-#include "../251110/pkt_cache.h"
+#include "../251117/pkt_cache.h"
 
 // 全局PCAP句柄
 pcap_t *handle;
@@ -29,6 +28,7 @@ pcap_t *handle;
 #define IP_HDR_LEN  20
 #define UDP_HDR_LEN 8
 #define RDMA_PORT   4791  // 目标端口筛选
+#define DEFAULT_WINDOW_SIZE 8192  // 默认窗口大小（根据需求调整）
 
 // 打印数据包基本信息
 void print_packet_info(const struct ip *ip_hdr, const struct udphdr *udp_hdr, 
@@ -72,14 +72,20 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *p
     print_packet_info(ip_hdr, udp_hdr, payload, payload_len);
 
     // 提取RDMA相关字段（这里简化处理，实际应根据RDMA协议解析）
-    // 注意：真实环境中需根据实际QP号解析逻辑替换以下默认值
     uint32_t src_qp = 10;    // 示例值，实际应从报文中解析
     uint32_t dest_qp = 20;   // 示例值，实际应从报文中解析
     uint8_t service_type = 0;
     uint16_t pkey = 0xffff;
     static uint32_t psn = 1; // 示例PSN自增，实际应从报文中解析
 
-    // 将报文添加到缓存
+    // 获取全局缓存管理器（替代直接访问g_cache_mgr）
+    struct cache_manager *mgr = get_cache_manager();
+    if (!mgr) {
+        fprintf(stderr, "获取缓存管理器失败\n");
+        return;
+    }
+
+    // 将报文添加到缓存（新增window_size参数）
     int ret = add_to_connection_cache(
         inet_ntoa(ip_hdr->ip_src),    // 源IP
         inet_ntoa(ip_hdr->ip_dst),    // 目标IP
@@ -88,7 +94,8 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *p
         src_qp, dest_qp,
         service_type, pkey,
         psn++,                        // PSN
-        payload, payload_len
+        payload, payload_len,
+        DEFAULT_WINDOW_SIZE           // 新增：窗口大小参数
     );
 
     if (ret != 0) {
@@ -121,15 +128,16 @@ int main() {
     char filter_exp[128];
     bpf_u_int32 net;
 
-    // 初始化缓存管理器
-    g_cache_mgr = init_cache_manager(
-        1024,    // 哈希表大小
-        100,     // 最大连接数
-        1000,    // 每连接最大报文数
-        10,      // 每连接最大字节数(MB)
-        300      // 连接超时时间(秒)
+    // 初始化缓存管理器（新增default_window_size参数）
+    struct cache_manager *mgr = init_cache_manager(
+        1024,                // 哈希表大小
+        100,                 // 最大连接数
+        1000,                // 每连接最大报文数
+        10,                  // 每连接最大字节数(MB)
+        300,                 // 连接超时时间(秒)
+        DEFAULT_WINDOW_SIZE  // 新增：默认窗口大小
     );
-    if (!g_cache_mgr) {
+    if (!mgr) {
         fprintf(stderr, "缓存管理器初始化失败\n");
         return 1;
     }

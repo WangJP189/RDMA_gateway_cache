@@ -7,7 +7,7 @@
 2、滑动窗口：通过维护每个连接的 PSN 范围（min_psn/max_psn）实现类似滑动窗口的机制，NACK 重传时从指定 PSN 开始重传后续报文。
 3、哈希流程：用connection_key作为哈希键，通过哈希表快速定位连接缓存，解决哈希冲突采用链表法。
 
-编译命令：
+编译命令（该文件属于库文件，不是可执行文件，不需要单独编译，和验证程序一起编译即可）：
 gcc pkt_cache.c -o pkt_cache -lpthread -lrdmacm -libverbs
 
 运行命令：
@@ -77,6 +77,7 @@ struct cache_manager {
     int connection_timeout;           // 连接超时时间（秒）
     pthread_mutex_t global_lock;      // 全局锁
     size_t total_connections;         // 总连接数
+    uint32_t default_window_size;  // 默认窗口大小
 };
 
 // 哈希计算函数（优化哈希分布）
@@ -180,17 +181,11 @@ void print_connection_key(const struct connection_key *key) {
 }
 
 // 全局缓存管理器实例
-static struct cache_manager *g_cache_mgr = NULL;
+struct cache_manager *g_cache_mgr = NULL;
 
-
-/*
- * get_cache_manager
- * 目的：提供全局缓存管理器的访问接口，避免直接暴露全局变量
- */
-struct cache_manager* get_cache_manager() {
+struct cache_manager* get_cache_manager(){
     return g_cache_mgr;
 }
-
 
 // 初始化缓存管理器（补充滑动窗口默认值）
 /*
@@ -209,7 +204,8 @@ struct cache_manager* init_cache_manager(size_t hash_size,
                                         size_t max_conns,
                                         size_t max_packets_per_conn,
                                         size_t max_bytes_per_conn_mb,
-                                        int conn_timeout_seconds)
+                                        int conn_timeout_seconds,
+                                        uint32_t default_window_size)  // 新增默认窗口大小
 {
     struct cache_manager *mgr = malloc(sizeof(struct cache_manager));
     if (!mgr) {
@@ -217,6 +213,7 @@ struct cache_manager* init_cache_manager(size_t hash_size,
         return NULL;
     }
     
+    mgr->default_window_size = default_window_size;  // 需要在struct cache_manager中增加该字段
     mgr->hash_table_size = hash_size;
     mgr->hash_table = calloc(hash_size, sizeof(struct hash_table_entry*));
     if (!mgr->hash_table) {
@@ -238,7 +235,6 @@ struct cache_manager* init_cache_manager(size_t hash_size,
         return NULL;
     }
     
-    g_cache_mgr = mgr;  // 初始化全局实例
     printf("初始化缓存管理器: 哈希表大小=%zu, 最大连接数=%zu, 每连接最大报文数=%zu\n",
            hash_size, max_conns, max_packets_per_conn);
     
@@ -378,23 +374,6 @@ struct connection_cache* get_or_create_connection_cache(
     return new_cache;
 }
 
-
-/*
- * free_packet_list
- * 目的：释放由 find_packets_by_psn_range 返回的报文链表
- * 输入：链表头指针
- * 注意：必须在使用完查询结果后调用，避免内存泄漏
- */
-void free_packet_list(struct cached_packet *head) {
-    while (head) {
-        struct cached_packet *temp = head;
-        head = head->next;
-        free(temp->app_data);
-        free(temp);
-    }
-}
-
-
 /*
  * slide_window
  * 目的：根据 cache->window_start 和 window_size 维护滑动窗口，清理
@@ -404,9 +383,12 @@ void free_packet_list(struct cached_packet *head) {
  */
 static void slide_window(struct connection_cache *cache)
 {
-    // 安全计算窗口范围（避免溢出）
+    // 计算窗口上限
+    uint32_t window_end = cache->window_start + cache->window_size - 1;
+    
+    // 移除窗口外的报文（PSN < window_start）
     struct cached_packet *current = cache->head;
-    while (current && (current->psn - cache->window_start) >= cache->window_size) {
+    while (current && current->psn < cache->window_start) {
         struct cached_packet *to_remove = current;
         current = current->next;
         
@@ -460,11 +442,24 @@ int insert_packet_sorted(struct connection_cache *cache,
     
     pthread_mutex_lock(&cache->lock);
     
-    // 安全检查是否在滑动窗口内（避免溢出）
-    if ((new_packet->psn - cache->window_start) >= cache->window_size) {
+    uint32_t window_end = cache->window_start + cache->window_size - 1;
+    
+    // 新增：当新PSN超过窗口上限时，自动滑动窗口
+    if (new_packet->psn > window_end) {
+        // 计算需要滑动的距离（确保窗口至少包含新PSN）
+        uint32_t slide_distance = new_packet->psn - window_end;
+        cache->window_start += slide_distance;
+        window_end = cache->window_start + cache->window_size - 1;
+        printf("自动滑动窗口: [%u, %u] -> [%u, %u]\n",
+               cache->window_start - slide_distance, window_end - slide_distance,
+               cache->window_start, window_end);
+        slide_window(cache); // 清理窗口外的报文
+    }
+    
+    // 检查是否在滑动窗口内（更新后的窗口）
+    if (new_packet->psn < cache->window_start || new_packet->psn > window_end) {
         printf("报文PSN=%u 超出窗口范围 [%u, %u]\n",
-               new_packet->psn, cache->window_start, 
-               cache->window_start + cache->window_size - 1);
+               new_packet->psn, cache->window_start, window_end);
         pthread_mutex_unlock(&cache->lock);
         return -1;
     }
@@ -555,10 +550,10 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
                            uint16_t src_port, uint16_t dst_port,
                            uint32_t src_qp, uint32_t dest_qp,
                            uint8_t service_type, uint16_t pkey,
-                           uint32_t psn, const unsigned char *app_data, 
-                           int data_len, uint32_t window_size)  // 新增窗口大小参数
+                           uint32_t psn, const unsigned char *app_data, int data_len,
+                           uint32_t window_size)  // 新增窗口大小参数
 {
-    if (!get_cache_manager()) {
+    if (!g_cache_mgr) {
         fprintf(stderr, "缓存管理器未初始化\n");
         return -1;
     }
@@ -566,12 +561,13 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
     // 创建包含QP信息的连接键
     struct connection_key key = create_connection_key(src_ip, dst_ip, 
                                                      src_port, dst_port,
-                                                     src_qp, dest_qp,
+                                                     src_qp, dest_qp,  // 传入QP
                                                      service_type, pkey);
     
-    // 获取或创建连接缓存（使用指定窗口大小）
+    // 获取或创建连接缓存
+    // 使用传入的窗口大小，而非硬编码1024
     struct connection_cache *conn_cache = get_or_create_connection_cache(
-        get_cache_manager(), &key, window_size);
+        g_cache_mgr, &key, window_size);
     if (!conn_cache) return -1;
     
     // 创建缓存报文
