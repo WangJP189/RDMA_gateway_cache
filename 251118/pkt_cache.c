@@ -548,7 +548,7 @@ static void process_batch(struct batch_queue *queue) {
 }
 
 // 线程处理函数（新增）
-static void *thread_worker(void *arg) {
+void *thread_worker(void *arg) {
     size_t thread_id = *(size_t *)arg;
     free(arg);  // 释放传递的线程ID内存
     

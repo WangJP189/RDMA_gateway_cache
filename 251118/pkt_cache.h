@@ -133,6 +133,9 @@ struct connection_cache* get_or_create_connection_cache(
 int insert_packet_sorted(struct connection_cache *cache, 
                          struct cached_packet *new_packet);
 
+//线程处理函数
+void *thread_worker(void *arg);
+
 // 启动工作线程
 int start_worker_threads(struct cache_manager *mgr);
 
