@@ -3,7 +3,7 @@
 /*
 整体逻辑
 该程序是一个基于 RDMA 的报文缓存管理系统，主要功能是通过哈希表管理多连接的报文缓存，支持按 PSN（包序列号）有序存储、NACK 触发的批量重传以及连接超时清理。核心流程包括：
-1、缓存流程：接收报文后先存入线程本地队列，定时（1秒）批量存入对应哈希表项
+1、缓存流程：接收报文后先存入线程本地队列，定时批量存入对应哈希表项
 2、滑动窗口：通过维护每个连接的 PSN 范围（min_psn/max_psn）实现类似滑动窗口的机制
 3、哈希流程：用connection_key作为哈希键，通过哈希表快速定位连接缓存，解决哈希冲突采用链表法
 4、多线程支持：每个线程独立处理数据流，通过线程安全队列实现批量提交
@@ -25,7 +25,12 @@ sudo ./pkt_cache
 #include <arpa/inet.h>
 #include <unistd.h>
 
-// 缓存报文结构（保持不变）
+#define DEFAULT_WINDOW_SIZE 16384  // 增大窗口大小
+#define BATCH_INTERVAL 0.1   // 减小批量间隔(秒)
+#define BATCH_MAX_PACKETS 5000  // 增大批量最大包数
+#define THREAD_COUNT 4     // 缓存工作线程数
+
+// 缓存报文结构
 struct cached_packet {
     unsigned char *app_data;          // 应用数据载荷
     int data_len;                     // 数据长度
@@ -36,7 +41,7 @@ struct cached_packet {
     struct cached_packet *prev;       // 前一个节点（双向链表）
 };
 
-// 线程本地批量缓存队列（新增）
+// 线程本地批量缓存队列
 struct batch_queue {
     struct batch_node *head;          // 队列头
     struct batch_node *tail;          // 队列尾
@@ -46,7 +51,7 @@ struct batch_queue {
     int running;                      // 线程运行标志
 };
 
-// 每个连接的缓存队列（保持不变）
+// 每个连接的缓存队列
 struct connection_cache {
     struct cached_packet *head;       // 队列头（最小PSN）
     struct cached_packet *tail;       // 队列尾（最大PSN）
@@ -60,7 +65,7 @@ struct connection_cache {
     pthread_mutex_t lock;             // 连接级锁
 };
 
-// IPv4连接标识键（保持不变）
+// IPv4连接标识键
 struct connection_key {
     uint32_t src_ip;                  // 源IP
     uint32_t dst_ip;                  // 目的IP
@@ -72,14 +77,14 @@ struct connection_key {
     uint16_t pkey;                    // 分区键
 };
 
-// 哈希表节点（保持不变）
+// 哈希表节点
 struct hash_table_entry {
     struct connection_key key;        // 连接标识
     struct connection_cache *cache;   // 对应的缓存队列
     struct hash_table_entry *next;    // 哈希冲突链表
 };
 
-// 批量缓存临时节点（新增）
+// 批量缓存临时节点
 struct batch_node {
     struct connection_key key;        // 连接键
     uint32_t psn;                     // 包序列号
@@ -105,7 +110,19 @@ struct cache_manager {
     size_t thread_count;              // 线程数量
 };
 
-// 哈希计算函数（保持不变）
+
+// 批量缓存队列结构
+typedef struct {
+    struct packet_data *packets[BATCH_MAX_PACKETS];
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} BatchQueue;
+
+// 全局缓存管理器实例
+struct cache_manager *g_cache_mgr = NULL;
+
+// 哈希计算函数
 uint32_t calculate_hash(const struct connection_key *key, size_t table_size)
 {
     uint32_t hash = 5381;
@@ -121,7 +138,7 @@ uint32_t calculate_hash(const struct connection_key *key, size_t table_size)
     return hash % table_size;
 }
 
-// 连接键比较（保持不变）
+// 连接键比较
 int connection_keys_equal(const struct connection_key *a,
                           const struct connection_key *b)
 {
@@ -135,7 +152,7 @@ int connection_keys_equal(const struct connection_key *a,
             a->pkey == b->pkey);
 }
 
-// 创建连接键（保持不变）
+// 创建连接键
 struct connection_key create_connection_key(const char *src_ip, const char *dst_ip,
                                             uint16_t src_port, uint16_t dst_port,
                                             uint32_t src_qp, uint32_t dest_qp,
@@ -156,7 +173,7 @@ struct connection_key create_connection_key(const char *src_ip, const char *dst_
     return key;
 }
 
-// 打印连接键信息（保持不变）
+// 打印连接键信息
 void print_connection_key(const struct connection_key *key) {
     char src_ip[INET_ADDRSTRLEN];
     char dst_ip[INET_ADDRSTRLEN];
@@ -170,14 +187,12 @@ void print_connection_key(const struct connection_key *key) {
            key->service_type, key->pkey);
 }
 
-// 全局缓存管理器实例（保持不变）
-struct cache_manager *g_cache_mgr = NULL;
 
 struct cache_manager* get_cache_manager(){
     return g_cache_mgr;
 }
 
-// 初始化缓存管理器（修改为支持多线程）
+// 初始化缓存管理器（支持多线程）
 struct cache_manager* init_cache_manager(size_t hash_size, 
                                         size_t max_conns,
                                         size_t max_packets_per_conn,
@@ -310,7 +325,7 @@ void destroy_connection_cache(struct connection_cache *cache)
     free(cache);
 }
 
-// 获取或创建连接缓存（保持不变）
+// 获取或创建连接缓存
 struct connection_cache* get_or_create_connection_cache(
     struct cache_manager *mgr, const struct connection_key *key,
     uint32_t window_size)
@@ -886,24 +901,50 @@ void retransmit_rdma_packet(const struct connection_key *key,
     printf(" PSN=%u, 长度=%d\n", psn, len);
 }
 
-// 测试用的线程函数（新增）
-void *test_producer_thread(void *arg) {
-    size_t thread_id = *(size_t *)arg;
-    unsigned char data[128];
-    snprintf((char *)data, sizeof(data), "thread_%zu_test_data", thread_id);
-    
-    // 每个线程发送10个报文
-    for (uint32_t psn = 1; psn <= 10; psn++) {
-        add_to_batch_queue(thread_id,
-                         "192.168.1.100", "192.168.1.200",
-                         1234, 5678, thread_id + 10, 20, 0, 0xffff,
-                         psn + thread_id * 100,  // 不同线程使用不同PSN范围避免冲突
-                         data, strlen((char *)data) + 1,
-                         1024);
-        usleep(100000);  // 每100ms发送一个
+// 销毁缓存管理器
+void destroy_cache_manager() {
+    struct cache_manager *mgr = get_cache_manager();
+    if (mgr) {
+        printf("[主线程] 停止工作线程\n");
+        stop_worker_threads(mgr);
+        
+        // 清理哈希表（若hash_table_entry在pkt_cache.h中定义）
+        for (size_t i = 0; i < mgr->hash_table_size; i++) {
+            struct hash_table_entry *entry = mgr->hash_table[i];
+            while (entry) {
+                struct hash_table_entry *next = entry->next;
+                destroy_connection_cache(entry->cache);
+                free(entry);
+                entry = next;
+            }
+        }
+        free(mgr->hash_table);
+        pthread_mutex_destroy(&mgr->global_lock);
+        free(mgr);
+        printf("[主线程] 缓存管理器已销毁\n");
     }
-    return NULL;
 }
+
+
+
+// // 测试用的线程函数（新增）
+// void *test_producer_thread(void *arg) {
+//     size_t thread_id = *(size_t *)arg;
+//     unsigned char data[128];
+//     snprintf((char *)data, sizeof(data), "thread_%zu_test_data", thread_id);
+    
+//     // 每个线程发送10个报文
+//     for (uint32_t psn = 1; psn <= 10; psn++) {
+//         add_to_batch_queue(thread_id,
+//                          "192.168.1.100", "192.168.1.200",
+//                          1234, 5678, thread_id + 10, 20, 0, 0xffff,
+//                          psn + thread_id * 100,  // 不同线程使用不同PSN范围避免冲突
+//                          data, strlen((char *)data) + 1,
+//                          1024);
+//         usleep(100000);  // 每100ms发送一个
+//     }
+//     return NULL;
+// }
 
 // // 主函数测试
 // int main() {

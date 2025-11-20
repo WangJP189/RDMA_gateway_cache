@@ -33,11 +33,18 @@ sudo gdb ./pkt_cache_val2_1118
 #define IP_HDR_LEN  20
 #define UDP_HDR_LEN 8
 #define RDMA_PORT   4791  // 目标端口筛选
-#define DEFAULT_WINDOW_SIZE 16384  // 增大窗口大小
-#define BATCH_INTERVAL 0.01   // 减小批量间隔(秒)
-#define BATCH_MAX_PACKETS 5000  // 增大批量最大包数
 #define STATS_INTERVAL 5   // 性能统计输出间隔(秒)
-#define THREAD_COUNT 4     // 缓存工作线程数
+
+
+// 性能统计结构体
+typedef struct {
+    uint64_t total_captured;  // 总捕获包数
+    uint64_t total_cached;    // 总缓存包数
+    uint64_t total_bytes;     // 总缓存字节数
+    uint64_t total_dropped;   // 因缓存上限丢弃的包数
+    struct timeval start_time; // 统计开始时间
+    pthread_mutex_t lock;     // 统计锁
+} PerfStats;
 
 // 声明工作线程参数结构体
 struct worker_args {
@@ -60,24 +67,6 @@ struct packet_data {
     int payload_len;
     uint32_t window_size;
 };
-
-// 批量缓存队列结构
-typedef struct {
-    struct packet_data *packets[BATCH_MAX_PACKETS];
-    int count;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-} BatchQueue;
-
-// 性能统计结构体
-typedef struct {
-    uint64_t total_captured;  // 总捕获包数
-    uint64_t total_cached;    // 总缓存包数
-    uint64_t total_bytes;     // 总缓存字节数
-    uint64_t total_dropped;   // 因缓存上限丢弃的包数
-    struct timeval start_time; // 统计开始时间
-    pthread_mutex_t lock;     // 统计锁
-} PerfStats;
 
 // 全局变量
 BatchQueue g_batch_queue = {
@@ -224,20 +213,20 @@ void *cleanup_thread(void *arg) {
     return NULL;
 }
 
-// 工作线程包装函数，添加线程标识（假设原工作函数为thread_worker）
-void *worker_thread_wrapper(void *arg) {
-    struct worker_args *args = (struct worker_args *)arg;
-    int thread_id = args->thread_id;
+// // 工作线程包装函数，添加线程标识（假设原工作函数为thread_worker）
+// void *worker_thread_wrapper(void *arg) {
+//     struct worker_args *args = (struct worker_args *)arg;
+//     int thread_id = args->thread_id;
     
-    printf("[工作线程%d] 启动\n", thread_id);
+//     printf("[工作线程%d] 启动\n", thread_id);
     
-    // 调用实际工作函数（原pkt_cache.c中的线程函数，假设为thread_worker）
-    thread_worker(arg);  // 修正：使用pkt_cache.c中定义的线程函数名
+//     // 调用实际工作函数（原pkt_cache.c中的线程函数，假设为thread_worker）
+//     thread_worker(arg);  // 修正：使用pkt_cache.c中定义的线程函数名
     
-    printf("[工作线程%d] 退出\n", thread_id);
-    free(args);  // 释放参数内存
-    return NULL;
-}
+//     printf("[工作线程%d] 退出\n", thread_id);
+//     free(args);  // 释放参数内存
+//     return NULL;
+// }
 
 // 数据包处理回调
 void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *packet) {
@@ -328,29 +317,6 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *p
     }
 }
 
-// 销毁缓存管理器
-void destroy_cache_manager() {
-    struct cache_manager *mgr = get_cache_manager();
-    if (mgr) {
-        printf("[主线程] 停止工作线程\n");
-        stop_worker_threads(mgr);
-        
-        // 清理哈希表（若hash_table_entry在pkt_cache.h中定义）
-        for (size_t i = 0; i < mgr->hash_table_size; i++) {
-            struct hash_table_entry *entry = mgr->hash_table[i];
-            while (entry) {
-                struct hash_table_entry *next = entry->next;
-                destroy_connection_cache(entry->cache);
-                free(entry);
-                entry = next;
-            }
-        }
-        free(mgr->hash_table);
-        pthread_mutex_destroy(&mgr->global_lock);
-        free(mgr);
-        printf("[主线程] 缓存管理器已销毁\n");
-    }
-}
 
 // // 启动工作线程函数，添加线程标识
 // int start_worker_threads(struct cache_manager *mgr) {
@@ -385,8 +351,8 @@ int main() {
     struct cache_manager *mgr = init_cache_manager(
         1024,                // 哈希表大小
         100,                 // 最大连接数
-        5000,                // 每连接最大报文数（减小以便测试上限）
-        50,                  // 每连接最大字节数(MB)（减小以便测试上限）
+        5000,                // 每连接最大报文数
+        50,                  // 每连接最大字节数(MB)
         300,                 // 连接超时时间(秒)
         DEFAULT_WINDOW_SIZE, // 默认窗口大小
         THREAD_COUNT         // 工作线程数量

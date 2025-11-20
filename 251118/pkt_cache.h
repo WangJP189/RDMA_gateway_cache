@@ -10,6 +10,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#define DEFAULT_WINDOW_SIZE 16384  // 增大窗口大小
+#define BATCH_INTERVAL 0.1   // 减小批量间隔(秒)
+#define BATCH_MAX_PACKETS 5000  // 增大批量最大包数
+#define THREAD_COUNT 4     // 缓存工作线程数
+
 // 缓存报文结构（保持不变）
 struct cached_packet {
     unsigned char *app_data;          // 应用数据载荷
@@ -89,6 +94,15 @@ struct cache_manager {
     pthread_t *threads;               // 线程数组
     size_t thread_count;              // 线程数量
 };
+
+
+// 批量缓存队列结构
+typedef struct {
+    struct packet_data *packets[BATCH_MAX_PACKETS];
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} BatchQueue;
 
 // 哈希计算函数
 uint32_t calculate_hash(const struct connection_key *key, size_t table_size);
@@ -173,5 +187,8 @@ void print_all_connections_status();
 void retransmit_rdma_packet(const struct connection_key *key, 
                            const unsigned char *data, int len, 
                            uint32_t dest_qp, uint32_t psn);
+
+// 销毁缓存管理器
+void destroy_cache_manager();
 
 #endif // PKT_CACHE_H
