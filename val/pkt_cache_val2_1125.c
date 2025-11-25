@@ -12,18 +12,12 @@ gcc -g pkt_cache_val2_1125.c ../251125/pkt_cache.c -o pkt_cache_val2_1125 -lpthr
 运行命令：
 sudo gdb ./pkt_cache_val2_1125
 
-更新说明：
-1. 修复内存泄漏问题
-2. 增加线程同步超时机制
-3. 优化批量处理逻辑，减少线程切换
-4. 限制PCAP捕获速率，避免缓冲区溢出
-5. 增加内存使用监控
 
 
 gcc pkt_cache_val2_1125.c -o pkt_cache_val2_1125 -lpcap
 */
 
-// RDMA缓存验证程序 - 简化稳定版本
+// RDMA缓存验证程序 - 带重传测试功能
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,20 +26,62 @@ gcc pkt_cache_val2_1125.c -o pkt_cache_val2_1125 -lpcap
 #include <netinet/udp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "../251125/pkt_cache.c"  // 直接包含缓存模块
 
 #define RDMA_PORT 4791
 #define ETH_HDR_LEN 14
-#define MAX_PACKETS 10000  // 最大处理包数，防止无限运行
+#define MAX_PACKETS 10000  // 最大处理包数
+#define RETRANSMIT_TEST_INTERVAL 1000  // 重传测试间隔(包数)
 
 // 全局变量
 pcap_t *handle;
 int packet_count = 0;
+pthread_mutex_t retransmit_lock = PTHREAD_MUTEX_INITIALIZER;
+uint32_t last_test_psn = 0;
+char last_src_ip[INET_ADDRSTRLEN] = {0};
+char last_dst_ip[INET_ADDRSTRLEN] = {0};
+uint16_t last_src_port = 0;
+uint16_t last_dst_port = 0;
+uint32_t last_src_qp = 0;
+uint32_t last_dest_qp = 0;
+
+// 重传测试线程
+void *retransmit_test_thread(void *arg) {
+    while (1) {
+        sleep(2);  // 每2秒测试一次
+        
+        pthread_mutex_lock(&retransmit_lock);
+        if (last_test_psn > 0 && strlen(last_src_ip) > 0) {
+            // 随机测试一个之前的PSN（-5到当前）
+            uint32_t test_psn = last_test_psn - (rand() % 5);
+            if (test_psn < 1) test_psn = 1;
+            
+            printf("\n===== 重传测试: 查找PSN=%u =====\n", test_psn);
+            struct cached_packet *pkt = find_packet_by_psn(
+                last_src_ip, last_dst_ip,
+                last_src_port, last_dst_port,
+                last_src_qp, last_dest_qp,
+                test_psn
+            );
+            
+            if (pkt) {
+                printf("找到PSN=%u的数据包, 长度=%d\n", pkt->psn, pkt->data_len);
+                free(pkt);
+            } else {
+                printf("未找到PSN=%u的数据包\n", test_psn);
+            }
+            printf("==============================\n");
+        }
+        pthread_mutex_unlock(&retransmit_lock);
+    }
+    return NULL;
+}
 
 // 数据包处理回调
 void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *packet) {
-    // 限制处理包数，防止无限运行
+    // 限制处理包数
     if (packet_count++ >= MAX_PACKETS) {
         pcap_breakloop(handle);
         return;
@@ -67,11 +103,22 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *p
     int payload_len = udp_total_len - 8; // UDP头长度
     const unsigned char *payload = (u_char*)udp_hdr + 8;
 
-    // 模拟提取RDMA信息（实际应从IB头部解析）
+    // 提取RDMA信息（实际应从IB头部解析）
     static uint32_t psn_counter = 1;
     uint32_t src_qp = 0x1234;
     uint32_t dest_qp = 0x5678;
     uint32_t psn = psn_counter++;
+
+    // 保存信息用于重传测试
+    pthread_mutex_lock(&retransmit_lock);
+    strncpy(last_src_ip, inet_ntoa(ip_hdr->ip_src), INET_ADDRSTRLEN-1);
+    strncpy(last_dst_ip, inet_ntoa(ip_hdr->ip_dst), INET_ADDRSTRLEN-1);
+    last_src_port = ntohs(udp_hdr->source);
+    last_dst_port = ntohs(udp_hdr->dest);
+    last_src_qp = src_qp;
+    last_dest_qp = dest_qp;
+    last_test_psn = psn;
+    pthread_mutex_unlock(&retransmit_lock);
 
     // 调用缓存函数
     int ret = add_to_batch_queue(
@@ -106,13 +153,21 @@ int main() {
     char errbuf[PCAP_ERRBUF_SIZE];
     struct bpf_program fp;
     char filter_exp[100];
+    pthread_t retransmit_thread;
 
     printf("=== RDMA缓存验证程序启动 ===\n");
 
     // 初始化缓存管理器
-    g_cache_mgr = init_cache_manager(16); // 小哈希表
+    g_cache_mgr = init_cache_manager(8); // 小哈希表
     if (!g_cache_mgr) {
         fprintf(stderr, "缓存管理器初始化失败\n");
+        return 1;
+    }
+
+    // 启动重传测试线程
+    if (pthread_create(&retransmit_thread, NULL, retransmit_test_thread, NULL) != 0) {
+        fprintf(stderr, "创建重传测试线程失败\n");
+        destroy_cache_manager(g_cache_mgr);
         return 1;
     }
 
@@ -150,6 +205,8 @@ int main() {
     // 清理资源
     pcap_close(handle);
     destroy_cache_manager(g_cache_mgr);
+    pthread_cancel(retransmit_thread);
+    pthread_join(retransmit_thread, NULL);
     
     printf("\n程序正常结束，共处理 %d 个数据包\n", packet_count);
     return 0;

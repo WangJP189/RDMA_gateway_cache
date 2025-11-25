@@ -13,18 +13,25 @@ gcc pkt_cache.c -o pkt_cache -lpthread -lrdmacm -libverbs
 sudo ./pkt_cache
 */
 
-// RDMA报文缓存管理系统 - 简化稳定版本
+// RDMA报文缓存管理系统（进程隔离版）
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <unistd.h>
 
-// 配置参数
-#define MAX_CONNECTIONS 10           // 最大连接数
-#define RING_BUFFER_SIZE 1000        // 每个连接的环形缓冲区大小（包数）
+// 配置参数（根据虚拟机性能调整）
+#define MAX_CONNECTIONS 5            // 最大连接数
+#define RING_BUFFER_SIZE 500         // 每个连接的环形缓冲区大小
 #define MAX_PACKET_SIZE 4096         // 最大包大小
+#define BATCH_TIMEOUT_MS 100         // 批量处理超时时间(ms)
+#define BATCH_THRESHOLD 100          // 批量处理阈值
 
 // 连接标识键
 struct connection_key {
@@ -61,7 +68,9 @@ struct connection_cache {
 // 哈希表节点
 struct hash_entry {
     struct connection_key key;
-    struct connection_cache *cache;
+    pid_t process_id;                // 对应处理进程ID
+    int shm_id;                      // 共享内存ID
+    struct connection_cache *cache;  // 共享内存地址
     struct hash_entry *next;
 };
 
@@ -75,6 +84,14 @@ struct cache_manager {
 
 // 全局缓存管理器
 struct cache_manager *g_cache_mgr = NULL;
+
+// 消息队列结构（用于进程间通信）
+struct packet_msg {
+    uint32_t psn;
+    unsigned char data[MAX_PACKET_SIZE];
+    int data_len;
+    int processed;
+};
 
 // 简化哈希函数
 uint32_t calculate_hash(const struct connection_key *key, size_t table_size) {
@@ -116,7 +133,7 @@ struct connection_cache* create_connection_cache(uint32_t first_psn) {
     cache->min_psn = first_psn;
     cache->max_psn = first_psn;
     cache->window_start = first_psn;
-    cache->window_size = 32; // 默认窗口大小
+    cache->window_size = 32;  // 初始窗口大小
     gettimeofday(&cache->last_activity, NULL);
     
     if (pthread_mutex_init(&cache->lock, NULL) != 0) {
@@ -132,6 +149,19 @@ static inline size_t psn_to_index(struct connection_cache *cache, uint32_t psn) 
     return (psn - cache->base_psn) % RING_BUFFER_SIZE;
 }
 
+// 滑动窗口调整函数
+static void adjust_window(struct connection_cache *cache, uint32_t psn) {
+    // 当PSN超过窗口上限时，滑动窗口
+    if (psn >= cache->window_start + cache->window_size) {
+        uint32_t new_start = psn - cache->window_size + 1;
+        // 确保新窗口起始位置不小于最小PSN
+        if (new_start < cache->min_psn) {
+            new_start = cache->min_psn;
+        }
+        cache->window_start = new_start;
+    }
+}
+
 // 插入数据包到缓存
 int insert_packet(struct connection_cache *cache, uint32_t psn, 
                  const unsigned char *data, int data_len) {
@@ -140,6 +170,9 @@ int insert_packet(struct connection_cache *cache, uint32_t psn,
     }
     
     pthread_mutex_lock(&cache->lock);
+    
+    // 动态调整窗口
+    adjust_window(cache, psn);
     
     // 计算位置
     size_t index = psn_to_index(cache, psn);
@@ -176,7 +209,7 @@ int insert_packet(struct connection_cache *cache, uint32_t psn,
     return 0;
 }
 
-// 查找数据包
+// 查找数据包（重传请求处理）
 struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) {
     if (!cache) return NULL;
     
@@ -190,11 +223,10 @@ struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) 
         return NULL;
     }
     
-    // 返回数据副本
+    // 创建数据副本返回
     struct cached_packet *result = malloc(sizeof(struct cached_packet));
     if (result) {
         memcpy(result, packet, sizeof(struct cached_packet));
-        // 复制数据内容
         result->data_len = packet->data_len;
         memcpy(result->data, packet->data, packet->data_len);
     }
@@ -203,7 +235,52 @@ struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) 
     return result;
 }
 
-// 获取或创建连接缓存
+// 连接处理进程
+static void connection_process(struct connection_cache *cache, int msg_queue_id) {
+    struct packet_msg *msg_queue = (struct packet_msg*)shmat(msg_queue_id, NULL, 0);
+    if (msg_queue == (void*)-1) {
+        perror("shmat failed");
+        exit(EXIT_FAILURE);
+    }
+
+    struct timeval last_process_time;
+    gettimeofday(&last_process_time, NULL);
+    int pending_count = 0;
+
+    while (1) {
+        // 检查是否有新消息
+        for (int i = 0; i < BATCH_THRESHOLD; i++) {
+            if (!msg_queue[i].processed && msg_queue[i].data_len > 0) {
+                insert_packet(cache, msg_queue[i].psn, 
+                             msg_queue[i].data, msg_queue[i].data_len);
+                msg_queue[i].processed = 1;
+                pending_count++;
+            }
+        }
+
+        // 检查超时或达到阈值
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long elapsed = (now.tv_sec - last_process_time.tv_sec) * 1000 +
+                      (now.tv_usec - last_process_time.tv_usec) / 1000;
+
+        if (pending_count >= BATCH_THRESHOLD || elapsed >= BATCH_TIMEOUT_MS) {
+            if (pending_count > 0) {
+                // 批量处理完成，重置计数器
+                pending_count = 0;
+                gettimeofday(&last_process_time, NULL);
+            }
+        }
+
+        // 短暂休眠，降低CPU占用
+        usleep(1000);
+    }
+
+    shmdt(msg_queue);
+    exit(EXIT_SUCCESS);
+}
+
+// 获取或创建连接缓存（进程隔离版）
 struct connection_cache* get_or_create_cache(struct cache_manager *mgr, 
                                            const struct connection_key *key,
                                            uint32_t first_psn) {
@@ -229,27 +306,94 @@ struct connection_cache* get_or_create_cache(struct cache_manager *mgr,
         return NULL;
     }
     
-    // 创建新连接缓存
-    struct connection_cache *new_cache = create_connection_cache(first_psn);
-    if (!new_cache) {
+    // 创建共享内存用于消息队列
+    int msg_queue_id = shmget(IPC_PRIVATE, sizeof(struct packet_msg) * BATCH_THRESHOLD, 0666 | IPC_CREAT);
+    if (msg_queue_id == -1) {
+        perror("shmget failed");
         pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     }
-    
+
+    // 初始化共享内存
+    struct packet_msg *msg_queue = (struct packet_msg*)shmat(msg_queue_id, NULL, 0);
+    if (msg_queue == (void*)-1) {
+        perror("shmat failed");
+        shmctl(msg_queue_id, IPC_RMID, NULL);
+        pthread_mutex_unlock(&mgr->global_lock);
+        return NULL;
+    }
+    memset(msg_queue, 0, sizeof(struct packet_msg) * BATCH_THRESHOLD);
+    shmdt(msg_queue);
+
+    // 创建共享内存用于缓存
+    int shm_id = shmget(IPC_PRIVATE, sizeof(struct connection_cache), 0666 | IPC_CREAT);
+    if (shm_id == -1) {
+        perror("shmget failed");
+        shmctl(msg_queue_id, IPC_RMID, NULL);
+        pthread_mutex_unlock(&mgr->global_lock);
+        return NULL;
+    }
+
+    // 映射共享内存
+    struct connection_cache *new_cache = (struct connection_cache*)shmat(shm_id, NULL, 0);
+    if (new_cache == (void*)-1) {
+        perror("shmat failed");
+        shmctl(shm_id, IPC_RMID, NULL);
+        shmctl(msg_queue_id, IPC_RMID, NULL);
+        pthread_mutex_unlock(&mgr->global_lock);
+        return NULL;
+    }
+
+    // 初始化缓存
+    memset(new_cache, 0, sizeof(struct connection_cache));
+    new_cache->base_psn = first_psn;
+    new_cache->min_psn = first_psn;
+    new_cache->max_psn = first_psn;
+    new_cache->window_start = first_psn;
+    new_cache->window_size = 32;
+    gettimeofday(&new_cache->last_activity, NULL);
+    pthread_mutex_init(&new_cache->lock, NULL);
+
+    // 创建子进程处理这个连接
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork failed");
+        pthread_mutex_destroy(&new_cache->lock);
+        shmdt(new_cache);
+        shmctl(shm_id, IPC_RMID, NULL);
+        shmctl(msg_queue_id, IPC_RMID, NULL);
+        pthread_mutex_unlock(&mgr->global_lock);
+        return NULL;
+    } else if (pid == 0) {
+        // 子进程：处理连接缓存
+        connection_process(new_cache, msg_queue_id);
+        exit(EXIT_SUCCESS);
+    }
+
+    // 父进程继续
+    shmdt(new_cache);
+
+    // 创建哈希表项
     struct hash_entry *new_entry = malloc(sizeof(struct hash_entry));
     if (!new_entry) {
-        free(new_cache);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        shmctl(shm_id, IPC_RMID, NULL);
+        shmctl(msg_queue_id, IPC_RMID, NULL);
         pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     }
     
     new_entry->key = *key;
-    new_entry->cache = new_cache;
+    new_entry->process_id = pid;
+    new_entry->shm_id = shm_id;
+    new_entry->cache = (struct connection_cache*)shmat(shm_id, NULL, 0);
     new_entry->next = mgr->hash_table[hash_index];
     mgr->hash_table[hash_index] = new_entry;
     mgr->total_connections++;
     
-    printf("创建新连接缓存: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (QP%u->QP%u)\n",
+    printf("创建新连接缓存(进程ID: %d): %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (QP%u->QP%u)\n",
+           pid,
            (key->src_ip >> 24) & 0xFF, (key->src_ip >> 16) & 0xFF, 
            (key->src_ip >> 8) & 0xFF, key->src_ip & 0xFF, key->src_port,
            (key->dst_ip >> 24) & 0xFF, (key->dst_ip >> 16) & 0xFF,
@@ -257,10 +401,10 @@ struct connection_cache* get_or_create_cache(struct cache_manager *mgr,
            key->src_qp, key->dest_qp);
     
     pthread_mutex_unlock(&mgr->global_lock);
-    return new_cache;
+    return new_entry->cache;
 }
 
-// 批量插入数据包（简化版本）
+// 批量插入数据包
 int add_to_batch_queue(const char *src_ip, const char *dst_ip,
                       uint16_t src_port, uint16_t dst_port,
                       uint32_t src_qp, uint32_t dest_qp,
@@ -278,8 +422,33 @@ int add_to_batch_queue(const char *src_ip, const char *dst_ip,
         return -1;
     }
     
-    // 直接插入数据包
+    // 直接插入数据包（实际环境中可改为放入消息队列）
     return insert_packet(cache, psn, app_data, data_len);
+}
+
+// 根据PSN查找数据包（重传请求接口）
+struct cached_packet* find_packet_by_psn(const char *src_ip, const char *dst_ip,
+                                        uint16_t src_port, uint16_t dst_port,
+                                        uint32_t src_qp, uint32_t dest_qp,
+                                        uint32_t psn) {
+    if (!g_cache_mgr) return NULL;
+    
+    struct connection_key key = create_connection_key(src_ip, dst_ip, src_port, dst_port, src_qp, dest_qp);
+    uint32_t hash_index = calculate_hash(&key, g_cache_mgr->hash_table_size);
+    
+    pthread_mutex_lock(&g_cache_mgr->global_lock);
+    
+    struct hash_entry *entry = g_cache_mgr->hash_table[hash_index];
+    while (entry) {
+        if (connection_keys_equal(&entry->key, &key)) {
+            pthread_mutex_unlock(&g_cache_mgr->global_lock);
+            return find_packet(entry->cache, psn);
+        }
+        entry = entry->next;
+    }
+    
+    pthread_mutex_unlock(&g_cache_mgr->global_lock);
+    return NULL;
 }
 
 // 初始化缓存管理器
@@ -314,10 +483,22 @@ void destroy_cache_manager(struct cache_manager *mgr) {
         struct hash_entry *entry = mgr->hash_table[i];
         while (entry) {
             struct hash_entry *next = entry->next;
+            
+            // 终止子进程
+            if (entry->process_id > 0) {
+                kill(entry->process_id, SIGTERM);
+                waitpid(entry->process_id, NULL, 0);
+            }
+            
+            // 清理共享内存
             if (entry->cache) {
                 pthread_mutex_destroy(&entry->cache->lock);
-                free(entry->cache);
+                shmdt(entry->cache);
             }
+            if (entry->shm_id != 0) {
+                shmctl(entry->shm_id, IPC_RMID, NULL);
+            }
+            
             free(entry);
             entry = next;
         }
@@ -346,7 +527,8 @@ void print_all_connections_status() {
             struct connection_key *key = &entry->key;
             struct connection_cache *cache = entry->cache;
             
-            printf("连接: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (QP%u->QP%u)\n",
+            printf("连接(进程ID: %d): %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (QP%u->QP%u)\n",
+                   entry->process_id,
                    (key->src_ip >> 24) & 0xFF, (key->src_ip >> 16) & 0xFF,
                    (key->src_ip >> 8) & 0xFF, key->src_ip & 0xFF, key->src_port,
                    (key->dst_ip >> 24) & 0xFF, (key->dst_ip >> 16) & 0xFF,
