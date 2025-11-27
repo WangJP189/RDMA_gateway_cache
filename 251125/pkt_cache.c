@@ -13,7 +13,7 @@ gcc pkt_cache.c -o pkt_cache -lpthread -lrdmacm -libverbs
 sudo ./pkt_cache
 */
 
-// RDMA报文缓存管理系统（进程隔离版）
+// RDMA报文缓存管理系统
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,15 +25,13 @@ sudo ./pkt_cache
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <unistd.h>
-#include <errno.h>
 
-// 配置参数（根据虚拟机性能调整）
+// 配置参数
 #define MAX_CONNECTIONS 5            // 最大连接数
 #define RING_BUFFER_SIZE 500         // 每个连接的环形缓冲区大小
 #define MAX_PACKET_SIZE 4096         // 最大包大小
 #define BATCH_TIMEOUT_MS 100         // 批量处理超时时间(ms)
 #define BATCH_THRESHOLD 100          // 批量处理阈值
-#define WINDOW_SIZE 128               // 滑动窗口大小
 
 // 连接标识键
 struct connection_key {
@@ -71,7 +69,8 @@ struct connection_cache {
 struct hash_entry {
     struct connection_key key;
     pid_t process_id;                // 对应处理进程ID
-    int shm_id;                      // 共享内存ID
+    int msg_queue_id;                // 消息队列共享内存ID
+    int shm_id;                      // 缓存共享内存ID
     struct connection_cache *cache;  // 共享内存地址
     struct hash_entry *next;
 };
@@ -84,23 +83,17 @@ struct cache_manager {
     pthread_mutex_t global_lock;
 };
 
+// 全局缓存管理器
+struct cache_manager *g_cache_mgr = NULL;
+
 // 消息队列结构（用于进程间通信）
 struct packet_msg {
+    struct connection_key key;
     uint32_t psn;
     unsigned char data[MAX_PACKET_SIZE];
     int data_len;
     int processed;
-    struct connection_key key;
 };
-
-// 全局缓存管理器
-struct cache_manager *g_cache_mgr = NULL;
-
-// 全局消息队列（用于批量处理）
-struct packet_msg batch_queue[BATCH_THRESHOLD];
-int batch_queue_count = 0;
-pthread_mutex_t batch_queue_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t batch_queue_cond = PTHREAD_COND_INITIALIZER;
 
 // 简化哈希函数
 uint32_t calculate_hash(const struct connection_key *key, size_t table_size) {
@@ -123,15 +116,6 @@ struct connection_key create_connection_key(const char *src_ip, const char *dst_
                                           uint32_t src_qp, uint32_t dest_qp) {
     struct connection_key key;
     memset(&key, 0, sizeof(key));
-
-    // 增加错误检查
-    if (inet_pton(AF_INET, src_ip, &key.src_ip) != 1) {
-        fprintf(stderr, "无效的源IP地址: %s\n", src_ip);
-    }
-    if (inet_pton(AF_INET, dst_ip, &key.dst_ip) != 1) {
-        fprintf(stderr, "无效的目标IP地址: %s\n", dst_ip);
-    }
-
     inet_pton(AF_INET, src_ip, &key.src_ip);
     inet_pton(AF_INET, dst_ip, &key.dst_ip);
     key.src_port = src_port;
@@ -151,7 +135,7 @@ struct connection_cache* create_connection_cache(uint32_t first_psn) {
     cache->min_psn = first_psn;
     cache->max_psn = first_psn;
     cache->window_start = first_psn;
-    cache->window_size = WINDOW_SIZE;  // 初始窗口大小
+    cache->window_size = 128;  // 增大窗口大小，减少PSN溢出
     gettimeofday(&cache->last_activity, NULL);
     
     if (pthread_mutex_init(&cache->lock, NULL) != 0) {
@@ -232,9 +216,9 @@ struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) 
     if (!cache) return NULL;
     
     pthread_mutex_lock(&cache->lock);
-
-    // 增加调试信息
-    printf("查找PSN=%u, 窗口范围[%u, %u]\n", 
+    
+    // 调试信息：打印查找的PSN和当前窗口范围
+    printf("查找PSN=%u, 当前窗口范围[%u, %u]\n", 
            psn, cache->window_start, cache->window_start + cache->window_size - 1);
     
     size_t index = psn_to_index(cache, psn);
@@ -257,7 +241,7 @@ struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) 
     return result;
 }
 
-// 连接处理进程
+// 连接处理进程 - 负责批量处理消息队列
 static void connection_process(struct connection_cache *cache, int msg_queue_id) {
     struct packet_msg *msg_queue = (struct packet_msg*)shmat(msg_queue_id, NULL, 0);
     if (msg_queue == (void*)-1) {
@@ -267,10 +251,10 @@ static void connection_process(struct connection_cache *cache, int msg_queue_id)
 
     struct timeval last_process_time;
     gettimeofday(&last_process_time, NULL);
-    int pending_count = 0;
 
     while (1) {
-        // 检查是否有新消息
+        int pending_count = 0;
+        // 处理队列中的所有消息
         for (int i = 0; i < BATCH_THRESHOLD; i++) {
             if (!msg_queue[i].processed && msg_queue[i].data_len > 0) {
                 insert_packet(cache, msg_queue[i].psn, 
@@ -280,18 +264,16 @@ static void connection_process(struct connection_cache *cache, int msg_queue_id)
             }
         }
 
-        // 检查超时或达到阈值
+        // 检查超时
         struct timeval now;
         gettimeofday(&now, NULL);
         long elapsed = (now.tv_sec - last_process_time.tv_sec) * 1000 +
                       (now.tv_usec - last_process_time.tv_usec) / 1000;
 
-        if (pending_count >= BATCH_THRESHOLD || elapsed >= BATCH_TIMEOUT_MS) {
-            if (pending_count > 0) {
-                // 批量处理完成，重置计数器
-                pending_count = 0;
-                gettimeofday(&last_process_time, NULL);
-            }
+        if (pending_count > 0) {
+            last_process_time = now;
+        } else if (elapsed >= BATCH_TIMEOUT_MS) {
+            last_process_time = now;
         }
 
         // 短暂休眠，降低CPU占用
@@ -302,21 +284,28 @@ static void connection_process(struct connection_cache *cache, int msg_queue_id)
     exit(EXIT_SUCCESS);
 }
 
-// 获取或创建连接缓存（进程隔离版）
-struct connection_cache* get_or_create_cache(struct cache_manager *mgr, 
+// 获取消息队列中第一个空闲位置
+static int get_free_msg_slot(struct packet_msg *msg_queue) {
+    for (int i = 0; i < BATCH_THRESHOLD; i++) {
+        if (msg_queue[i].processed) {
+            return i;
+        }
+    }
+    return -1; // 队列满
+}
+
+// 获取或创建连接缓存
+struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr, 
                                            const struct connection_key *key,
                                            uint32_t first_psn) {
     uint32_t hash_index = calculate_hash(key, mgr->hash_table_size);
-    
-    pthread_mutex_lock(&mgr->global_lock);
     
     // 查找现有连接
     struct hash_entry *entry = mgr->hash_table[hash_index];
     while (entry) {
         if (connection_keys_equal(&entry->key, key)) {
             gettimeofday(&entry->cache->last_activity, NULL);
-            pthread_mutex_unlock(&mgr->global_lock);
-            return entry->cache;
+            return entry;
         }
         entry = entry->next;
     }
@@ -324,24 +313,21 @@ struct connection_cache* get_or_create_cache(struct cache_manager *mgr,
     // 检查连接数限制
     if (mgr->total_connections >= MAX_CONNECTIONS) {
         printf("达到最大连接数限制 (%zu/%d)\n", mgr->total_connections, MAX_CONNECTIONS);
-        pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     }
     
     // 创建共享内存用于消息队列
     int msg_queue_id = shmget(IPC_PRIVATE, sizeof(struct packet_msg) * BATCH_THRESHOLD, 0666 | IPC_CREAT);
     if (msg_queue_id == -1) {
-        perror("shmget failed");
-        pthread_mutex_unlock(&mgr->global_lock);
+        perror("shmget failed for msg queue");
         return NULL;
     }
 
     // 初始化共享内存
     struct packet_msg *msg_queue = (struct packet_msg*)shmat(msg_queue_id, NULL, 0);
     if (msg_queue == (void*)-1) {
-        perror("shmat failed");
+        perror("shmat failed for msg queue");
         shmctl(msg_queue_id, IPC_RMID, NULL);
-        pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     }
     memset(msg_queue, 0, sizeof(struct packet_msg) * BATCH_THRESHOLD);
@@ -350,19 +336,17 @@ struct connection_cache* get_or_create_cache(struct cache_manager *mgr,
     // 创建共享内存用于缓存
     int shm_id = shmget(IPC_PRIVATE, sizeof(struct connection_cache), 0666 | IPC_CREAT);
     if (shm_id == -1) {
-        perror("shmget failed");
+        perror("shmget failed for cache");
         shmctl(msg_queue_id, IPC_RMID, NULL);
-        pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     }
 
     // 映射共享内存
     struct connection_cache *new_cache = (struct connection_cache*)shmat(shm_id, NULL, 0);
     if (new_cache == (void*)-1) {
-        perror("shmat failed");
+        perror("shmat failed for cache");
         shmctl(shm_id, IPC_RMID, NULL);
         shmctl(msg_queue_id, IPC_RMID, NULL);
-        pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     }
 
@@ -372,7 +356,7 @@ struct connection_cache* get_or_create_cache(struct cache_manager *mgr,
     new_cache->min_psn = first_psn;
     new_cache->max_psn = first_psn;
     new_cache->window_start = first_psn;
-    new_cache->window_size = 32;
+    new_cache->window_size = 128;
     gettimeofday(&new_cache->last_activity, NULL);
     pthread_mutex_init(&new_cache->lock, NULL);
 
@@ -384,7 +368,6 @@ struct connection_cache* get_or_create_cache(struct cache_manager *mgr,
         shmdt(new_cache);
         shmctl(shm_id, IPC_RMID, NULL);
         shmctl(msg_queue_id, IPC_RMID, NULL);
-        pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     } else if (pid == 0) {
         // 子进程：处理连接缓存
@@ -402,31 +385,33 @@ struct connection_cache* get_or_create_cache(struct cache_manager *mgr,
         waitpid(pid, NULL, 0);
         shmctl(shm_id, IPC_RMID, NULL);
         shmctl(msg_queue_id, IPC_RMID, NULL);
-        pthread_mutex_unlock(&mgr->global_lock);
         return NULL;
     }
     
     new_entry->key = *key;
     new_entry->process_id = pid;
+    new_entry->msg_queue_id = msg_queue_id;
     new_entry->shm_id = shm_id;
     new_entry->cache = (struct connection_cache*)shmat(shm_id, NULL, 0);
     new_entry->next = mgr->hash_table[hash_index];
     mgr->hash_table[hash_index] = new_entry;
     mgr->total_connections++;
     
-    printf("创建新连接缓存(进程ID: %d): %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (QP%u->QP%u)\n",
+    // 正确打印IP地址
+    struct in_addr src_in_addr, dst_in_addr;
+    src_in_addr.s_addr = key->src_ip;
+    dst_in_addr.s_addr = key->dst_ip;
+    
+    printf("创建新连接缓存(进程ID: %d): %s:%u -> %s:%u (QP%u->QP%u)\n",
            pid,
-           (key->src_ip >> 24) & 0xFF, (key->src_ip >> 16) & 0xFF, 
-           (key->src_ip >> 8) & 0xFF, key->src_ip & 0xFF, key->src_port,
-           (key->dst_ip >> 24) & 0xFF, (key->dst_ip >> 16) & 0xFF,
-           (key->dst_ip >> 8) & 0xFF, key->dst_ip & 0xFF, key->dst_port,
+           inet_ntoa(src_in_addr), key->src_port,
+           inet_ntoa(dst_in_addr), key->dst_port,
            key->src_qp, key->dest_qp);
     
-    pthread_mutex_unlock(&mgr->global_lock);
-    return new_entry->cache;
+    return new_entry;
 }
 
-// 批量插入数据包
+// 批量插入数据包 - 修复核心：使用消息队列
 int add_to_batch_queue(const char *src_ip, const char *dst_ip,
                       uint16_t src_port, uint16_t dst_port,
                       uint32_t src_qp, uint32_t dest_qp,
@@ -438,66 +423,42 @@ int add_to_batch_queue(const char *src_ip, const char *dst_ip,
     // 创建连接键
     struct connection_key key = create_connection_key(src_ip, dst_ip, src_port, dst_port, src_qp, dest_qp);
     
-    // 加锁保护队列操作
-    pthread_mutex_lock(&batch_queue_lock);
+    pthread_mutex_lock(&g_cache_mgr->global_lock);
     
-    // 检查队列是否已满
-    if (batch_queue_count >= BATCH_THRESHOLD) {
-        pthread_mutex_unlock(&batch_queue_lock);
-        return -1; // 队列满
+    // 获取或创建缓存项
+    struct hash_entry *entry = get_or_create_hash_entry(g_cache_mgr, &key, psn);
+    if (!entry) {
+        pthread_mutex_unlock(&g_cache_mgr->global_lock);
+        return -1;
     }
     
-    // 将数据加入消息队列
-    struct packet_msg *msg = &batch_queue[batch_queue_count++];
-    msg->psn = psn;
-    memcpy(msg->data, app_data, data_len);
-    msg->data_len = data_len;
-    msg->processed = 0;
-    msg->key = key; // 需要在struct packet_msg中添加connection_key字段
-    
-    // 发送信号唤醒批量处理线程
-    if (batch_queue_count >= BATCH_THRESHOLD) {
-        pthread_cond_signal(&batch_queue_cond);
+    // 映射消息队列
+    struct packet_msg *msg_queue = (struct packet_msg*)shmat(entry->msg_queue_id, NULL, 0);
+    if (msg_queue == (void*)-1) {
+        perror("shmat failed in add_to_batch_queue");
+        pthread_mutex_unlock(&g_cache_mgr->global_lock);
+        return -1;
     }
     
-    pthread_mutex_unlock(&batch_queue_lock);
+    // 查找空闲位置
+    int slot = get_free_msg_slot(msg_queue);
+    if (slot == -1) {
+        printf("消息队列已满，无法添加PSN=%u\n", psn);
+        shmdt(msg_queue);
+        pthread_mutex_unlock(&g_cache_mgr->global_lock);
+        return -1;
+    }
+    
+    // 添加到消息队列
+    msg_queue[slot].key = key;
+    msg_queue[slot].psn = psn;
+    memcpy(msg_queue[slot].data, app_data, data_len);
+    msg_queue[slot].data_len = data_len;
+    msg_queue[slot].processed = 0;
+    
+    shmdt(msg_queue);
+    pthread_mutex_unlock(&g_cache_mgr->global_lock);
     return 0;
-}
-
-// 批量处理线程函数
-void *batch_processor_thread(void *arg) {
-    while (1) {
-        pthread_mutex_lock(&batch_queue_lock);
-        
-        // 等待队列达到阈值或超时
-        struct timespec timeout;
-        clock_gettime(CLOCK_REALTIME, &timeout);
-        timeout.tv_sec += BATCH_TIMEOUT_MS / 1000;
-        timeout.tv_nsec += (BATCH_TIMEOUT_MS % 1000) * 1000000;
-        
-        while (batch_queue_count < BATCH_THRESHOLD) {
-            int ret = pthread_cond_timedwait(&batch_queue_cond, &batch_queue_lock, &timeout);
-            if (ret == ETIMEDOUT) break; // 超时退出等待
-        }
-        
-        // 处理队列中的所有消息
-        int count = batch_queue_count;
-        for (int i = 0; i < count; i++) {
-            struct packet_msg *msg = &batch_queue[i];
-            if (!msg->processed && msg->data_len > 0) {
-                struct connection_cache *cache = get_or_create_cache(g_cache_mgr, &msg->key, msg->psn);
-                if (cache) {
-                    insert_packet(cache, msg->psn, msg->data, msg->data_len);
-                }
-                msg->processed = 1;
-            }
-        }
-        
-        // 重置队列
-        batch_queue_count = 0;
-        pthread_mutex_unlock(&batch_queue_lock);
-    }
-    return NULL;
 }
 
 // 根据PSN查找数据包（重传请求接口）
@@ -544,13 +505,6 @@ struct cache_manager* init_cache_manager(size_t hash_size) {
         free(mgr);
         return NULL;
     }
-
-    // 启动批量处理线程
-    pthread_t batch_thread;
-    if (pthread_create(&batch_thread, NULL, batch_processor_thread, NULL) != 0) {
-        perror("创建批量处理线程失败");
-        // 清理已分配资源
-    }
     
     printf("初始化缓存管理器: 哈希表大小=%zu, 最大连接数=%d\n", hash_size, MAX_CONNECTIONS);
     return mgr;
@@ -578,6 +532,9 @@ void destroy_cache_manager(struct cache_manager *mgr) {
             }
             if (entry->shm_id != 0) {
                 shmctl(entry->shm_id, IPC_RMID, NULL);
+            }
+            if (entry->msg_queue_id != 0) {
+                shmctl(entry->msg_queue_id, IPC_RMID, NULL);
             }
             
             free(entry);
@@ -608,16 +565,16 @@ void print_all_connections_status() {
             struct connection_key *key = &entry->key;
             struct connection_cache *cache = entry->cache;
             
-            // 正确代码（使用inet_ntoa）
+            // 正确打印IP地址
             struct in_addr src_in_addr, dst_in_addr;
             src_in_addr.s_addr = key->src_ip;
             dst_in_addr.s_addr = key->dst_ip;
-
+            
             printf("连接(进程ID: %d): %s:%u -> %s:%u (QP%u->QP%u)\n",
-                entry->process_id,
-                inet_ntoa(src_in_addr), key->src_port,
-                inet_ntoa(dst_in_addr), key->dst_port,
-                key->src_qp, key->dest_qp);
+                   entry->process_id,
+                   inet_ntoa(src_in_addr), key->src_port,
+                   inet_ntoa(dst_in_addr), key->dst_port,
+                   key->src_qp, key->dest_qp);
             
             pthread_mutex_lock(&cache->lock);
             printf("  PSN范围: %u-%u, 窗口: [%u, %u], 缓存数据: %zu bytes\n",

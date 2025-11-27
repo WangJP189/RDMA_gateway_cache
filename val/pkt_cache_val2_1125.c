@@ -27,13 +27,14 @@ gcc pkt_cache_val2_1125.c -o pkt_cache_val2_1125 -lpcap
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>  // 新增：用于随机数种子
 
 #include "../251125/pkt_cache.c"  // 直接包含缓存模块
 
 #define RDMA_PORT 4791
 #define ETH_HDR_LEN 14
 #define MAX_PACKETS 10000  // 最大处理包数
-#define RETRANSMIT_TEST_INTERVAL 100  // 重传测试间隔(包数)
+#define RETRANSMIT_TEST_INTERVAL 1000  // 重传测试间隔(包数)
 
 // 全局变量
 pcap_t *handle;
@@ -49,6 +50,9 @@ uint32_t last_dest_qp = 0;
 
 // 重传测试线程
 void *retransmit_test_thread(void *arg) {
+    // 初始化随机数种子
+    srand(time(NULL));
+    
     while (1) {
         sleep(2);  // 每2秒测试一次
         
@@ -103,10 +107,10 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *p
     int payload_len = udp_total_len - 8; // UDP头长度
     const unsigned char *payload = (u_char*)udp_hdr + 8;
 
-    // 提取RDMA信息（实际应从IB头部解析）
-    static uint32_t psn_counter = 1;
-    uint32_t src_qp = 0x1234;
-    uint32_t dest_qp = 0x5678;
+    // 提取RDMA信息（这里使用递增的PSN）
+    static uint32_t psn_counter = 1;  // 从1开始计数，避免0值
+    uint32_t src_qp = 0x1234;  // 实际应用中应从IB头部解析
+    uint32_t dest_qp = 0x5678; // 实际应用中应从IB头部解析
     uint32_t psn = psn_counter++;
 
     // 保存信息用于重传测试
@@ -120,7 +124,7 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *hdr, const u_char *p
     last_test_psn = psn;
     pthread_mutex_unlock(&retransmit_lock);
 
-    // 调用缓存函数
+    // 调用缓存函数 - 现在会使用批量处理队列
     int ret = add_to_batch_queue(
         inet_ntoa(ip_hdr->ip_src),
         inet_ntoa(ip_hdr->ip_dst),
