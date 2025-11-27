@@ -26,12 +26,12 @@ sudo ./pkt_cache
 #include <sys/shm.h>
 #include <unistd.h>
 
-// 配置参数
+// 配置参数（优化批量处理阈值）
 #define MAX_CONNECTIONS 5            // 最大连接数
-#define RING_BUFFER_SIZE 500         // 每个连接的环形缓冲区大小
+#define RING_BUFFER_SIZE 1000        // 增大环形缓冲区
 #define MAX_PACKET_SIZE 4096         // 最大包大小
-#define BATCH_TIMEOUT_MS 100         // 批量处理超时时间(ms)
-#define BATCH_THRESHOLD 100          // 批量处理阈值
+#define BATCH_TIMEOUT_MS 10          // 缩短批量处理超时(ms)
+#define BATCH_THRESHOLD 500          // 增大批量阈值适配高速发包
 
 // 连接标识键
 struct connection_key {
@@ -92,7 +92,7 @@ struct packet_msg {
     uint32_t psn;
     unsigned char data[MAX_PACKET_SIZE];
     int data_len;
-    int processed;
+    int processed;  // 0=未处理(空闲), 1=已处理(待清理)
 };
 
 // 简化哈希函数
@@ -135,7 +135,7 @@ struct connection_cache* create_connection_cache(uint32_t first_psn) {
     cache->min_psn = first_psn;
     cache->max_psn = first_psn;
     cache->window_start = first_psn;
-    cache->window_size = 128;  // 增大窗口大小，减少PSN溢出
+    cache->window_size = 512;  // 大幅增大窗口
     gettimeofday(&cache->last_activity, NULL);
     
     if (pthread_mutex_init(&cache->lock, NULL) != 0) {
@@ -153,13 +153,9 @@ static inline size_t psn_to_index(struct connection_cache *cache, uint32_t psn) 
 
 // 滑动窗口调整函数
 static void adjust_window(struct connection_cache *cache, uint32_t psn) {
-    // 当PSN超过窗口上限时，滑动窗口
     if (psn >= cache->window_start + cache->window_size) {
-        uint32_t new_start = psn - cache->window_size + 1;
-        // 确保新窗口起始位置不小于最小PSN
-        if (new_start < cache->min_psn) {
-            new_start = cache->min_psn;
-        }
+        uint32_t new_start = psn - cache->window_size / 2;  // 保留一半历史数据
+        if (new_start < cache->min_psn) new_start = cache->min_psn;
         cache->window_start = new_start;
     }
 }
@@ -173,25 +169,18 @@ int insert_packet(struct connection_cache *cache, uint32_t psn,
     
     pthread_mutex_lock(&cache->lock);
     
-    // 动态调整窗口
     adjust_window(cache, psn);
     
-    // 计算位置
-    size_t index = psn_to_index(cache, psn);
-    
-    // 检查是否在窗口内
-    if (psn < cache->window_start || psn >= cache->window_start + cache->window_size) {
-        printf("PSN %u 超出窗口范围 [%u, %u]\n", 
-               psn, cache->window_start, cache->window_start + cache->window_size - 1);
+    // 放宽窗口限制：允许缓存窗口外的近期数据
+    if (psn < cache->window_start - 100 || psn >= cache->window_start + cache->window_size + 100) {
         pthread_mutex_unlock(&cache->lock);
         return -1;
     }
     
-    // 更新数据包
+    size_t index = psn_to_index(cache, psn);
     struct cached_packet *packet = &cache->ring[index];
     
     if (packet->valid) {
-        // 释放旧数据占用的字节数
         cache->total_bytes -= packet->data_len;
     }
     
@@ -201,7 +190,6 @@ int insert_packet(struct connection_cache *cache, uint32_t psn,
     packet->valid = 1;
     gettimeofday(&packet->timestamp, NULL);
     
-    // 更新统计信息
     cache->total_bytes += data_len;
     if (psn < cache->min_psn) cache->min_psn = psn;
     if (psn > cache->max_psn) cache->max_psn = psn;
@@ -217,7 +205,6 @@ struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) 
     
     pthread_mutex_lock(&cache->lock);
     
-    // 调试信息：打印查找的PSN和当前窗口范围
     printf("查找PSN=%u, 当前窗口范围[%u, %u]\n", 
            psn, cache->window_start, cache->window_start + cache->window_size - 1);
     
@@ -229,11 +216,9 @@ struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) 
         return NULL;
     }
     
-    // 创建数据副本返回
     struct cached_packet *result = malloc(sizeof(struct cached_packet));
     if (result) {
         memcpy(result, packet, sizeof(struct cached_packet));
-        result->data_len = packet->data_len;
         memcpy(result->data, packet->data, packet->data_len);
     }
     
@@ -241,7 +226,7 @@ struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) 
     return result;
 }
 
-// 连接处理进程 - 负责批量处理消息队列
+// 连接处理进程 - 修复批量消费逻辑
 static void connection_process(struct connection_cache *cache, int msg_queue_id) {
     struct packet_msg *msg_queue = (struct packet_msg*)shmat(msg_queue_id, NULL, 0);
     if (msg_queue == (void*)-1) {
@@ -249,45 +234,37 @@ static void connection_process(struct connection_cache *cache, int msg_queue_id)
         exit(EXIT_FAILURE);
     }
 
-    struct timeval last_process_time;
-    gettimeofday(&last_process_time, NULL);
-
     while (1) {
-        int pending_count = 0;
-        // 处理队列中的所有消息
+        int processed_count = 0;
+        // 遍历队列处理未处理的消息
         for (int i = 0; i < BATCH_THRESHOLD; i++) {
-            if (!msg_queue[i].processed && msg_queue[i].data_len > 0) {
+            if (msg_queue[i].processed == 0 && msg_queue[i].data_len > 0) {
                 insert_packet(cache, msg_queue[i].psn, 
                              msg_queue[i].data, msg_queue[i].data_len);
-                msg_queue[i].processed = 1;
-                pending_count++;
+                msg_queue[i].processed = 1;  // 标记为已处理
+                processed_count++;
+            } else if (msg_queue[i].processed == 1) {
+                // 清理已处理的消息，释放队列位置
+                memset(&msg_queue[i], 0, sizeof(struct packet_msg));
             }
         }
 
-        // 检查超时
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long elapsed = (now.tv_sec - last_process_time.tv_sec) * 1000 +
-                      (now.tv_usec - last_process_time.tv_usec) / 1000;
-
-        if (pending_count > 0) {
-            last_process_time = now;
-        } else if (elapsed >= BATCH_TIMEOUT_MS) {
-            last_process_time = now;
+        // 处理完后短暂休眠，降低CPU占用
+        if (processed_count > 0) {
+            usleep(100);  // 高负载时缩短休眠
+        } else {
+            usleep(1000); // 低负载时正常休眠
         }
-
-        // 短暂休眠，降低CPU占用
-        usleep(1000);
     }
 
     shmdt(msg_queue);
     exit(EXIT_SUCCESS);
 }
 
-// 获取消息队列中第一个空闲位置
+// 修复：查找空闲消息队列位置（processed=0）
 static int get_free_msg_slot(struct packet_msg *msg_queue) {
     for (int i = 0; i < BATCH_THRESHOLD; i++) {
-        if (msg_queue[i].processed) {
+        if (msg_queue[i].processed == 0) {  // 关键修复：找未处理的空闲位置
             return i;
         }
     }
@@ -310,30 +287,29 @@ struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr,
         entry = entry->next;
     }
     
-    // 检查连接数限制
     if (mgr->total_connections >= MAX_CONNECTIONS) {
         printf("达到最大连接数限制 (%zu/%d)\n", mgr->total_connections, MAX_CONNECTIONS);
         return NULL;
     }
     
-    // 创建共享内存用于消息队列
+    // 创建消息队列共享内存
     int msg_queue_id = shmget(IPC_PRIVATE, sizeof(struct packet_msg) * BATCH_THRESHOLD, 0666 | IPC_CREAT);
     if (msg_queue_id == -1) {
         perror("shmget failed for msg queue");
         return NULL;
     }
 
-    // 初始化共享内存
+    // 初始化消息队列：所有位置设为空闲(processed=0)
     struct packet_msg *msg_queue = (struct packet_msg*)shmat(msg_queue_id, NULL, 0);
     if (msg_queue == (void*)-1) {
         perror("shmat failed for msg queue");
         shmctl(msg_queue_id, IPC_RMID, NULL);
         return NULL;
     }
-    memset(msg_queue, 0, sizeof(struct packet_msg) * BATCH_THRESHOLD);
+    memset(msg_queue, 0, sizeof(struct packet_msg) * BATCH_THRESHOLD); // 关键修复：初始化所有字段为0
     shmdt(msg_queue);
 
-    // 创建共享内存用于缓存
+    // 创建缓存共享内存
     int shm_id = shmget(IPC_PRIVATE, sizeof(struct connection_cache), 0666 | IPC_CREAT);
     if (shm_id == -1) {
         perror("shmget failed for cache");
@@ -341,7 +317,6 @@ struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr,
         return NULL;
     }
 
-    // 映射共享内存
     struct connection_cache *new_cache = (struct connection_cache*)shmat(shm_id, NULL, 0);
     if (new_cache == (void*)-1) {
         perror("shmat failed for cache");
@@ -356,11 +331,11 @@ struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr,
     new_cache->min_psn = first_psn;
     new_cache->max_psn = first_psn;
     new_cache->window_start = first_psn;
-    new_cache->window_size = 128;
+    new_cache->window_size = 512;
     gettimeofday(&new_cache->last_activity, NULL);
     pthread_mutex_init(&new_cache->lock, NULL);
 
-    // 创建子进程处理这个连接
+    // 创建子进程
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork failed");
@@ -370,12 +345,10 @@ struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr,
         shmctl(msg_queue_id, IPC_RMID, NULL);
         return NULL;
     } else if (pid == 0) {
-        // 子进程：处理连接缓存
         connection_process(new_cache, msg_queue_id);
         exit(EXIT_SUCCESS);
     }
 
-    // 父进程继续
     shmdt(new_cache);
 
     // 创建哈希表项
@@ -411,7 +384,7 @@ struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr,
     return new_entry;
 }
 
-// 批量插入数据包 - 修复核心：使用消息队列
+// 批量插入数据包 - 最终修复版
 int add_to_batch_queue(const char *src_ip, const char *dst_ip,
                       uint16_t src_port, uint16_t dst_port,
                       uint32_t src_qp, uint32_t dest_qp,
@@ -420,12 +393,10 @@ int add_to_batch_queue(const char *src_ip, const char *dst_ip,
         return -1;
     }
     
-    // 创建连接键
     struct connection_key key = create_connection_key(src_ip, dst_ip, src_port, dst_port, src_qp, dest_qp);
     
     pthread_mutex_lock(&g_cache_mgr->global_lock);
     
-    // 获取或创建缓存项
     struct hash_entry *entry = get_or_create_hash_entry(g_cache_mgr, &key, psn);
     if (!entry) {
         pthread_mutex_unlock(&g_cache_mgr->global_lock);
@@ -443,10 +414,13 @@ int add_to_batch_queue(const char *src_ip, const char *dst_ip,
     // 查找空闲位置
     int slot = get_free_msg_slot(msg_queue);
     if (slot == -1) {
-        printf("消息队列已满，无法添加PSN=%u\n", psn);
+        printf("警告: 消息队列已满，PSN=%u等待重试...\n", psn);
         shmdt(msg_queue);
         pthread_mutex_unlock(&g_cache_mgr->global_lock);
-        return -1;
+        // 短暂重试：避免直接失败
+        usleep(100);
+        return add_to_batch_queue(src_ip, dst_ip, src_port, dst_port, 
+                                 src_qp, dest_qp, psn, app_data, data_len);
     }
     
     // 添加到消息队列
@@ -454,14 +428,14 @@ int add_to_batch_queue(const char *src_ip, const char *dst_ip,
     msg_queue[slot].psn = psn;
     memcpy(msg_queue[slot].data, app_data, data_len);
     msg_queue[slot].data_len = data_len;
-    msg_queue[slot].processed = 0;
+    msg_queue[slot].processed = 0;  // 明确标记为未处理
     
     shmdt(msg_queue);
     pthread_mutex_unlock(&g_cache_mgr->global_lock);
     return 0;
 }
 
-// 根据PSN查找数据包（重传请求接口）
+// 根据PSN查找数据包
 struct cached_packet* find_packet_by_psn(const char *src_ip, const char *dst_ip,
                                         uint16_t src_port, uint16_t dst_port,
                                         uint32_t src_qp, uint32_t dest_qp,
@@ -519,13 +493,11 @@ void destroy_cache_manager(struct cache_manager *mgr) {
         while (entry) {
             struct hash_entry *next = entry->next;
             
-            // 终止子进程
             if (entry->process_id > 0) {
                 kill(entry->process_id, SIGTERM);
                 waitpid(entry->process_id, NULL, 0);
             }
             
-            // 清理共享内存
             if (entry->cache) {
                 pthread_mutex_destroy(&entry->cache->lock);
                 shmdt(entry->cache);
@@ -565,7 +537,6 @@ void print_all_connections_status() {
             struct connection_key *key = &entry->key;
             struct connection_cache *cache = entry->cache;
             
-            // 正确打印IP地址
             struct in_addr src_in_addr, dst_in_addr;
             src_in_addr.s_addr = key->src_ip;
             dst_in_addr.s_addr = key->dst_ip;
