@@ -13,7 +13,9 @@ gcc pkt_cache.c -o pkt_cache -lpthread -lrdmacm -libverbs
 sudo ./pkt_cache
 */
 
-//w RDMA报文缓存管理系统
+//这个是我我自己完成的的版本，之后会复现刘彩霞老师专利的缓存模块
+
+//RDMA报文缓存管理系统
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
