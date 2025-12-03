@@ -56,6 +56,7 @@ struct cached_packet {
     uint32_t psn;
     int valid;
     struct timeval timestamp;
+    struct cached_packet *next;  // 链表指针
 };
 
 // 单个连接的缓存（专利：连接级动态分配）
@@ -75,6 +76,7 @@ struct hash_entry {
     struct connection_key key;
     pid_t process_id;                // 每个连接独立进程（专利隔离机制）
     int shm_id;                      // 共享内存ID
+    int msg_queue_id;                // 消息队列ID
     struct connection_cache *cache;  // 缓存地址
     struct hash_entry *next;         // 链表法处理哈希冲突（专利要求）
 };
@@ -204,6 +206,7 @@ struct connection_cache* create_connection_cache(const struct connection_key *ke
 }
 
 // 插入数据包到缓存（专利S304存储流程）
+// 修改insert_packet函数，处理哈希冲突
 int insert_packet(struct connection_cache *cache, uint32_t psn, 
                  const unsigned char *data, int data_len) {
     if (!cache || !data || data_len <= 0 || data_len > MAX_PACKET_SIZE) {
@@ -212,24 +215,44 @@ int insert_packet(struct connection_cache *cache, uint32_t psn,
     
     pthread_mutex_lock(&cache->lock);
     
-    // 计算存储地址（专利多级哈希）
+    // 计算存储地址
     size_t index = calculate_storage_addr(cache, psn);
     struct cached_packet *packet = &cache->ring[index];
     
-    // 覆盖旧数据（专利固定内存块复用）
-    if (packet->valid) {
-        cache->total_bytes -= packet->data_len;
-        cache->packet_count--;
+    // 如果当前位置已有数据且PSN不同，使用链表法
+    if (packet->valid && packet->psn != psn) {
+        // 创建新节点
+        struct cached_packet *new_node = malloc(sizeof(struct cached_packet));
+        if (!new_node) {
+            pthread_mutex_unlock(&cache->lock);
+            return -1;
+        }
+        
+        // 将新节点插入链表头部
+        memcpy(new_node->data, data, data_len);
+        new_node->data_len = data_len;
+        new_node->psn = psn;
+        new_node->valid = 1;
+        gettimeofday(&new_node->timestamp, NULL);
+        new_node->next = packet->next;
+        packet->next = new_node;
+        
+        printf("哈希冲突：索引%zu已有PSN=%u，新PSN=%u使用链表存储\n", 
+               index, packet->psn, psn);
+    } else {
+        // 直接存储或覆盖
+        if (packet->valid) {
+            cache->total_bytes -= packet->data_len;
+            cache->packet_count--;
+        }
+        
+        memcpy(packet->data, data, data_len);
+        packet->data_len = data_len;
+        packet->psn = psn;
+        packet->valid = 1;
+        gettimeofday(&packet->timestamp, NULL);
     }
     
-    // 存储数据包（专利RDMA WRITE操作模拟）
-    memcpy(packet->data, data, data_len);
-    packet->data_len = data_len;
-    packet->psn = psn;
-    packet->valid = 1;
-    gettimeofday(&packet->timestamp, NULL);
-    
-    // 更新连接统计（专利元数据维护）
     cache->total_bytes += data_len;
     cache->packet_count++;
     if (psn < cache->min_psn) cache->min_psn = psn;
@@ -240,26 +263,63 @@ int insert_packet(struct connection_cache *cache, uint32_t psn,
     return 0;
 }
 
+// 哈希函数（专利哈希表索引）
+static uint32_t hash_table_calculate(const struct connection_key *key, size_t table_size) {
+    return (key->src_ip + key->dst_ip + key->src_qp + key->dest_qp) % table_size;
+}
+
+// 添加一个辅助函数来查找哈希表项
+struct hash_entry* find_hash_entry(struct cache_manager *mgr, const struct connection_key *key) {
+    if (!mgr || !key) return NULL;
+    
+    uint32_t hash_index = hash_table_calculate(key, mgr->hash_table_size);
+    
+    // 遍历哈希链查找匹配的连接
+    struct hash_entry *entry = mgr->hash_table[hash_index];
+    while (entry) {
+        if (connection_keys_equal(&entry->key, key)) {
+            return entry;
+        }
+        entry = entry->next;
+    }
+    
+    return NULL;
+}
+
 // 查找数据包（专利重传快速查找）
 struct cached_packet* find_packet(struct connection_cache *cache, uint32_t psn) {
-    if (!cache) return NULL;
+    if (!cache) {
+        printf("查找失败: cache为空\n");
+        return NULL;
+    }
     
     pthread_mutex_lock(&cache->lock);
     
-    // 专利O(1)查找：多级哈希直接定位
+    // 计算存储地址
     size_t index = calculate_storage_addr(cache, psn);
+    printf("查找PSN=%u, 计算地址索引=%zu\n", psn, index);
+    
     struct cached_packet *packet = &cache->ring[index];
     
-    if (!packet->valid || packet->psn != psn) {
+    if (!packet->valid) {
+        printf("查找失败: 索引%zu无效\n", index);
         pthread_mutex_unlock(&cache->lock);
         return NULL;
     }
     
-    // 专利要求：返回数据副本（避免直接引用）
+    if (packet->psn != psn) {
+        printf("查找失败: 索引%zu存储的是PSN=%u，不是目标PSN=%u\n", 
+               index, packet->psn, psn);
+        pthread_mutex_unlock(&cache->lock);
+        return NULL;
+    }
+    
     struct cached_packet *result = malloc(sizeof(struct cached_packet));
     if (result) {
         memcpy(result, packet, sizeof(struct cached_packet));
+        result->data_len = packet->data_len;
         memcpy(result->data, packet->data, packet->data_len);
+        printf("查找成功: 找到PSN=%u, 长度=%d\n", psn, packet->data_len);
     }
     
     pthread_mutex_unlock(&cache->lock);
@@ -323,10 +383,7 @@ static int get_free_msg_slot(struct packet_msg *msg_queue) {
     return -1;
 }
 
-// 哈希函数（专利哈希表索引）
-static uint32_t hash_table_calculate(const struct connection_key *key, size_t table_size) {
-    return (key->src_ip + key->dst_ip + key->src_qp + key->dest_qp) % table_size;
-}
+
 
 // 控制平面：获取或创建连接（专利S10-S102）
 struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr, 
@@ -421,6 +478,7 @@ struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr,
     new_entry->process_id = pid;
     new_entry->shm_id = shm_id;
     new_entry->cache = new_cache;
+    new_entry->msg_queue_id = msg_queue_id;
     new_entry->next = mgr->hash_table[hash_index];  // 链表法处理冲突
     mgr->hash_table[hash_index] = new_entry;
     mgr->total_connections++;
@@ -439,6 +497,7 @@ struct hash_entry* get_or_create_hash_entry(struct cache_manager *mgr,
 }
 
 // 批量插入数据包（专利S304）
+// 修改add_to_batch_queue函数，使用正确的消息队列ID
 int add_to_batch_queue(const char *src_ip, const char *dst_ip,
                       uint32_t src_qp, uint32_t dest_qp,
                       uint32_t psn, const unsigned char *app_data, int data_len) {
@@ -446,20 +505,23 @@ int add_to_batch_queue(const char *src_ip, const char *dst_ip,
         return -1;
     }
     
-    // 专利：创建连接键（IP+QP）
     struct connection_key key = create_connection_key(src_ip, dst_ip, src_qp, dest_qp);
     
     pthread_mutex_lock(&g_cache_mgr->global_lock);
     
-    // 控制平面：获取或创建连接
-    struct hash_entry *entry = get_or_create_hash_entry(g_cache_mgr, &key);
+    // 查找现有连接的消息队列ID
+    struct hash_entry *entry = find_hash_entry(g_cache_mgr, &key);
     if (!entry) {
-        pthread_mutex_unlock(&g_cache_mgr->global_lock);
-        return -1;
+        // 创建新连接
+        entry = get_or_create_hash_entry(g_cache_mgr, &key);
+        if (!entry) {
+            pthread_mutex_unlock(&g_cache_mgr->global_lock);
+            return -1;
+        }
     }
     
-    // 映射消息队列
-    struct packet_msg *msg_queue = (struct packet_msg*)shmat(shmget(IPC_PRIVATE, sizeof(struct packet_msg) * BATCH_THRESHOLD, 0666), NULL, 0);
+    // 使用已存在的消息队列ID
+    struct packet_msg *msg_queue = (struct packet_msg*)shmat(entry->msg_queue_id, NULL, 0);
     if (msg_queue == (void*)-1) {
         perror("shmat failed");
         pthread_mutex_unlock(&g_cache_mgr->global_lock);
@@ -469,18 +531,17 @@ int add_to_batch_queue(const char *src_ip, const char *dst_ip,
     // 查找空闲位置
     int slot = get_free_msg_slot(msg_queue);
     if (slot == -1) {
-        printf("专利架构：消息队列已满，PSN=%u等待重试...\n", psn);
+        printf("消息队列满，稍后重试 PSN=%u\n", psn);
         shmdt(msg_queue);
         pthread_mutex_unlock(&g_cache_mgr->global_lock);
         usleep(100);
         return add_to_batch_queue(src_ip, dst_ip, src_qp, dest_qp, psn, app_data, data_len);
     }
     
-    // 写入消息队列（专利批量传输）
-    msg_queue[slot].key = key;
-    msg_queue[slot].psn = psn;
+    // 填充消息
     memcpy(msg_queue[slot].data, app_data, data_len);
     msg_queue[slot].data_len = data_len;
+    msg_queue[slot].psn = psn;
     msg_queue[slot].processed = 0;
     
     shmdt(msg_queue);
@@ -616,3 +677,4 @@ void print_all_connections_status() {
     pthread_mutex_unlock(&g_cache_mgr->global_lock);
     printf("==============================\n");
 }
+

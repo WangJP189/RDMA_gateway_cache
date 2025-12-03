@@ -57,6 +57,7 @@ struct hash_entry {
     struct connection_key key;
     pid_t process_id;                // 每个连接独立进程（专利隔离机制）
     int shm_id;                      // 共享内存ID
+    int msg_queue_id;                // 消息队列ID
     struct connection_cache *cache;  // 缓存地址
     struct hash_entry *next;         // 链表法处理哈希冲突（专利要求）
 };
@@ -84,6 +85,7 @@ struct packet_msg {
     int processed;  // 0=未处理, 1=已处理
 };
 
+struct hash_entry* find_hash_entry(struct cache_manager *mgr, const struct connection_key *key);
 
 // 专利要求：CRC32算法（第一级哈希）
 static uint32_t crc32_calculate(const unsigned char *data, size_t len);
