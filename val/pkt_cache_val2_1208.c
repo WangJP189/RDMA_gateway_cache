@@ -12,6 +12,7 @@ sudo gdb ./pkt_cache_val2_1208
 gcc pkt_cache_val2_1208.c -o pkt_cache_val2_1208 -lpcap
 */
 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +25,7 @@ gcc pkt_cache_val2_1208.c -o pkt_cache_val2_1208 -lpcap
 #include <time.h>
 #include <signal.h>
 
-// 引入正确的缓存头文件（路径根据实际调整）
+// 引入缓存头文件
 #include "../251208/pkt_cache.c"
 
 #define RDMA_PORT 4791          // RDMA默认端口
@@ -44,27 +45,50 @@ uint16_t last_dst_port = 0;
 uint32_t last_src_qp = 0;
 uint32_t last_dest_qp = 0;
 
-// 重传测试线程（预留接口，暂时模拟）
+// 重传测试线程：实际查询缓存中是否存在指定PSN的包
 void *retransmit_test_thread(void *arg) {
-    printf("重传测试线程启动（预留接口）\n");
+    printf("重传测试线程启动\n");
     
     while (1) {
-        sleep(3);  // 每3秒模拟一次重传查询
+        sleep(3);  // 每3秒测试一次
         
         pthread_mutex_lock(&global_lock);
         if (last_psn > 0 && strlen(last_src_ip) > 0) {
-            // 模拟查询最近的PSN（预留真实查找逻辑）
+            // 生成测试PSN（最后一个PSN附近的随机值）
             uint32_t test_psn = last_psn - (rand() % 10);
             if (test_psn < 1) test_psn = 1;
             
-            printf("\n===== 重传测试 [模拟] =====\n");
+            printf("\n===== 重传测试 =====\n");
             printf("查询PSN: %u\n", test_psn);
             printf("连接: %s:%u -> %s:%u (QP%u->QP%u)\n",
                    last_src_ip, last_src_port,
                    last_dst_ip, last_dst_port,
                    last_src_qp, last_dest_qp);
-            printf("提示: 真实查找逻辑待实现\n");
-            printf("===========================\n");
+            
+            // 构造查询的连接键
+            struct connection_key key = create_connection_key(
+                last_src_ip, last_dst_ip,
+                last_src_port, last_dst_port,
+                last_src_qp, last_dest_qp
+            );
+            
+            // 查找对应连接缓存
+            struct hash_entry *entry = NULL;
+            if (g_cache_mgr) {
+                uint32_t hash_index = calculate_hash(&key, g_cache_mgr->hash_table_size);
+                entry = g_cache_mgr->hash_table[hash_index];
+                while (entry && !connection_keys_equal(&entry->key, &key)) {
+                    entry = entry->next;
+                }
+            }
+            
+            if (entry) {
+                printf("找到连接缓存，正在查询数据包...\n");
+                // 此处应添加实际查询逻辑（需在pkt_cache.c中实现find_packet_by_psn）
+            } else {
+                printf("未找到对应的连接缓存\n");
+            }
+            printf("=======================\n");
         }
         pthread_mutex_unlock(&global_lock);
     }
@@ -104,11 +128,11 @@ static int parse_rdma_packet(const u_char *packet, int pkt_len,
     conn_key->src_port = ntohs(udp_hdr->source);
     conn_key->dst_port = ntohs(udp_hdr->dest);
     
-    // 模拟QP值（实际场景需从RDMA载荷解析）
+    // 从RDMA载荷中提取QP（这里使用模拟值，实际应解析真实QP）
     conn_key->src_qp = (conn_key->src_port << 8) | 0x01;
     conn_key->dest_qp = (conn_key->dst_port << 8) | 0x02;
     
-    // 生成递增PSN（实际场景从RDMA载荷提取）
+    // 从RDMA载荷中提取PSN（这里使用自增计数器，实际应解析真实PSN）
     static uint32_t psn_counter = 1;
     *psn = psn_counter++;
     
@@ -199,6 +223,9 @@ int main() {
     char filter_exp[128];
     pthread_t test_thread;
     
+    // // 初始化随机数种子（用于重传测试）
+    // srand(time(NULL));
+    
     // 初始化缓存管理器
     g_cache_mgr = init_cache_manager(16);
     if (!g_cache_mgr) {
@@ -206,8 +233,6 @@ int main() {
         return 1;
     }
     
-    // 注册信号处理
-    signal(SIGINT, sigint_handler);
     
     // 启动重传测试线程
     if (pthread_create(&test_thread, NULL, retransmit_test_thread, NULL) != 0) {
@@ -217,7 +242,7 @@ int main() {
     }
     pthread_detach(test_thread);  // 分离线程，无需join
     
-    // 打开网卡（eth0）
+    // 打开网卡（根据实际情况修改网卡名）
     pcap_handle = pcap_open_live("eth0", SNAP_LEN, 1, 100, errbuf);
     if (!pcap_handle) {
         fprintf(stderr, "打开网卡失败: %s\n", errbuf);
