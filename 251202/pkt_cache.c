@@ -45,6 +45,8 @@ sudo ./pkt_cache
 struct connection_key {
     uint32_t src_ip;
     uint32_t dst_ip;
+    uint16_t src_port;  // 新增：源端口
+    uint16_t dst_port;  // 新增：目的端口（4791）
     uint32_t src_qp;
     uint32_t dest_qp;
 };
@@ -130,12 +132,14 @@ static uint32_t custom_crc_calculate(const unsigned char *data, size_t len) {
 
 // 一级哈希：基于IP+QP计算流特征（专利S202）
 static uint32_t calculate_flow_hash(const struct connection_key *key) {
-    unsigned char hash_data[16];
+    unsigned char hash_data[20];  // 5*4字节=20字节（五元组）
     memcpy(hash_data, &key->src_ip, 4);
     memcpy(hash_data+4, &key->dst_ip, 4);
-    memcpy(hash_data+8, &key->src_qp, 4);
-    memcpy(hash_data+12, &key->dest_qp, 4);
-    return custom_crc_calculate(hash_data, 16);  // 专利自定义CRC
+    memcpy(hash_data+8, &key->src_port, 2);  // 加入源端口
+    memcpy(hash_data+10, &key->dst_port, 2); // 加入目的端口
+    memcpy(hash_data+12, &key->src_qp, 4);
+    memcpy(hash_data+16, &key->dest_qp, 4);
+    return custom_crc_calculate(hash_data, 20);  // 专利自定义CRC
 }
 
 // 二级哈希：结合流特征+PSN生成存储地址（专利S301-S302）
@@ -168,11 +172,14 @@ int connection_keys_equal(const struct connection_key *a, const struct connectio
 
 // 创建连接键（专利S202）
 struct connection_key create_connection_key(const char *src_ip, const char *dst_ip,
+                                          uint16_t src_port, uint16_t dst_port,  
                                           uint32_t src_qp, uint32_t dest_qp) {
     struct connection_key key;
     memset(&key, 0, sizeof(key));
     inet_pton(AF_INET, src_ip, &key.src_ip);
     inet_pton(AF_INET, dst_ip, &key.dst_ip);
+    key.src_port = src_port;  // 赋值端口
+    key.dst_port = dst_port;
     key.src_qp = src_qp;
     key.dest_qp = dest_qp;
     return key;

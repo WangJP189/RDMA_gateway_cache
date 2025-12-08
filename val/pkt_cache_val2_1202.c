@@ -63,31 +63,43 @@ static uint32_t get_24bit_value(const uint8_t *data) {
 
 
 // 解析BTH头部
+// 修改parse_bth_header函数
 int parse_bth_header(const unsigned char *bth_start, 
                      uint8_t *opcode, uint16_t *pkey,
                      uint32_t *dest_qp, uint32_t *psn,
                      int *packet_type) {
-    struct bth_header *bth = (struct bth_header*)bth_start;
+    // RoCE v1 的BTH头部结构（参考IBTA规范）
+    // | Opcode(1B) | SE | M | PadCnt(3bits) | Tver(4bits) | P_Key(2B) | Reserved(3B) | DestQP(3B) | PSN(3B) |
     
-    *opcode = bth->opcode;
-    *pkey = ntohs(bth->pkey);
-    *dest_qp = get_24bit_value(bth->dest_qp);
-    *psn = get_24bit_value(bth->psn);
+    if (bth_start == NULL) return -1;
+    
+    // 解析opcode（包含SE和M位）
+    uint8_t first_byte = bth_start[0];
+    *opcode = first_byte & 0x1F;  // 取低5位为opcode
+    // 注意：RoCE中opcode可能需要调整
+    
+    // 解析P_Key（网络字节序）
+    *pkey = (bth_start[2] << 8) | bth_start[3];
+    
+    // 解析目标QP（24位，网络字节序）
+    *dest_qp = (bth_start[6] << 16) | (bth_start[7] << 8) | bth_start[8];
+    
+    // 解析PSN（24位，网络字节序）
+    *psn = (bth_start[9] << 16) | (bth_start[10] << 8) | bth_start[11];
     
     // 根据opcode判断包类型
-    switch (*opcode) {
-        case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
-        case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A: case 0x0B:
-            *packet_type = 0; // 数据包
-            break;
-        case 0x10: case 0x11: case 0x12: case 0x13:
-            *packet_type = 1; // ACK
-            break;
-        case 0x14: case 0x15:
-            *packet_type = 2; // NACK
-            break;
-        default:
-            *packet_type = -1; // 未知
+    uint8_t base_opcode = *opcode & 0x1F;
+    if (base_opcode >= 0x00 && base_opcode <= 0x0B) {
+        *packet_type = 0; // 发送操作，数据包
+    } else if (base_opcode >= 0x10 && base_opcode <= 0x13) {
+        *packet_type = 1; // ACK
+    } else if (base_opcode >= 0x14 && base_opcode <= 0x15) {
+        *packet_type = 2; // NACK
+    } else if (base_opcode == 0x80 || base_opcode == 0x81) {
+        *packet_type = 0; // RDMA Write/Read
+    } else {
+        *packet_type = -1;
+        return -1;
     }
     
     return 0;
