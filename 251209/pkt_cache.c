@@ -6,89 +6,37 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-// #include "pkt_cache.h"
+#include "pkt_cache.h"
 
-// 配置参数
-#define MTU_SIZE 1500              // MTU大小
-#define MEM_BLOCK_SIZE (MTU_SIZE)  // 内存块大小
-#define BUFFER_CAPACITY 100        // buffer容量(阈值的2倍)
-#define BATCH_THRESHOLD 50         // 批量处理阈值
-#define BATCH_TIMEOUT_MS 10        // 批量处理超时(ms)
-#define INIT_MEM_SIZE 1024         // 初始内存块数量
-#define EXTEND_MEM_SIZE 512        // 内存扩展块数量
-
-
-// 缓存报文结构
-struct cached_packet {
-    unsigned char data[MEM_BLOCK_SIZE];  // 数据块
-    int data_len;                        // 实际数据长度
-    uint32_t psn;                        // 包序列号
-    int valid;                           // 有效性标记
-};
-
-// 连接标识键（五元组）
-struct connection_key {
-    uint32_t src_ip;      // 源IP
-    uint32_t dst_ip;      // 目的IP
-    uint16_t src_port;    // 源端口
-    uint16_t dst_port;    // 目的端口
-    uint32_t qp;          // QP信息
-};
-
-// 批量处理缓冲区
-struct batch_buffer {
-    struct cached_packet packets[BUFFER_CAPACITY];  // 数据包缓冲区
-    int head;                     // 头指针
-    int tail;                     // 尾指针
-    int count;                    // 当前数量
-    struct timeval last_flush;    // 上次刷新时间
-    uint32_t base_psn;            // 基准PSN
-    pthread_mutex_t lock;         // 缓冲区锁
-};
-
-// 线性内存区
-struct linear_memory {
-    struct cached_packet *blocks;  // 内存块数组
-    size_t capacity;               // 总容量
-    size_t used;                   // 已使用数量
-    struct linear_memory *next;    // 下一段内存(用于扩展)
-    pthread_mutex_t lock;          // 内存锁
-};
-
-// 单个连接的缓存管理结构
-struct connection_cache {
-    struct connection_key key;     // 连接键
-    struct batch_buffer buffer;    // 批量缓冲区
-    struct linear_memory *memory;  // 线性内存区
-    uint32_t min_psn;              // 最小PSN
-    uint32_t max_psn;              // 最大PSN
-    pthread_t flush_thread;        // 定时刷新线程
-    int running;                   // 运行标志
-};
-
-// 全局缓存管理器
-struct cache_manager {
-    struct hash_table_entry **hash_table;   // 哈希表
-    size_t hash_table_size;                 // 哈希表大小
-    size_t max_connections;           // 最大连接数
-    size_t max_packets_per_conn;      // 每连接最大报文数
-    size_t max_bytes_per_conn;        // 每连接最大字节数
-    int connection_timeout;           // 连接超时时间（秒）
-    pthread_mutex_t global_lock;      // 全局锁
-    size_t total_connections;         // 总连接数
-};
-
-// 前置声明（解决隐式声明警告）
-void destroy_connection_cache(struct connection_cache *cache);
 
 // 全局缓存管理器
 struct cache_manager *g_cache_mgr = NULL;
 
 
+// 计算五元组哈希值
+static uint32_t connection_hash(const struct connection_key *key, size_t table_size) {
+    if (!key || table_size == 0) return 0;
+    uint64_t hash = key->src_ip;
+    hash ^= key->dst_ip + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= key->src_port + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= key->dst_port + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= key->qp + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    return (uint32_t)(hash % table_size);
+}
+
+// 比较两个连接键是否相等
+static int connection_key_equal(const struct connection_key *a, const struct connection_key *b) {
+    if (!a || !b) return 0;
+    return (a->src_ip == b->src_ip &&
+            a->dst_ip == b->dst_ip &&
+            a->src_port == b->src_port &&
+            a->dst_port == b->dst_port &&
+            a->qp == b->qp);
+}
+
 // 计算初始内存地址（基于五元组哈希）
 uint32_t calculate_initial_addr(const struct connection_key *key) {
     if (!key) return 0;
-    // 基于五元组计算哈希作为初始地址偏移
     return (key->src_ip ^ key->dst_ip ^ key->src_port ^ key->dst_port ^ key->qp) % INIT_MEM_SIZE;
 }
 
@@ -128,12 +76,10 @@ struct linear_memory* init_linear_memory(size_t capacity) {
 int extend_linear_memory(struct linear_memory *mem) {
     if (!mem) return -1;
 
-    // 找到最后一段内存
     while (mem->next) {
         mem = mem->next;
     }
 
-    // 创建新的扩展内存
     struct linear_memory *new_mem = init_linear_memory(EXTEND_MEM_SIZE);
     if (!new_mem) return -1;
 
@@ -142,7 +88,7 @@ int extend_linear_memory(struct linear_memory *mem) {
     return 0;
 }
 
-// 插入数据包到缓冲区（O(1)时间复杂度）
+// 插入数据包到缓冲区
 int insert_to_buffer(struct connection_cache *cache, uint32_t psn, 
                     const unsigned char *data, int data_len) {
     if (!cache || !data || data_len <= 0 || data_len > MEM_BLOCK_SIZE) {
@@ -151,27 +97,22 @@ int insert_to_buffer(struct connection_cache *cache, uint32_t psn,
 
     pthread_mutex_lock(&cache->buffer.lock);
 
-    // 检查缓冲区是否已满
     if (cache->buffer.count >= BUFFER_CAPACITY) {
         pthread_mutex_unlock(&cache->buffer.lock);
         return -1;
     }
 
-    // 计算插入位置（循环队列）
     int insert_pos = (cache->buffer.tail) % BUFFER_CAPACITY;
     struct cached_packet *pkt = &cache->buffer.packets[insert_pos];
 
-    // 复制数据
     memcpy(pkt->data, data, data_len);
     pkt->data_len = data_len;
     pkt->psn = psn;
     pkt->valid = 1;
 
-    // 更新缓冲区状态
     cache->buffer.tail = (cache->buffer.tail + 1) % BUFFER_CAPACITY;
     cache->buffer.count++;
 
-    // 更新连接的PSN范围
     if (psn < cache->min_psn || cache->min_psn == 0) {
         cache->min_psn = psn;
     }
@@ -183,7 +124,7 @@ int insert_to_buffer(struct connection_cache *cache, uint32_t psn,
     return 0;
 }
 
-// 刷新缓冲区到内存（地址映射机制）
+// 刷新缓冲区到内存
 int flush_buffer_to_memory(struct connection_cache *cache) {
     if (!cache || cache->buffer.count == 0) {
         return 0;
@@ -195,7 +136,6 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
         return 0;
     }
 
-    // 1. 收集所有数据包并按PSN排序（保证内存中有序）
     struct cached_packet *packets = malloc(sizeof(struct cached_packet) * cache->buffer.count);
     if (!packets) {
         pthread_mutex_unlock(&cache->buffer.lock);
@@ -223,17 +163,14 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
         }
     }
 
-    // 2. 更新base_psn为当前最大PSN
     cache->buffer.base_psn = packets[count - 1].psn;
 
-    // 3. 将排序后的数据包写入线性内存
     struct linear_memory *current_mem = cache->memory;
     int written = 0;
 
     while (written < count) {
         pthread_mutex_lock(&current_mem->lock);
         
-        // 检查当前内存是否有足够空间
         size_t available = current_mem->capacity - current_mem->used;
         size_t to_write = (available < count - written) ? available : count - written;
 
@@ -247,7 +184,6 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
 
         pthread_mutex_unlock(&current_mem->lock);
 
-        // 如果当前内存已满且还有数据要写，扩展内存
         if (written < count && !current_mem->next) {
             if (extend_linear_memory(current_mem) != 0) {
                 free(packets);
@@ -256,7 +192,6 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
             }
         }
 
-        // 移动到下一段内存
         if (current_mem->next) {
             current_mem = current_mem->next;
         }
@@ -264,7 +199,6 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
 
     free(packets);
 
-    // 4. 清空缓冲区
     cache->buffer.head = cache->buffer.tail;
     cache->buffer.count = 0;
     gettimeofday(&cache->buffer.last_flush, NULL);
@@ -280,17 +214,15 @@ void* batch_flush_thread(void *arg) {
     struct timeval diff;
 
     while (cache->running) {
-        usleep(1000);  // 1ms检查一次
+        usleep(1000);
 
         pthread_mutex_lock(&cache->buffer.lock);
         gettimeofday(&now, NULL);
         
-        // 计算时间差(ms)
         diff.tv_sec = now.tv_sec - cache->buffer.last_flush.tv_sec;
         diff.tv_usec = now.tv_usec - cache->buffer.last_flush.tv_usec;
         long ms_diff = diff.tv_sec * 1000 + diff.tv_usec / 1000;
 
-        // 检查是否需要刷新
         if (cache->buffer.count >= BATCH_THRESHOLD || ms_diff >= BATCH_TIMEOUT_MS) {
             if (cache->buffer.count > 0) {
                 pthread_mutex_unlock(&cache->buffer.lock);
@@ -319,20 +251,17 @@ struct connection_cache* create_connection_cache(const struct connection_key *ke
     cache->min_psn = 0;
     cache->max_psn = 0;
 
-    // 初始化缓冲区
     if (init_batch_buffer(&cache->buffer) != 0) {
         free(cache);
         return NULL;
     }
 
-    // 初始化线性内存（基于五元组计算初始地址）
     cache->memory = init_linear_memory(INIT_MEM_SIZE);
     if (!cache->memory) {
         free(cache);
         return NULL;
     }
 
-    // 创建定时刷新线程
     if (pthread_create(&cache->flush_thread, NULL, batch_flush_thread, cache) != 0) {
         destroy_connection_cache(cache);
         return NULL;
@@ -345,16 +274,13 @@ struct connection_cache* create_connection_cache(const struct connection_key *ke
 void destroy_connection_cache(struct connection_cache *cache) {
     if (!cache) return;
 
-    // 停止运行标志
     cache->running = 0;
 
-    // 销毁定时线程
     if (pthread_self() != cache->flush_thread && cache->flush_thread != 0) {
         pthread_cancel(cache->flush_thread);
         pthread_join(cache->flush_thread, NULL);
     }
 
-    // 销毁线性内存
     struct linear_memory *current = cache->memory;
     while (current) {
         struct linear_memory *next = current->next;
@@ -364,9 +290,7 @@ void destroy_connection_cache(struct connection_cache *cache) {
         current = next;
     }
 
-    // 销毁缓冲区锁
     pthread_mutex_destroy(&cache->buffer.lock);
-
     free(cache);
 }
 
@@ -378,7 +302,6 @@ int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
     *count = 0;
     *retrans_pkts = NULL;
 
-    // 收集所有需要重传的包（psn >= ePSN）
     struct linear_memory *current = cache->memory;
     while (current) {
         pthread_mutex_lock(&current->lock);
@@ -395,11 +318,9 @@ int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
 
     if (*count == 0) return 0;
 
-    // 分配重传包数组
     *retrans_pkts = malloc(sizeof(struct cached_packet) * (*count));
     if (!*retrans_pkts) return -1;
 
-    // 填充重传包并清空旧包
     size_t idx = 0;
     current = cache->memory;
     while (current) {
@@ -410,7 +331,6 @@ int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
                 if (current->blocks[i].psn >= ePSN) {
                     (*retrans_pkts)[idx++] = current->blocks[i];
                 } else {
-                    // 清空psn < ePSN的包
                     memset(&current->blocks[i], 0, sizeof(struct cached_packet));
                 }
             }
@@ -421,4 +341,163 @@ int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
     }
 
     return 0;
+}
+
+// 初始化缓存管理器
+struct cache_manager* init_cache_manager(size_t max_conns) {
+    if (max_conns == 0) return NULL;
+
+    struct cache_manager *mgr = malloc(sizeof(struct cache_manager));
+    if (!mgr) return NULL;
+
+    memset(mgr, 0, sizeof(struct cache_manager));
+    mgr->max_connections = max_conns;
+    mgr->hash_table_size = max_conns * 2;  // 哈希表大小为最大连接数的2倍
+    mgr->hash_table = calloc(mgr->hash_table_size, sizeof(struct hash_table_entry*));
+    if (!mgr->hash_table) {
+        free(mgr);
+        return NULL;
+    }
+
+    pthread_mutex_init(&mgr->global_lock, NULL);
+    mgr->total_connections = 0;
+
+    return mgr;
+}
+
+// 销毁缓存管理器
+void destroy_cache_manager(struct cache_manager *mgr) {
+    if (!mgr) return;
+
+    pthread_mutex_lock(&mgr->global_lock);
+
+    // 销毁所有连接缓存
+    for (size_t i = 0; i < mgr->hash_table_size; i++) {
+        struct hash_table_entry *entry = mgr->hash_table[i];
+        while (entry) {
+            struct hash_table_entry *next = entry->next;
+            destroy_connection_cache(entry->cache);
+            free(entry);
+            entry = next;
+        }
+    }
+
+    free(mgr->hash_table);
+    pthread_mutex_destroy(&mgr->global_lock);
+    free(mgr);
+}
+
+// 添加数据包到缓存
+int add_packet_to_cache(const char *src_ip, const char *dst_ip,
+                       uint16_t src_port, uint16_t dst_port,
+                       uint32_t src_qp, uint32_t dest_qp,
+                       uint32_t psn, const unsigned char *data, int data_len) {
+    if (!g_cache_mgr || !src_ip || !dst_ip || !data || data_len <= 0) {
+        return -1;
+    }
+
+    struct connection_key key;
+    key.src_ip = ip_str_to_uint(src_ip);
+    key.dst_ip = ip_str_to_uint(dst_ip);
+    key.src_port = src_port;
+    key.dst_port = dst_port;
+    key.qp = src_qp;  // 使用源QP作为连接标识的QP
+
+    pthread_mutex_lock(&g_cache_mgr->global_lock);
+
+    // 检查是否已存在该连接
+    uint32_t hash = connection_hash(&key, g_cache_mgr->hash_table_size);
+    struct hash_table_entry *entry = g_cache_mgr->hash_table[hash];
+    struct connection_cache *cache = NULL;
+
+    while (entry) {
+        if (connection_key_equal(&entry->cache->key, &key)) {
+            cache = entry->cache;
+            break;
+        }
+        entry = entry->next;
+    }
+
+    // 不存在则创建新连接
+    if (!cache) {
+        if (g_cache_mgr->total_connections >= g_cache_mgr->max_connections) {
+            pthread_mutex_unlock(&g_cache_mgr->global_lock);
+            return -1;  // 达到最大连接数
+        }
+
+        cache = create_connection_cache(&key);
+        if (!cache) {
+            pthread_mutex_unlock(&g_cache_mgr->global_lock);
+            return -1;
+        }
+
+        // 添加到哈希表
+        struct hash_table_entry *new_entry = malloc(sizeof(struct hash_table_entry));
+        if (!new_entry) {
+            destroy_connection_cache(cache);
+            pthread_mutex_unlock(&g_cache_mgr->global_lock);
+            return -1;
+        }
+        new_entry->cache = cache;
+        new_entry->next = g_cache_mgr->hash_table[hash];
+        g_cache_mgr->hash_table[hash] = new_entry;
+        g_cache_mgr->total_connections++;
+    }
+
+    pthread_mutex_unlock(&g_cache_mgr->global_lock);
+
+    // 插入数据包到缓冲区
+    return insert_to_buffer(cache, psn, data, data_len);
+}
+
+// 打印单个连接状态
+void print_connection_status(struct connection_cache *cache) {
+    if (!cache) return;
+
+    char src_ip_str[INET_ADDRSTRLEN];
+    char dst_ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &cache->key.src_ip, src_ip_str, INET_ADDRSTRLEN);
+    inet_ntop(AF_INET, &cache->key.dst_ip, dst_ip_str, INET_ADDRSTRLEN);
+
+    printf("连接: %s:%u (QP%u) -> %s:%u\n",
+           src_ip_str, ntohs(cache->key.src_port), cache->key.qp,
+           dst_ip_str, ntohs(cache->key.dst_port));
+    printf("  PSN范围: %u - %u\n", cache->min_psn, cache->max_psn);
+    
+    // 计算总缓存包数
+    size_t total_pkts = 0;
+    struct linear_memory *current = cache->memory;
+    while (current) {
+        pthread_mutex_lock(&current->lock);
+        total_pkts += current->used;
+        pthread_mutex_unlock(&current->lock);
+        current = current->next;
+    }
+    printf("  缓存包数: %zu\n", total_pkts);
+    printf("  缓冲区当前包数: %d\n", cache->buffer.count);
+}
+
+// 打印所有连接状态
+void print_all_connections_status() {
+    if (!g_cache_mgr) return;
+
+    printf("当前缓存连接数: %zu (最大: %zu)\n",
+           g_cache_mgr->total_connections, g_cache_mgr->max_connections);
+
+    pthread_mutex_lock(&g_cache_mgr->global_lock);
+    for (size_t i = 0; i < g_cache_mgr->hash_table_size; i++) {
+        struct hash_table_entry *entry = g_cache_mgr->hash_table[i];
+        while (entry) {
+            print_connection_status(entry->cache);
+            entry = entry->next;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mgr->global_lock);
+}
+
+// 转换IP字符串到网络字节序（从测试文件移过来的共享函数）
+uint32_t ip_str_to_uint(const char *ip) {
+    struct in_addr addr;
+    inet_pton(AF_INET, ip, &addr);
+    return addr.s_addr;
 }

@@ -1,6 +1,6 @@
 /*
 编译命令：
-gcc pkt_cache_test.c -o pkt_cache_test -lpthread -lrdmacm -libverbs
+gcc pkt_cache_test.c pkt_cache.c -o pkt_cache_test -lpthread -lrdmacm -libverbs
 
 运行命令：
 sudo ./pkt_cache_test
@@ -45,11 +45,11 @@ void generate_roce_packet(unsigned char *buf, int *len, uint32_t psn) {
 }
 
 // 转换IP字符串到网络字节序
-uint32_t ip_str_to_uint(const char *ip) {
-    struct in_addr addr;
-    inet_pton(AF_INET, ip, &addr);
-    return addr.s_addr;
-}
+// uint32_t ip_str_to_uint(const char *ip) {
+//     struct in_addr addr;
+//     inet_pton(AF_INET, ip, &addr);
+//     return addr.s_addr;
+// }
 
 // 模拟300个乱序RoCEv2数据包并缓存
 void simulate_roce_traffic() {
@@ -137,8 +137,13 @@ void verify_cache_result() {
     printf("\n===== 模拟重传请求（ePSN=100）=====\n");
     // 找到第一个连接缓存
     struct connection_cache *cache = NULL;
-    if (g_cache_mgr && g_cache_mgr->conn_caches[0]) {
-        cache = g_cache_mgr->conn_caches[0];
+    if (g_cache_mgr && g_cache_mgr->conn_caches && g_cache_mgr->total_connections > 0) {
+        for (size_t i = 0; i < g_cache_mgr->max_connections; i++) {
+            if (g_cache_mgr->conn_caches[i]) {
+                cache = g_cache_mgr->conn_caches[i];
+                break;
+            }
+        }
     }
 
     if (cache) {
@@ -173,12 +178,12 @@ int main() {
 
     // 1. 初始化缓存管理器
     printf("===== 初始化缓存管理器 =====\n");
-    g_cache_mgr = init_cache_manager(10);  // 最大10个连接
+    struct cache_manager *g_cache_mgr = init_cache_manager(10);  // 最大10个连接
     if (!g_cache_mgr) {
         fprintf(stderr, "缓存管理器初始化失败！\n");
         return -1;
     }
-    printf("缓存管理器初始化成功（最大连接数: %zu）\n", g_cache_mgr->max_conns);
+    printf("缓存管理器初始化成功（最大连接数: %zu）\n", g_cache_mgr->max_connections);
 
     // 2. 模拟RoCEv2流量
     simulate_roce_traffic();

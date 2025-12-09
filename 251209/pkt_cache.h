@@ -18,7 +18,6 @@
 #define EXTEND_MEM_SIZE 512        // 内存扩展块数量
 
 
-
 // 缓存报文结构
 struct cached_packet {
     unsigned char data[MEM_BLOCK_SIZE];  // 数据块
@@ -67,6 +66,13 @@ struct connection_cache {
     int running;                   // 运行标志
 };
 
+// 哈希表条目结构
+struct hash_table_entry {
+    struct connection_key key;
+    struct connection_cache *cache;
+    struct hash_table_entry *next;  // 链表解决哈希冲突
+};
+
 // 全局缓存管理器
 struct cache_manager {
     struct hash_table_entry **hash_table;   // 哈希表
@@ -77,10 +83,11 @@ struct cache_manager {
     int connection_timeout;           // 连接超时时间（秒）
     pthread_mutex_t global_lock;      // 全局锁
     size_t total_connections;         // 总连接数
+    struct connection_cache **conn_caches;  // 连接缓存数组(用于测试)
 };
 
 // 全局缓存管理器
-struct cache_manager *g_cache_mgr;
+extern struct cache_manager *g_cache_mgr;
 
 // 计算初始内存地址（基于五元组）
 uint32_t calculate_initial_addr(const struct connection_key *key);
@@ -115,7 +122,7 @@ int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
                               struct cached_packet **retrans_pkts, size_t *count);
 
 
-// 补充缺失的函数声明
+// 补充的函数声明
 struct cache_manager* init_cache_manager(size_t max_conns);
 void destroy_cache_manager(struct cache_manager *mgr);
 int add_packet_to_cache(const char *src_ip, const char *dst_ip,
@@ -124,5 +131,8 @@ int add_packet_to_cache(const char *src_ip, const char *dst_ip,
                        uint32_t psn, const unsigned char *data, int data_len);
 void print_all_connections_status();
 void print_connection_status(struct connection_cache *cache);
+
+
+uint32_t ip_str_to_uint(const char *ip);
 
 #endif // PKT_CACHE_H
