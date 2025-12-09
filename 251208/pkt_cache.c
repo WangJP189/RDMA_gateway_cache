@@ -436,7 +436,7 @@ struct connection_cache* create_connection_cache(const struct connection_key *ke
     if (pid < 0) {
         perror("fork failed");
         destroy_connection_cache(cache);
-        return NULL;
+        return NUwLL;
     } else if (pid == 0) {
         // 子进程：启动定时刷新线程
         if (pthread_create(&cache->flush_thread, NULL, batch_flush_thread, cache) != 0) {
