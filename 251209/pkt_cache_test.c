@@ -72,13 +72,13 @@ void simulate_roce_traffic() {
     for (int i = 0; i < 300; i++) {
         psn_list[i] = i + 1;
     }
-    // 打乱PSN顺序（模拟网络乱序）
-    for (int i = 299; i > 0; i--) {
-        int j = rand() % (i + 1);
-        uint32_t temp = psn_list[i];
-        psn_list[i] = psn_list[j];
-        psn_list[j] = temp;
-    }
+    // // 打乱PSN顺序（模拟网络乱序）
+    // for (int i = 299; i > 0; i--) {
+    //     int j = rand() % (i + 1);
+    //     uint32_t temp = psn_list[i];
+    //     psn_list[i] = psn_list[j];
+    //     psn_list[j] = temp;
+    // }
 
     printf("===== 开始模拟300个乱序RoCEv2数据包 =====\n");
     printf("连接: %s:%u (QP%u) -> %s:%u (QP%u)\n",

@@ -72,6 +72,7 @@ struct linear_memory* init_linear_memory(size_t capacity) {
     return mem;
 }
 
+
 // 扩展线性内存区
 int extend_linear_memory(struct linear_memory *mem) {
     if (!mem) return -1;
