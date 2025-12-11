@@ -178,7 +178,7 @@ int main() {
 
     // 1. 初始化缓存管理器
     printf("===== 初始化缓存管理器 =====\n");
-    struct cache_manager *g_cache_mgr = init_cache_manager(10);  // 最大10个连接
+    g_cache_mgr = init_cache_manager(10);  // 最大10个连接
     if (!g_cache_mgr) {
         fprintf(stderr, "缓存管理器初始化失败！\n");
         return -1;

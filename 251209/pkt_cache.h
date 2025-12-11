@@ -9,7 +9,7 @@
 #include <arpa/inet.h>
 
 // 配置参数
-#define MTU_SIZE 1500              // MTU大小
+#define MTU_SIZE 4096              // MTU大小
 #define MEM_BLOCK_SIZE (MTU_SIZE)  // 内存块大小
 #define BUFFER_CAPACITY 100        // buffer容量(阈值的2倍)
 #define BATCH_THRESHOLD 50         // 批量处理阈值

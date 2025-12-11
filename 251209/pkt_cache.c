@@ -69,6 +69,9 @@ struct linear_memory* init_linear_memory(size_t capacity) {
     mem->used = 0;
     mem->next = NULL;
     pthread_mutex_init(&mem->lock, NULL);
+
+    print("初始化线性内存区，容量 %zu 个块\n", mem->capacity);
+
     return mem;
 }
 
@@ -332,7 +335,10 @@ int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
                 if (current->blocks[i].psn >= ePSN) {
                     (*retrans_pkts)[idx++] = current->blocks[i];
                 } else {
-                    memset(&current->blocks[i], 0, sizeof(struct cached_packet));
+                    // memset(&current->blocks[i], 0, sizeof(struct cached_packet));
+
+                    //仅把psn<ePSN的包标记为无效,而不区清除
+                    current->blocks[i].valid = 0;
                 }
             }
         }
@@ -355,6 +361,15 @@ struct cache_manager* init_cache_manager(size_t max_conns) {
     mgr->max_connections = max_conns;
     mgr->hash_table_size = max_conns * 2;  // 哈希表大小为最大连接数的2倍
     mgr->hash_table = calloc(mgr->hash_table_size, sizeof(struct hash_table_entry*));
+    
+    //为mgr分配连接缓存数组
+    mgr->conn_caches = calloc(mgr->max_connections, sizeof(struct connection_cache *));
+    if (!mgr->conn_caches) {
+        free(mgr->hash_table);
+        free(mgr);
+        return NULL;
+    }
+
     if (!mgr->hash_table) {
         free(mgr);
         return NULL;
@@ -400,8 +415,8 @@ int add_packet_to_cache(const char *src_ip, const char *dst_ip,
     struct connection_key key;
     key.src_ip = ip_str_to_uint(src_ip);
     key.dst_ip = ip_str_to_uint(dst_ip);
-    key.src_port = src_port;
-    key.dst_port = dst_port;
+    key.src_port = htons(src_port);  // 转换为网络字节序
+    key.dst_port = htons(dst_port);
     key.qp = src_qp;  // 使用源QP作为连接标识的QP
 
     pthread_mutex_lock(&g_cache_mgr->global_lock);
@@ -443,6 +458,14 @@ int add_packet_to_cache(const char *src_ip, const char *dst_ip,
         new_entry->next = g_cache_mgr->hash_table[hash];
         g_cache_mgr->hash_table[hash] = new_entry;
         g_cache_mgr->total_connections++;
+
+        // 找到第一个空位置存入连接
+        for (size_t i = 0; i < g_cache_mgr->max_connections; i++) {
+            if (!g_cache_mgr->conn_caches[i]) {
+                g_cache_mgr->conn_caches[i] = cache;
+                break;
+            }
+        }
     }
 
     pthread_mutex_unlock(&g_cache_mgr->global_lock);
