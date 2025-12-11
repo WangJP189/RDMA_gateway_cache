@@ -70,7 +70,7 @@ void simulate_roce_traffic() {
     const uint32_t src_qp = 1001;
     const uint32_t dest_qp = 2001;
 
-    int packet_count = 300;
+    int packet_count = 3000;
 
     unsigned char pkt_buf[MTU_SIZE];
     int pkt_len;
