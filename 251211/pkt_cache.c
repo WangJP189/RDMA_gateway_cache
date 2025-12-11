@@ -61,7 +61,7 @@ struct linear_memory* init_linear_memory(size_t capacity) {
     if (!mem) return NULL;
 
     mem->blocks = malloc(sizeof(struct cached_packet) * capacity);
-    mem->meta = malloc(sizeof(struct memory_block_meta) * capacity); // 新增
+    mem->meta = malloc(sizeof(struct memory_block_meta) * capacity);
     if (!mem->blocks || !mem->meta) {
         free(mem->blocks);
         free(mem->meta);
@@ -161,8 +161,16 @@ int insert_to_buffer(struct connection_cache *cache, uint32_t psn,
     pkt->psn = psn;
     pkt->valid = 1;
 
-    // 更新计数和全局PSN范围
+    // 更新计数和缓冲区PSN范围
     cache->buffer.count++;
+    if (psn < cache->buffer.min_psn || cache->buffer.min_psn == 0) {
+        cache->buffer.min_psn = psn;
+    }
+    if (psn > cache->buffer.max_psn) {
+        cache->buffer.max_psn = psn;
+    }
+
+    // 更新全局PSN范围
     if (psn < cache->min_psn || cache->min_psn == 0) {
         cache->min_psn = psn;
     }
@@ -177,7 +185,7 @@ int insert_to_buffer(struct connection_cache *cache, uint32_t psn,
     return 0;
 }
 
-// 刷新缓冲区到内存
+// 刷新缓冲区到内存（批量一次性写入）
 int flush_buffer_to_memory(struct connection_cache *cache) {
     if (!cache || cache->buffer.count == 0) {
         return 0;
@@ -189,26 +197,26 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
         return 0;
     }
 
-    // 收集有效数据包并记录最大PSN
-    struct cached_packet *packets = malloc(sizeof(struct cached_packet) * cache->buffer.count);
+    // 获取缓冲区中的数据包数量和最大PSN（由insert_to_buffer维护）
+    int count = cache->buffer.count;
+    uint32_t max_flush_psn = cache->buffer.max_psn;
+
+    // 分配连续内存存储所有有效数据包
+    struct cached_packet *packets = malloc(sizeof(struct cached_packet) * count);
     if (!packets) {
         pthread_mutex_unlock(&cache->buffer.lock);
         return -1;
     }
 
-    int count = 0;
-    uint32_t max_flush_psn = 0;  // 记录本次刷新的最大PSN
-    for (int i = 0; i < BUFFER_CAPACITY; i++) {
+    // 收集所有有效数据包
+    int idx = 0;
+    for (int i = 0; i < BUFFER_CAPACITY && idx < count; i++) {
         if (cache->buffer.packets[i].valid) {
-            packets[count] = cache->buffer.packets[i];
-            if (packets[count].psn > max_flush_psn) {
-                max_flush_psn = packets[count].psn;
-            }
-            count++;
+            packets[idx++] = cache->buffer.packets[i];
         }
     }
 
-    // 写入线性内存
+    // 写入线性内存（一次性批量处理）
     struct linear_memory *current_mem = cache->memory;
     int written = 0;
 
@@ -216,18 +224,29 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
         pthread_mutex_lock(&current_mem->lock);
         
         size_t available = current_mem->capacity - current_mem->used;
-        size_t to_write = (available < count - written) ? available : count - written;
+        size_t to_write = (available < (size_t)(count - written)) ? available : (size_t)(count - written);
 
         if (to_write > 0) {
+            // 批量拷贝数据包
             memcpy(&current_mem->blocks[current_mem->used], 
                    &packets[written], 
                    to_write * sizeof(struct cached_packet));
+            
+            // 批量更新元数据
+            for (size_t i = 0; i < to_write; i++) {
+                size_t pos = current_mem->used + i;
+                current_mem->meta[pos].is_free = 0;
+                current_mem->meta[pos].data_len = packets[written + i].data_len;
+                current_mem->meta[pos].psn = packets[written + i].psn;
+            }
+
             current_mem->used += to_write;
             written += to_write;
         }
 
         pthread_mutex_unlock(&current_mem->lock);
 
+        // 如果当前内存块已满且需要继续写入，则扩展内存
         if (written < count && !current_mem->next) {
             if (extend_linear_memory(current_mem) != 0) {
                 free(packets);
@@ -243,17 +262,18 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
 
     free(packets);
 
-    // 关键修改：更新base_psn为本次刷新的最大PSN
+    // 关键更新：将base_psn设置为本次刷新的最大PSN，使缓冲区能接收更大PSN的数据包
     cache->buffer.base_psn = max_flush_psn;
-    // batch_buffer->base_psn = max_flush_psn;
-    // 重置缓冲区计数和有效标记（保留base_psn）
+    // 重置缓冲区状态
     for (int i = 0; i < BUFFER_CAPACITY; i++) {
         cache->buffer.packets[i].valid = 0;
     }
     cache->buffer.count = 0;
+    cache->buffer.min_psn = 0;
+    cache->buffer.max_psn = 0;
     gettimeofday(&cache->buffer.last_flush, NULL);
 
-    printf("[FLUSH] 完成刷新，共%d个包，新base_psn=%u\n", count, max_flush_psn);
+    printf("[FLUSH] 完成批量刷新，共%d个包，新base_psn=%u\n", count, max_flush_psn);
     pthread_mutex_unlock(&cache->buffer.lock);
     return 0;
 }
@@ -275,7 +295,7 @@ void* batch_flush_thread(void *arg) {
         diff.tv_usec = now.tv_usec - cache->buffer.last_flush.tv_usec;
         long ms_diff = diff.tv_sec * 1000 + diff.tv_usec / 1000;
 
-        // 触发条件：数量≥阈值 或 超时（仅基于count判断）
+        // 触发条件：数量≥阈值 或 超时
         int need_flush = (cache->buffer.count >= BATCH_THRESHOLD) || 
                          (ms_diff >= BATCH_TIMEOUT_MS);
 
@@ -337,6 +357,7 @@ void destroy_connection_cache(struct connection_cache *cache) {
     while (current) {
         struct linear_memory *next = current->next;
         if (current->blocks) free(current->blocks);
+        if (current->meta) free(current->meta);
         pthread_mutex_destroy(&current->lock);
         free(current);
         current = next;
@@ -383,9 +404,6 @@ int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
                 if (current->blocks[i].psn >= ePSN) {
                     (*retrans_pkts)[idx++] = current->blocks[i];
                 } else {
-                    // memset(&current->blocks[i], 0, sizeof(struct cached_packet));
-
-                    //仅把psn<ePSN的包标记为无效,而不区清除
                     current->blocks[i].valid = 0;
                 }
             }
@@ -447,6 +465,7 @@ void destroy_cache_manager(struct cache_manager *mgr) {
     }
 
     free(mgr->hash_table);
+    free(mgr->conn_caches);
     pthread_mutex_destroy(&mgr->global_lock);
     free(mgr);
 }
@@ -535,6 +554,9 @@ void print_connection_status(struct connection_cache *cache) {
            src_ip_str, ntohs(cache->key.src_port), cache->key.qp,
            dst_ip_str, ntohs(cache->key.dst_port));
     printf("  PSN范围: %u - %u\n", cache->min_psn, cache->max_psn);
+    printf("  缓冲区状态: 基准PSN=%u, 计数=%d, 范围=%u-%u\n",
+           cache->buffer.base_psn, cache->buffer.count,
+           cache->buffer.min_psn, cache->buffer.max_psn);
     
     // 计算总缓存包数
     size_t total_pkts = 0;
@@ -546,7 +568,6 @@ void print_connection_status(struct connection_cache *cache) {
         current = current->next;
     }
     printf("  缓存包数: %zu\n", total_pkts);
-    printf("  缓冲区当前包数: %d\n", cache->buffer.count);
 }
 
 // 打印所有连接状态
@@ -567,7 +588,7 @@ void print_all_connections_status() {
     pthread_mutex_unlock(&g_cache_mgr->global_lock);
 }
 
-// 转换IP字符串到网络字节序（从测试文件移过来的共享函数）
+// 转换IP字符串到网络字节序
 uint32_t ip_str_to_uint(const char *ip) {
     struct in_addr addr;
     inet_pton(AF_INET, ip, &addr);

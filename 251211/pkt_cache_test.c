@@ -91,7 +91,7 @@ void simulate_roce_traffic() {
     //     psn_list[j] = temp;
     // }
 
-    printf("===== 开始模拟300个乱序RoCEv2数据包 =====\n");
+    printf("===== 开始模拟RoCEv2数据包 =====\n");
     printf("连接: %s:%u (QP%u) -> %s:%u (QP%u)\n",
            src_ip, src_port, src_qp,
            dst_ip, dst_port, dest_qp);
@@ -118,9 +118,9 @@ void simulate_roce_traffic() {
             fail_count++;
         }
 
-        // 每20个包输出进度
+        // 每50个包输出进度
         if ((i + 1) % 50 == 0) {
-            printf("已发送 %d/%d 包 | 成功: %d | 失败: %d | 当前PSN: %u (乱序)\n",
+            printf("已发送 %d/%d 包 | 成功: %d | 失败: %d | 当前PSN: %u \n",
                    i + 1, total_pkts, success_count, fail_count, psn);
         }
 
