@@ -48,7 +48,9 @@ int init_batch_buffer(struct batch_buffer *buffer) {
     buffer->head = 0;
     buffer->tail = 0;
     buffer->count = 0;
-    buffer->base_psn = 0;
+    buffer->base_psn = 0;         // 初始基准PSN为0
+    buffer->min_psn = 0;          // 初始最小PSN为0
+    buffer->max_psn = 0;          // 初始最大PSN为0
     gettimeofday(&buffer->last_flush, NULL);
     return pthread_mutex_init(&buffer->lock, NULL);
 }
@@ -59,19 +61,29 @@ struct linear_memory* init_linear_memory(size_t capacity) {
     if (!mem) return NULL;
 
     mem->blocks = malloc(sizeof(struct cached_packet) * capacity);
-    if (!mem->blocks) {
+    mem->meta = malloc(sizeof(struct memory_block_meta) * capacity); // 新增
+    if (!mem->blocks || !mem->meta) {
+        free(mem->blocks);
+        free(mem->meta);
         free(mem);
         return NULL;
     }
 
     memset(mem->blocks, 0, sizeof(struct cached_packet) * capacity);
+    // 初始化元数据
+    for (size_t i = 0; i < capacity; i++) {
+        mem->meta[i].is_free = 1;
+        mem->meta[i].data_len = 0;
+        mem->meta[i].block_size = sizeof(struct cached_packet);
+        mem->meta[i].block_addr = mem->blocks[i].data;
+        mem->meta[i].psn = 0;
+    }
     mem->capacity = capacity;
     mem->used = 0;
     mem->next = NULL;
     pthread_mutex_init(&mem->lock, NULL);
 
     printf("初始化线性内存区，容量 %zu 个块\n", mem->capacity);
-
     return mem;
 }
 
@@ -92,6 +104,32 @@ int extend_linear_memory(struct linear_memory *mem) {
     return 0;
 }
 
+// 如果数据包psn在buffer中越界，则直接写入内存块
+int write_directly_to_memory(struct connection_cache *cache, struct cached_packet *pkt) {
+    struct linear_memory *current_mem = cache->memory;
+    while (1) {
+        pthread_mutex_lock(&current_mem->lock);
+        if (current_mem->used < current_mem->capacity) {
+            // 找到空闲块
+            size_t pos = current_mem->used;
+            current_mem->blocks[pos] = *pkt;
+            current_mem->meta[pos].is_free = 0;
+            current_mem->meta[pos].data_len = pkt->data_len;
+            current_mem->meta[pos].psn = pkt->psn;
+            current_mem->used++;
+            pthread_mutex_unlock(&current_mem->lock);
+            return 0;
+        }
+        pthread_mutex_unlock(&current_mem->lock);
+        
+        // 扩展内存
+        if (!current_mem->next && extend_linear_memory(current_mem) != 0) {
+            return -1;
+        }
+        current_mem = current_mem->next;
+    }
+}
+
 // 插入数据包到缓冲区
 int insert_to_buffer(struct connection_cache *cache, uint32_t psn, 
                     const unsigned char *data, int data_len) {
@@ -101,28 +139,39 @@ int insert_to_buffer(struct connection_cache *cache, uint32_t psn,
 
     pthread_mutex_lock(&cache->buffer.lock);
 
-    if (cache->buffer.count >= BUFFER_CAPACITY) {
+    // 计算偏移量(PSN与基准的差值)
+    uint32_t offset = psn - cache->buffer.base_psn;
+    
+    // 检查偏移量是否超出缓冲区容量
+    if (offset >= BUFFER_CAPACITY) {
         pthread_mutex_unlock(&cache->buffer.lock);
-        return -1;
+        return -1;  // 超出缓冲区范围
     }
 
-    int insert_pos = (cache->buffer.tail) % BUFFER_CAPACITY;
-    struct cached_packet *pkt = &cache->buffer.packets[insert_pos];
+    // 检查是否已存在该PSN的数据包
+    struct cached_packet *pkt = &cache->buffer.packets[offset];
+    if (pkt->valid) {
+        pthread_mutex_unlock(&cache->buffer.lock);
+        return -2;  // 重复数据包
+    }
 
+    // 存储数据包
     memcpy(pkt->data, data, data_len);
     pkt->data_len = data_len;
     pkt->psn = psn;
     pkt->valid = 1;
 
-    cache->buffer.tail = (cache->buffer.tail + 1) % BUFFER_CAPACITY;
+    // 更新计数和全局PSN范围
     cache->buffer.count++;
-
     if (psn < cache->min_psn || cache->min_psn == 0) {
         cache->min_psn = psn;
     }
     if (psn > cache->max_psn) {
         cache->max_psn = psn;
     }
+
+    printf("[BUFFER] 插入PSN=%u 到缓冲区，偏移量=%u，当前计数=%d\n", 
+           psn, offset, cache->buffer.count);
 
     pthread_mutex_unlock(&cache->buffer.lock);
     return 0;
@@ -140,6 +189,7 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
         return 0;
     }
 
+    // 收集有效数据包并记录最大PSN
     struct cached_packet *packets = malloc(sizeof(struct cached_packet) * cache->buffer.count);
     if (!packets) {
         pthread_mutex_unlock(&cache->buffer.lock);
@@ -147,28 +197,18 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
     }
 
     int count = 0;
-    int pos = cache->buffer.head;
-    while (count < cache->buffer.count) {
-        if (cache->buffer.packets[pos].valid) {
-            packets[count] = cache->buffer.packets[pos];
+    uint32_t max_flush_psn = 0;  // 记录本次刷新的最大PSN
+    for (int i = 0; i < BUFFER_CAPACITY; i++) {
+        if (cache->buffer.packets[i].valid) {
+            packets[count] = cache->buffer.packets[i];
+            if (packets[count].psn > max_flush_psn) {
+                max_flush_psn = packets[count].psn;
+            }
             count++;
         }
-        pos = (pos + 1) % BUFFER_CAPACITY;
     }
 
-    // 按PSN排序
-    for (int i = 0; i < count - 1; i++) {
-        for (int j = 0; j < count - i - 1; j++) {
-            if (packets[j].psn > packets[j + 1].psn) {
-                struct cached_packet temp = packets[j];
-                packets[j] = packets[j + 1];
-                packets[j + 1] = temp;
-            }
-        }
-    }
-
-    cache->buffer.base_psn = packets[count - 1].psn;
-
+    // 写入线性内存
     struct linear_memory *current_mem = cache->memory;
     int written = 0;
 
@@ -203,10 +243,17 @@ int flush_buffer_to_memory(struct connection_cache *cache) {
 
     free(packets);
 
-    cache->buffer.head = cache->buffer.tail;
+    // 关键修改：更新base_psn为本次刷新的最大PSN
+    cache->buffer.base_psn = max_flush_psn;
+    // batch_buffer->base_psn = max_flush_psn;
+    // 重置缓冲区计数和有效标记（保留base_psn）
+    for (int i = 0; i < BUFFER_CAPACITY; i++) {
+        cache->buffer.packets[i].valid = 0;
+    }
     cache->buffer.count = 0;
     gettimeofday(&cache->buffer.last_flush, NULL);
 
+    printf("[FLUSH] 完成刷新，共%d个包，新base_psn=%u\n", count, max_flush_psn);
     pthread_mutex_unlock(&cache->buffer.lock);
     return 0;
 }
@@ -218,22 +265,23 @@ void* batch_flush_thread(void *arg) {
     struct timeval diff;
 
     while (cache->running) {
-        usleep(1000);
+        usleep(1000);  // 1ms轮询
 
         pthread_mutex_lock(&cache->buffer.lock);
         gettimeofday(&now, NULL);
         
+        // 计算超时时间差
         diff.tv_sec = now.tv_sec - cache->buffer.last_flush.tv_sec;
         diff.tv_usec = now.tv_usec - cache->buffer.last_flush.tv_usec;
         long ms_diff = diff.tv_sec * 1000 + diff.tv_usec / 1000;
 
-        if (cache->buffer.count >= BATCH_THRESHOLD || ms_diff >= BATCH_TIMEOUT_MS) {
-            if (cache->buffer.count > 0) {
-                pthread_mutex_unlock(&cache->buffer.lock);
-                flush_buffer_to_memory(cache);
-            } else {
-                pthread_mutex_unlock(&cache->buffer.lock);
-            }
+        // 触发条件：数量≥阈值 或 超时（仅基于count判断）
+        int need_flush = (cache->buffer.count >= BATCH_THRESHOLD) || 
+                         (ms_diff >= BATCH_TIMEOUT_MS);
+
+        if (need_flush && cache->buffer.count > 0) {
+            pthread_mutex_unlock(&cache->buffer.lock);
+            flush_buffer_to_memory(cache);
         } else {
             pthread_mutex_unlock(&cache->buffer.lock);
         }

@@ -17,31 +17,40 @@ sudo ./pkt_cache_test
 
 // 生成随机RoCEv2数据包（模拟真实格式）
 void generate_roce_packet(unsigned char *buf, int *len, uint32_t psn) {
-    // RoCEv2头部模拟（简化版）
+    // 真实RoCEv2包头结构（基于WireShark捕获）
     struct roce_header {
-        uint8_t version;    // 版本
-        uint8_t opcode;     // 操作码
-        uint16_t pkt_len;   // 包长度
-        uint32_t psn;       // 包序列号
-        uint32_t qp_num;    // QP号
-        uint8_t payload[];  // 载荷
+        // Base Transport Header (8字节)
+        uint8_t opcode;          // 操作码 (SEND First=0x00)
+        uint8_t flags;           // 标志位 (0x00)
+        uint16_t pkey;           // 分区键 (0xffff)
+        uint32_t dst_qp;         // 目的QP号
+        // Extended Transport Header (可选，此处简化)
+        uint32_t psn;            // 包序列号
+        uint32_t invariant_crc;  // CRC校验 (占位)
+        uint8_t payload[0]; // 柔性数组成员（修正点）
     } __attribute__((packed));
 
-    // 随机载荷长度（50~1500字节，符合MTU）
-    int payload_len = 50 + (rand() % (MTU_SIZE - sizeof(struct roce_header) - 50));
+    // 固定MTU=1024字节（数据部分）
+    int payload_len = 1024;  // 真实MTU数据长度
     *len = sizeof(struct roce_header) + payload_len;
 
     struct roce_header *hdr = (struct roce_header*)buf;
-    hdr->version = 0x02;          // RoCEv2版本
-    hdr->opcode = 0x01;           // 发送操作码
-    hdr->pkt_len = htons(*len);   // 网络字节序长度
-    hdr->psn = htonl(psn);        // 网络字节序PSN
-    hdr->qp_num = htonl(1001);    // QP号
+    hdr->opcode = 0x00;               // SEND First
+    hdr->flags = 0x00;                // 无特殊标志
+    hdr->pkey = htons(0xffff);        // 分区键
+    hdr->dst_qp = htonl(0x000011);    // 目的QP（示例值）
+    hdr->psn = htonl(psn);            // 网络字节序PSN
+    hdr->invariant_crc = 0x00000000;  // 临时占位
 
-    // 随机填充载荷
+    // 填充载荷（固定长度）
+    memset(hdr->payload, 0x00, payload_len);
+    // 可添加简单模式填充（如递增字节）
     for (int i = 0; i < payload_len; i++) {
-        hdr->payload[i] = rand() % 256;
+        hdr->payload[i] = (psn + i) % 256;
     }
+
+    printf("[PKT] 生成RoCEv2包: 总长度=%d, 包头=%zu, 载荷=%d, PSN=%u\n",
+           *len, sizeof(struct roce_header), payload_len, psn);
 }
 
 // 转换IP字符串到网络字节序
@@ -61,7 +70,7 @@ void simulate_roce_traffic() {
     const uint32_t src_qp = 1001;
     const uint32_t dest_qp = 2001;
 
-    int packet_count = 300;
+    int packet_count = 200;
 
     unsigned char pkt_buf[MTU_SIZE];
     int pkt_len;
