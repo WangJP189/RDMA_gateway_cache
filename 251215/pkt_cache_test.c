@@ -17,52 +17,48 @@ sudo ./pkt_cache_test
 
 // 生成随机RoCEv2数据包（模拟真实格式）
 void generate_roce_packet(unsigned char *buf, int *len, uint32_t psn) {
-    // 真实RoCEv2包头结构（基于WireShark捕获）
+    // 真实RoCEv2包头结构
     struct roce_header {
         // Base Transport Header (8字节)
         uint8_t opcode;          // 操作码 (SEND First=0x00)
-        uint8_t flags;           // 标志位 (0x00)
-        uint16_t pkey;           // 分区键 (0xffff)
+        uint8_t flags;           // 标志位
+        uint16_t pkey;           // 分区键
         uint32_t dst_qp;         // 目的QP号
-        // Extended Transport Header (可选，此处简化)
+        // Extended Transport Header
         uint32_t psn;            // 包序列号
-        uint32_t invariant_crc;  // CRC校验 (占位)
-        uint8_t payload[0]; // 柔性数组成员（修正点）
+        uint32_t invariant_crc;  // CRC校验
+        uint8_t payload[0];      // 柔性数组成员
     } __attribute__((packed));
 
-    // 固定MTU=1024字节（数据部分）
-    int payload_len = 1024;  // 真实MTU数据长度
+    // 数据部分长度（不超过5KB内存块）
+    int payload_len = 1024;  // 可调整，但不超过MEM_BLOCK_SIZE
     *len = sizeof(struct roce_header) + payload_len;
+    if (*len > MEM_BLOCK_SIZE) {
+        *len = MEM_BLOCK_SIZE;
+        payload_len = MEM_BLOCK_SIZE - sizeof(struct roce_header);
+    }
 
     struct roce_header *hdr = (struct roce_header*)buf;
     hdr->opcode = 0x00;               // SEND First
     hdr->flags = 0x00;                // 无特殊标志
     hdr->pkey = htons(0xffff);        // 分区键
-    hdr->dst_qp = htonl(0x000011);    // 目的QP（示例值）
+    hdr->dst_qp = htonl(0x000011);    // 目的QP
     hdr->psn = htonl(psn);            // 网络字节序PSN
     hdr->invariant_crc = 0x00000000;  // 临时占位
 
-    // 填充载荷（固定长度）
+    // 填充载荷
     memset(hdr->payload, 0x00, payload_len);
-    // 可添加简单模式填充（如递增字节）
     for (int i = 0; i < payload_len; i++) {
-        hdr->payload[i] = (psn + i) % 256;
+        hdr->payload[i] = (psn + i) % 256;  // 简单模式填充
     }
 
     printf("[PKT] 生成RoCEv2包: 总长度=%d, 包头=%zu, 载荷=%d, PSN=%u\n",
            *len, sizeof(struct roce_header), payload_len, psn);
 }
 
-// 转换IP字符串到网络字节序
-// uint32_t ip_str_to_uint(const char *ip) {
-//     struct in_addr addr;
-//     inet_pton(AF_INET, ip, &addr);
-//     return addr.s_addr;
-// }
-
 // 模拟300个乱序RoCEv2数据包并缓存
 void simulate_roce_traffic() {
-    // 单连接测试（聚焦缓存逻辑）
+    // 单连接测试
     const char *src_ip = "192.168.239.132";
     const char *dst_ip = "192.168.239.134";
     const uint16_t src_port = 4791;
@@ -72,7 +68,7 @@ void simulate_roce_traffic() {
 
     int packet_count = 300;
 
-    unsigned char pkt_buf[MTU_SIZE];
+    unsigned char pkt_buf[MEM_BLOCK_SIZE];  // 使用5KB缓冲区
     int pkt_len;
     int total_pkts = packet_count;
     int success_count = 0;
@@ -83,18 +79,19 @@ void simulate_roce_traffic() {
     for (int i = 0; i < packet_count; i++) {
         psn_list[i] = i + 1;
     }
-    // // 打乱PSN顺序（模拟网络乱序）
-    // for (int i = 299; i > 0; i--) {
-    //     int j = rand() % (i + 1);
-    //     uint32_t temp = psn_list[i];
-    //     psn_list[i] = psn_list[j];
-    //     psn_list[j] = temp;
-    // }
+    // 打乱PSN顺序（模拟网络乱序）
+    for (int i = packet_count - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        uint32_t temp = psn_list[i];
+        psn_list[i] = psn_list[j];
+        psn_list[j] = temp;
+    }
 
-    printf("===== 开始模拟RoCEv2数据包 =====\n");
+    printf("\n===== 开始模拟RoCEv2数据包 =====\n");
     printf("连接: %s:%u (QP%u) -> %s:%u (QP%u)\n",
            src_ip, src_port, src_qp,
            dst_ip, dst_port, dest_qp);
+    printf("总数据包数量: %d\n", total_pkts);
     printf("=========================================\n");
 
     // 逐个发送数据包
@@ -120,11 +117,11 @@ void simulate_roce_traffic() {
 
         // 每50个包输出进度
         if ((i + 1) % 50 == 0) {
-            printf("已发送 %d/%d 包 | 成功: %d | 失败: %d | 当前PSN: %u \n",
+            printf("已处理 %d/%d 包 | 成功: %d | 失败: %d | 最后PSN: %u \n",
                    i + 1, total_pkts, success_count, fail_count, psn);
         }
 
-        // 模拟网络延迟（触发超时刷新）
+        // 模拟网络延迟
         usleep(1000);
     }
 
@@ -133,13 +130,9 @@ void simulate_roce_traffic() {
            total_pkts, success_count, fail_count);
 }
 
-// 验证缓存结果（检查内存中的数据包）
+// 验证缓存结果
 void verify_cache_result() {
     printf("\n===== 开始验证缓存结果 =====\n");
-
-    // 等待缓冲区全部刷入内存
-    printf("等待缓冲区批量刷入内存（%dms超时）...\n", BATCH_TIMEOUT_MS * 2);
-    usleep(BATCH_TIMEOUT_MS * 2 * 1000);
 
     // 打印所有连接状态
     print_all_connections_status();
@@ -178,6 +171,10 @@ void verify_cache_result() {
         } else {
             printf("重传请求处理失败！\n");
         }
+
+        // 重传后再次打印连接状态
+        printf("\n===== 重传后连接状态 =====");
+        print_connection_status(cache);
     } else {
         printf("未找到连接缓存，无法验证重传逻辑！\n");
     }
@@ -194,7 +191,6 @@ int main() {
         fprintf(stderr, "缓存管理器初始化失败！\n");
         return -1;
     }
-    printf("缓存管理器初始化成功（最大连接数: %zu）\n", g_cache_mgr->max_connections);
 
     // 2. 模拟RoCEv2流量
     simulate_roce_traffic();
