@@ -1,3 +1,13 @@
+/*
+该版本的人的吗网关缓存模块特点：
+1. 支持多连接缓存，每个连接维护独立的环形数组存储RDMA数据包的内存首地址
+2. 数据包缓存到动态分配的5KB内存块中，头部包含控制信息，这个内存位置是随机的
+3. 环形数组的主要作用是存储这些5KB内存块的首地址，便于快速查找和管理，期间使用地址映射机制，实现存储首地址的有序性
+4. 支持根据ePSN范围查找丢包，可以直接到环形数组中定位丢失的数据包地址
+*/
+
+//注：缓存模块的for循环月月应该只有ePSN查找有，其余都不需要
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,393 +17,239 @@
 
 #include "pkt_cache.h"
 
-// 全局缓存管理器
-struct cache_manager *g_cache_mgr = NULL;
+// 全局连接表初始化
+connection_cache* g_connection_table[MAX_CONNECTIONS] = {NULL};
+int g_connection_count = 0;
 
-// 计算五元组哈希值
-static uint32_t connection_hash(const struct connection_key *key, size_t table_size) {
-    if (!key || table_size == 0) return 0;
-    uint64_t hash = key->src_ip;
-    hash ^= key->dst_ip + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= key->src_port + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= key->dst_port + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= key->qp + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    return (uint32_t)(hash % table_size);
-}
+//以下几个函数需要滕超学长实现connection_key_equal、find_connection_ring_buffer、add_connection_to_table
 
-// 比较两个连接键是否相等
-static int connection_key_equal(const struct connection_key *a, const struct connection_key *b) {
+// 辅助函数：比较两个连接键是否相等（三元组匹配）
+static int connection_key_equal(const connection_key* a, const connection_key* b) {
     if (!a || !b) return 0;
     return (a->src_ip == b->src_ip &&
             a->dst_ip == b->dst_ip &&
-            a->src_port == b->src_port &&
-            a->dst_port == b->dst_port &&
-            a->qp == b->qp);
+            a->dst_qp == b->dst_qp);
 }
 
-// 创建连接缓存
-static struct connection_cache* create_connection_cache(const struct connection_key *key) {
-    if (!key) return NULL;
-
-    struct connection_cache *cache = malloc(sizeof(struct connection_cache));
-    if (!cache) {
-        printf("[ERROR] 创建连接缓存失败：内存分配失败\n");
+// 1. 根据连接三元组查找对应的连接缓存（返回环形数组地址）
+uint64_t* find_connection_ring_buffer(const connection_key* key) {
+    if (!key) {
+        printf("[ERROR] 查找连接失败：连接键为空\n");
         return NULL;
     }
 
-    // 初始化成员变量
-    memset(cache, 0, sizeof(struct connection_cache));
-    cache->key = *key;
-    cache->start_psn = 0;
-    cache->end_psn = 0;
-    cache->ring_used_count = 0;
-    
-    // 初始化环形数组所有指针为NULL
-    for (int i = 0; i < RING_BUFFER_SIZE; i++) {
-        cache->packet_ptr_ring[i] = NULL;
-    }
-
-    // 初始化互斥锁
-    if (pthread_mutex_init(&cache->ring_lock, NULL) != 0 ||
-        pthread_mutex_init(&cache->mem_lock, NULL) != 0) {
-        printf("[ERROR] 创建连接缓存失败：锁初始化失败\n");
-        free(cache);
-        return NULL;
-    }
-
-    printf("[INFO] 成功创建连接缓存\n");
-    return cache;
-}
-
-// 销毁连接缓存
-static void destroy_connection_cache(struct connection_cache *cache) {
-    if (!cache) return;
-
-    // 释放所有缓存的数据包内存
-    pthread_mutex_lock(&cache->ring_lock);
-    for (int i = 0; i < RING_BUFFER_SIZE; i++) {
-        if (cache->packet_ptr_ring[i]) {
-            free(cache->packet_ptr_ring[i]);
-            cache->packet_ptr_ring[i] = NULL;
-        }
-    }
-    pthread_mutex_unlock(&cache->ring_lock);
-
-    // 销毁互斥锁
-    pthread_mutex_destroy(&cache->ring_lock);
-    pthread_mutex_destroy(&cache->mem_lock);
-    free(cache);
-    
-    printf("[INFO] 成功销毁连接缓存\n");
-}
-
-// 计算PSN在环形数组中的索引
-static int calculate_ring_index(uint32_t psn) {
-    // 环形数组索引 = PSN % 环形数组大小（确保循环利用）
-    return psn % RING_BUFFER_SIZE;
-}
-
-// 初始化缓存管理器
-struct cache_manager* init_cache_manager(size_t max_conns) {
-    if (max_conns == 0) {
-        printf("[ERROR] 最大连接数不能为0\n");
-        return NULL;
-    }
-
-    struct cache_manager *mgr = malloc(sizeof(struct cache_manager));
-    if (!mgr) {
-        printf("[ERROR] 缓存管理器初始化失败：内存分配失败\n");
-        return NULL;
-    }
-
-    memset(mgr, 0, sizeof(struct cache_manager));
-    mgr->max_connections = max_conns;
-    mgr->hash_table_size = max_conns * 2;  // 哈希表大小为最大连接数的2倍
-    mgr->hash_table = calloc(mgr->hash_table_size, sizeof(struct hash_table_entry*));
-    
-    // 分配连接缓存数组
-    mgr->conn_caches = calloc(mgr->max_connections, sizeof(struct connection_cache *));
-    if (!mgr->conn_caches) {
-        printf("[ERROR] 缓存管理器初始化失败：连接数组分配失败\n");
-        free(mgr->hash_table);
-        free(mgr);
-        return NULL;
-    }
-
-    if (!mgr->hash_table) {
-        printf("[ERROR] 缓存管理器初始化失败：哈希表分配失败\n");
-        free(mgr->conn_caches);
-        free(mgr);
-        return NULL;
-    }
-
-    pthread_mutex_init(&mgr->global_lock, NULL);
-    mgr->total_connections = 0;
-
-    printf("[INFO] 缓存管理器初始化成功（最大连接数: %zu）\n", mgr->max_connections);
-    return mgr;
-}
-
-// 销毁缓存管理器
-void destroy_cache_manager(struct cache_manager *mgr) {
-    if (!mgr) return;
-
-    pthread_mutex_lock(&mgr->global_lock);
-
-    // 销毁所有连接缓存
-    for (size_t i = 0; i < mgr->hash_table_size; i++) {
-        struct hash_table_entry *entry = mgr->hash_table[i];
-        while (entry) {
-            struct hash_table_entry *next = entry->next;
-            destroy_connection_cache(entry->cache);
-            free(entry);
-            entry = next;
+    // 遍历连接表，查找匹配的连接
+    for (int i = 0; i < g_connection_count; i++) {
+        if (connection_key_equal(&g_connection_table[i]->key, key)) {
+            printf("[INFO] 找到连接：src_ip=0x%x, dst_ip=0x%x, dst_qp=%u | 环形数组地址=%p\n",
+                   key->src_ip, key->dst_ip, key->dst_qp, g_connection_table[i]->ring_buffer);
+            return g_connection_table[i]->ring_buffer;
         }
     }
 
-    free(mgr->hash_table);
-    free(mgr->conn_caches);
-    pthread_mutex_destroy(&mgr->global_lock);
-    free(mgr);
-    
-    printf("[INFO] 缓存管理器销毁完成\n");
+    printf("[WARN] 未找到连接：src_ip=0x%x, dst_ip=0x%x, dst_qp=%u\n",
+           key->src_ip, key->dst_ip, key->dst_qp);
+    return NULL;
 }
 
-// 添加数据包到缓存
-int add_packet_to_cache(const char *src_ip, const char *dst_ip,
-                       uint16_t src_port, uint16_t dst_port,
-                       uint32_t src_qp, uint32_t dest_qp,
-                       uint32_t psn, const unsigned char *data, int data_len) {
-    if (!g_cache_mgr || !src_ip || !dst_ip || !data || data_len <= 0 || data_len > MEM_BLOCK_SIZE) {
-        printf("[ERROR] 无效的数据包参数\n");
+// 2. 添加新连接到连接表
+int add_connection_to_table(const connection_key* key) {
+    if (!key || g_connection_count >= MAX_CONNECTIONS) {
+        printf("[ERROR] 添加连接失败：连接键为空或连接表已满（当前=%d/最大=%d）\n",
+               g_connection_count, MAX_CONNECTIONS);
         return -1;
     }
 
-    // 构建连接键
-    struct connection_key key;
-    key.src_ip = ip_str_to_uint(src_ip);
-    key.dst_ip = ip_str_to_uint(dst_ip);
-    key.src_port = htons(src_port);  // 转换为网络字节序
-    key.dst_port = htons(dst_port);
-    key.qp = src_qp;  // 使用源QP作为连接标识
+    // 检查连接是否已存在
+    for (int i = 0; i < g_connection_count; i++) {
+        if (connection_key_equal(&g_connection_table[i]->key, key)) {
+            printf("[WARN] 连接已存在：src_ip=0x%x, dst_ip=0x%x, dst_qp=%u\n",
+                   key->src_ip, key->dst_ip, key->dst_qp);
+            return 0;
+        }
+    }
 
-    pthread_mutex_lock(&g_cache_mgr->global_lock);
+    // 分配连接缓存内存
+    connection_cache* new_conn = (connection_cache*)malloc(sizeof(connection_cache));
+    if (!new_conn) {
+        printf("[ERROR] 添加连接失败：内存分配失败\n");
+        return -1;
+    }
 
-    // 查找现有连接
-    uint32_t hash = connection_hash(&key, g_cache_mgr->hash_table_size);
-    struct hash_table_entry *entry = g_cache_mgr->hash_table[hash];
-    struct connection_cache *cache = NULL;
+    // 初始化连接缓存
+    new_conn->key = *key;
+    // 初始化环形数组：所有位置设为0（表示空地址）
+    memset(new_conn->ring_buffer, 0, sizeof(uint64_t) * RING_BUFFER_SIZE);
+    new_conn->start_psn = 0;
+    new_conn->end_psn = 0;
+    new_conn->current_psn = 0;
 
-    while (entry) {
-        if (connection_key_equal(&entry->cache->key, &key)) {
-            cache = entry->cache;
+    // 添加到连接表
+    g_connection_table[g_connection_count++] = new_conn;
+
+    printf("[INFO] 新增连接成功：src_ip=0x%x, dst_ip=0x%x, dst_qp=%u | 连接表位置=%d | 环形数组地址=%p\n",
+           key->src_ip, key->dst_ip, key->dst_qp, g_connection_count - 1, new_conn->ring_buffer);
+    return 0;
+}
+
+
+
+//以下函数需要我的缓存模块具体实现的
+
+// 3. 缓存RDMA数据包到内存，并将地址存入环形数组
+// 这个函数有问题，用for循环查找哪个个连接对应ring_buffer，部分应该是直接在传参部分传入的对应连接，不需要查找
+
+int cache_rdma_packet(const connection_key* key, uint32_t psn, const unsigned char* data, int data_len) {
+    if (!key || !data || data_len <= 0) {
+        printf("[ERROR] 缓存数据包失败：参数无效（psn=%u, data_len=%d）\n", psn, data_len);
+        return -1;
+    }
+
+    // 检查数据长度是否超过内存块可用空间（5KB - 头部控制信息大小）
+    int max_data_len = MEM_BLOCK_SIZE - sizeof(memblock_header);
+    if (data_len > max_data_len) {
+        printf("[ERROR] 缓存数据包失败：数据长度超过上限（请求=%d, 上限=%d）\n", data_len, max_data_len);
+        return -1;
+    }
+
+    // 步骤1：查找/添加连接，获取环形数组地址
+    uint64_t* ring_buffer = find_connection_ring_buffer(key);
+    if (!ring_buffer) {
+        // 连接不存在，添加新连接
+        if (add_connection_to_table(key) != 0) {
+            return -1;
+        }
+        // 重新查找环形数组
+        ring_buffer = find_connection_ring_buffer(key);
+        if (!ring_buffer) {
+            return -1;
+        }
+    }
+
+    // 步骤2：malloc固定5KB内存块（随机分配，动态内存）
+    unsigned char* mem_block = (unsigned char*)malloc(MEM_BLOCK_SIZE);
+    if (!mem_block) {
+        printf("[ERROR] 缓存数据包失败：内存块分配失败（5KB）\n");
+        return -1;
+    }
+
+    // 步骤3：写入内存块头部控制信息 + RDMA数据包
+    memblock_header* header = (memblock_header*)mem_block;
+    header->data_len = data_len; // 头部存储有效数据长度
+
+    // 拷贝RDMA数据包到头部之后的位置
+    memcpy(mem_block + sizeof(memblock_header), data, data_len);
+
+    // 步骤4：计算PSN对应的环形数组索引（psn=3 → 索引3)
+    // 索引公式：psn % RING_BUFFER_SIZE，根据需求调整
+    int ring_index = psn % RING_BUFFER_SIZE;
+    if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
+        printf("[ERROR] 缓存数据包失败：PSN对应的索引超出范围（psn=%u, 索引=%d, 数组大小=%d）\n",
+               psn, ring_index, RING_BUFFER_SIZE);
+        free(mem_block);
+        return -1;
+    }
+
+    // 步骤5：将内存块首地址存入环形数组对应位置（转换为uint64_t存储）
+    ring_buffer[ring_index] = (uint64_t)(uintptr_t)mem_block;
+    printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | 数据长度=%d\n",
+           psn, ring_index, (uintptr_t)mem_block, data_len);
+
+    // 步骤6：更新连接的PSN参数（找到对应连接缓存，更新start/end/current_psn）
+    connection_cache* conn = NULL;
+    for (int i = 0; i < g_connection_count; i++) {
+        if (g_connection_table[i]->ring_buffer == ring_buffer) {
+            conn = g_connection_table[i];
             break;
         }
-        entry = entry->next;
     }
-
-    // 未找到则创建新连接
-    if (!cache) {
-        if (g_cache_mgr->total_connections >= g_cache_mgr->max_connections) {
-            pthread_mutex_unlock(&g_cache_mgr->global_lock);
-            printf("[ERROR] 达到最大连接数限制（%zu）\n", g_cache_mgr->max_connections);
-            return -1;
+    if (conn) {
+        // 更新start_psn（最小PSN）
+        if (conn->start_psn == 0 || psn < conn->start_psn) {
+            conn->start_psn = psn;
         }
-
-        cache = create_connection_cache(&key);
-        if (!cache) {
-            pthread_mutex_unlock(&g_cache_mgr->global_lock);
-            return -1;
+        // 更新end_psn（最大PSN）
+        if (psn > conn->end_psn) {
+            conn->end_psn = psn;
         }
+        // 更新current_psn（当前最新PSN）
+        conn->current_psn = psn;
 
-        // 添加到哈希表
-        struct hash_table_entry *new_entry = malloc(sizeof(struct hash_table_entry));
-        if (!new_entry) {
-            destroy_connection_cache(cache);
-            pthread_mutex_unlock(&g_cache_mgr->global_lock);
-            printf("[ERROR] 哈希表条目分配失败\n");
-            return -1;
-        }
-        new_entry->cache = cache;
-        new_entry->next = g_cache_mgr->hash_table[hash];
-        g_cache_mgr->hash_table[hash] = new_entry;
-        g_cache_mgr->total_connections++;
-
-        // 存入连接数组
-        for (size_t i = 0; i < g_cache_mgr->max_connections; i++) {
-            if (!g_cache_mgr->conn_caches[i]) {
-                g_cache_mgr->conn_caches[i] = cache;
-                break;
-            }
-        }
-        printf("[INFO] 新增连接缓存，当前连接数: %zu\n", g_cache_mgr->total_connections);
+        printf("[UPDATE] 连接PSN参数：start_psn=%u, end_psn=%u, current_psn=%u\n",
+               conn->start_psn, conn->end_psn, conn->current_psn);
     }
 
-    pthread_mutex_unlock(&g_cache_mgr->global_lock);
-
-    // 分配内存块存储数据包
-    struct cached_packet *pkt = malloc(sizeof(struct cached_packet));
-    if (!pkt) {
-        printf("[ERROR] 数据包内存分配失败\n");
-        return -1;
-    }
-    memcpy(pkt->data, data, data_len);
-    pkt->data_len = data_len;
-    pkt->psn = psn;
-
-    // 计算环形数组索引
-    int ring_idx = calculate_ring_index(psn);
-    if (ring_idx < 0 || ring_idx >= RING_BUFFER_SIZE) {
-        free(pkt);
-        printf("[ERROR] 无效的环形数组索引: %d\n", ring_idx);
-        return -1;
-    }
-
-    // 存入环形数组
-    pthread_mutex_lock(&cache->ring_lock);
-    
-    // 如果该位置已有数据，先释放旧数据
-    if (cache->packet_ptr_ring[ring_idx]) {
-        free(cache->packet_ptr_ring[ring_idx]);
-        cache->ring_used_count--;
-        printf("[WARN] 环形数组位置%d已有数据，已释放旧数据\n", ring_idx);
-    }
-
-    // 存入新数据指针
-    cache->packet_ptr_ring[ring_idx] = pkt;
-    cache->ring_used_count++;
-
-    // 更新PSN范围
-    if (cache->start_psn == 0 || psn < cache->start_psn) {
-        cache->start_psn = psn;
-    }
-    if (psn > cache->end_psn) {
-        cache->end_psn = psn;
-    }
-
-    pthread_mutex_unlock(&cache->ring_lock);
-
-    printf("[CACHE] PSN=%u 存入环形数组位置%d | 当前使用数: %zu | PSN范围: %u-%u\n",
-           psn, ring_idx, cache->ring_used_count, cache->start_psn, cache->end_psn);
     return 0;
 }
 
-// 处理重传请求
-int process_retransmit_request(struct connection_cache *cache, uint32_t ePSN,
-                              struct cached_packet **retrans_pkts, size_t *count) {
-    if (!cache || !retrans_pkts || !count) {
-        printf("[ERROR] 重传请求参数无效\n");
+// 4. 根据ePSN范围查找环形数组中丢失的数据包（返回丢包的PSN列表）
+int find_lost_packets(uint64_t* ring_buffer, uint32_t epsn_start, uint32_t epsn_end, uint32_t* lost_psns, int max_lost) {
+    if (!ring_buffer || epsn_start > epsn_end || !lost_psns || max_lost <= 0) {
+        printf("[ERROR] 查找丢包失败：参数无效（ePSN范围=%u~%u）\n", epsn_start, epsn_end);
         return -1;
     }
 
-    *count = 0;
-    *retrans_pkts = NULL;
+    int lost_count = 0;
+    printf("\n[FIND] 开始查找ePSN范围[%u~%u]的丢包情况：\n", epsn_start, epsn_end);
 
-    // 收集需要重传的数据包
-    pthread_mutex_lock(&cache->ring_lock);
-    
-    // 先统计数量
-    for (int i = 0; i < RING_BUFFER_SIZE; i++) {
-        if (cache->packet_ptr_ring[i] && cache->packet_ptr_ring[i]->psn >= ePSN) {
-            (*count)++;
+    // 遍历ePSN范围，检查环形数组对应位置是否为空（地址为0表示丢包）
+    for (uint32_t psn = epsn_start; psn <= epsn_end && lost_count < max_lost; psn++) {
+        int ring_index = psn - 1;
+        if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
+            printf("[WARN] PSN=%u 对应的索引超出范围（索引=%d），跳过\n", psn, ring_index);
+            continue;
+        }
+
+        if (ring_buffer[ring_index] == 0) {
+            // 地址为空，说明丢包
+            lost_psns[lost_count++] = psn;
+            printf("[LOST] PSN=%u → 环形数组索引=%d | 地址为空（丢包）\n", psn, ring_index);
+        } else {
+            // 地址不为空，验证内存块数据
+            unsigned char* mem_block = (unsigned char*)(uintptr_t)ring_buffer[ring_index];
+            memblock_header* header = (memblock_header*)mem_block;
+            printf("[FOUND] PSN=%u → 环形数组索引=%d | 地址=0x%lx | 数据长度=%d（正常）\n",
+                   psn, ring_index, (uintptr_t)mem_block, header->data_len);
         }
     }
 
-    if (*count == 0) {
-        pthread_mutex_unlock(&cache->ring_lock);
-        printf("[RETRANS] 没有需要重传的数据包（ePSN=%u）\n", ePSN);
-        return 0;
-    }
+    printf("[FIND] 查找完成：ePSN范围[%u~%u] | 总检查PSN数=%u | 丢包数=%d\n",
+           epsn_start, epsn_end, epsn_end - epsn_start + 1, lost_count);
+    return lost_count;
+}
 
-    // 分配内存存储重传包
-    *retrans_pkts = malloc(sizeof(struct cached_packet) * (*count));
-    if (!*retrans_pkts) {
-        pthread_mutex_unlock(&cache->ring_lock);
-        *count = 0;
-        printf("[ERROR] 重传包数组分配失败\n");
+// 5. 释放指定PSN对应的内存块，并清空环形数组对应位置
+int free_packet_by_psn(uint64_t* ring_buffer, uint32_t psn) {
+    if (!ring_buffer) {
+        printf("[ERROR] 释放数据包失败：环形数组地址为空\n");
         return -1;
     }
 
-    // 复制需要重传的数据包
-    size_t idx = 0;
-    for (int i = 0; i < RING_BUFFER_SIZE; i++) {
-        struct cached_packet *pkt = cache->packet_ptr_ring[i];
-        if (pkt && pkt->psn >= ePSN) {
-            (*retrans_pkts)[idx] = *pkt;  // 复制数据包内容
-            idx++;
-            
-            // 释放原内存并置空指针
-            free(pkt);
-            cache->packet_ptr_ring[i] = NULL;
-            cache->ring_used_count--;
-        }
+    int ring_index = psn - 1;
+    if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
+        printf("[ERROR] 释放数据包失败：PSN=%u 对应的索引超出范围（索引=%d）\n", psn, ring_index);
+        return -1;
     }
 
-    pthread_mutex_unlock(&cache->ring_lock);
+    // 释放内存块
+    if (ring_buffer[ring_index] != 0) {
+        unsigned char* mem_block = (unsigned char*)(uintptr_t)ring_buffer[ring_index];
+        free(mem_block);
+        ring_buffer[ring_index] = 0; // 清空环形数组位置
+        printf("[FREE] PSN=%u → 环形数组索引=%d | 内存块已释放\n", psn, ring_index);
+    } else {
+        printf("[WARN] PSN=%u → 环形数组索引=%d | 地址为空，无需释放\n", psn, ring_index);
+    }
 
-    printf("[RETRANS] 处理重传请求完成（ePSN=%u）| 重传包数量: %zu | 剩余缓存数: %zu\n",
-           ePSN, *count, cache->ring_used_count);
     return 0;
 }
 
-// 打印单个连接状态
-void print_connection_status(struct connection_cache *cache) {
-    if (!cache) return;
-
-    char src_ip_str[INET_ADDRSTRLEN];
-    char dst_ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &cache->key.src_ip, src_ip_str, INET_ADDRSTRLEN);
-    inet_ntop(AF_INET, &cache->key.dst_ip, dst_ip_str, INET_ADDRSTRLEN);
-
-    printf("\n===== 连接状态 =====");
-    printf("\n源地址: %s:%u (QP%u)",
-           src_ip_str, ntohs(cache->key.src_port), cache->key.qp);
-    printf("\n目的地址: %s:%u",
-           dst_ip_str, ntohs(cache->key.dst_port));
-    printf("\n环形数组大小: %d", RING_BUFFER_SIZE);
-    printf("\n已使用数量: %zu", cache->ring_used_count);
-    printf("\nPSN有效范围: %u - %u", cache->start_psn, cache->end_psn);
-    
-    // 打印前5个有效数据位置
-    printf("\n前5个有效数据位置: ");
-    pthread_mutex_lock(&cache->ring_lock);
-    int shown = 0;
-    for (int i = 0; i < RING_BUFFER_SIZE && shown < 5; i++) {
-        if (cache->packet_ptr_ring[i]) {
-            printf("位置%d(PSN=%u) ", i, cache->packet_ptr_ring[i]->psn);
-            shown++;
-        }
-    }
-    if (shown == 0) printf("无");
-    pthread_mutex_unlock(&cache->ring_lock);
-    printf("\n====================\n");
-}
-
-// 打印所有连接状态
-void print_all_connections_status() {
-    if (!g_cache_mgr) return;
-
-    printf("\n===== 所有连接缓存状态 =====");
-    printf("\n总连接数: %zu (最大: %zu)\n",
-           g_cache_mgr->total_connections, g_cache_mgr->max_connections);
-
-    pthread_mutex_lock(&g_cache_mgr->global_lock);
-    for (size_t i = 0; i < g_cache_mgr->hash_table_size; i++) {
-        struct hash_table_entry *entry = g_cache_mgr->hash_table[i];
-        while (entry) {
-            print_connection_status(entry->cache);
-            entry = entry->next;
-        }
-    }
-    pthread_mutex_unlock(&g_cache_mgr->global_lock);
-}
-
-// IP字符串转网络字节序
-uint32_t ip_str_to_uint(const char *ip) {
+// 6. IP字符串转网络字节序的uint32_t
+uint32_t ip_str_to_uint(const char* ip) {
     struct in_addr addr;
     if (inet_pton(AF_INET, ip, &addr) != 1) {
-        printf("[ERROR] 无效的IP地址: %s\n", ip);
+        printf("[ERROR] 无效的IP地址：%s\n", ip);
         return 0;
     }
-    return addr.s_addr;
+    return addr.s_addr; // 网络字节序
 }

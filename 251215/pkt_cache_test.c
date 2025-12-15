@@ -3,9 +3,8 @@
 gcc pkt_cache_test.c pkt_cache.c -o pkt_cache_test -lpthread -lrdmacm -libverbs
 
 运行命令：
-sudo ./pkt_cache_test
+./pkt_cache_test
 */
-
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,100 +14,89 @@ sudo ./pkt_cache_test
 #include <arpa/inet.h>
 #include "pkt_cache.h"
 
-// 生成随机RoCEv2数据包（模拟真实格式）
-void generate_roce_packet(unsigned char *buf, int *len, uint32_t psn) {
-    // 真实RoCEv2包头结构
-    struct roce_header {
-        // Base Transport Header (8字节)
-        uint8_t opcode;          // 操作码 (SEND First=0x00)
-        uint8_t flags;           // 标志位
-        uint16_t pkey;           // 分区键
-        uint32_t dst_qp;         // 目的QP号
-        // Extended Transport Header
-        uint32_t psn;            // 包序列号
-        uint32_t invariant_crc;  // CRC校验
-        uint8_t payload[0];      // 柔性数组成员
-    } __attribute__((packed));
+// 生成模拟RDMA数据包（RoCEv2格式，简化版）
+void generate_rdma_packet(unsigned char* buf, int* len, uint32_t psn) {
+    // 简化的RoCEv2数据包结构（实际可替换为真实RDMA数据包）
+    const int header_len = 16; // 模拟RoCEv2包头长度
+    // 数据包总长度：包头+随机载荷（范围：128~4096字节，不超过内存块可用空间）
+    int payload_len = 128 + (rand() % (4096 - 128));
+    *len = header_len + payload_len;
 
-    // 数据部分长度（不超过5KB内存块）
-    int payload_len = 1024;  // 可调整，但不超过MEM_BLOCK_SIZE
-    *len = sizeof(struct roce_header) + payload_len;
-    if (*len > MEM_BLOCK_SIZE) {
-        *len = MEM_BLOCK_SIZE;
-        payload_len = MEM_BLOCK_SIZE - sizeof(struct roce_header);
-    }
-
-    struct roce_header *hdr = (struct roce_header*)buf;
-    hdr->opcode = 0x00;               // SEND First
-    hdr->flags = 0x00;                // 无特殊标志
-    hdr->pkey = htons(0xffff);        // 分区键
-    hdr->dst_qp = htonl(0x000011);    // 目的QP
-    hdr->psn = htonl(psn);            // 网络字节序PSN
-    hdr->invariant_crc = 0x00000000;  // 临时占位
-
-    // 填充载荷
-    memset(hdr->payload, 0x00, payload_len);
+    // 填充包头（简单标识）
+    memset(buf, 0, header_len);
+    memcpy(buf, "RDMA_PKT", 8); // 包头标识
+    memcpy(buf + 8, &psn, 4);   // 包头存储PSN
+    // 填充载荷（随机数据，与PSN关联）
     for (int i = 0; i < payload_len; i++) {
-        hdr->payload[i] = (psn + i) % 256;  // 简单模式填充
+        buf[header_len + i] = (psn + i) % 256;
     }
 
-    printf("[PKT] 生成RoCEv2包: 总长度=%d, 包头=%zu, 载荷=%d, PSN=%u\n",
-           *len, sizeof(struct roce_header), payload_len, psn);
+    printf("[PKT] 生成RDMA数据包：PSN=%u | 总长度=%d（包头=%d + 载荷=%d）\n",
+           psn, *len, header_len, payload_len);
 }
 
-// 模拟300个乱序RoCEv2数据包并缓存
-void simulate_roce_traffic() {
-    // 单连接测试
-    const char *src_ip = "192.168.239.132";
-    const char *dst_ip = "192.168.239.134";
-    const uint16_t src_port = 4791;
-    const uint16_t dst_port = 4791;
-    const uint32_t src_qp = 1001;
-    const uint32_t dest_qp = 2001;
+// 模拟300个乱序RDMA数据包生成、缓存，以及丢包模拟
+void simulate_rdma_traffic(uint32_t* sent_psns, int total_pkts, int* lost_psns, int lost_count) {
+    // 固定连接三元组（测试用）
+    const char* src_ip_str = "192.168.239.132";
+    const char* dst_ip_str = "192.168.239.134";
+    const uint32_t dst_qp = 2001;
 
-    int packet_count = 300;
+    // 构建连接键
+    connection_key key;
+    key.src_ip = ip_str_to_uint(src_ip_str);
+    key.dst_ip = ip_str_to_uint(dst_ip_str);
+    key.dst_qp = dst_qp;
 
-    unsigned char pkt_buf[MEM_BLOCK_SIZE];  // 使用5KB缓冲区
+    // 初始化发送的PSN列表（1~300）
+    for (int i = 0; i < total_pkts; i++) {
+        sent_psns[i] = i + 1;
+    }
+
+    // 打乱PSN顺序（模拟网络乱序）
+    for (int i = total_pkts - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        uint32_t temp = sent_psns[i];
+        sent_psns[i] = sent_psns[j];
+        sent_psns[j] = temp;
+    }
+
+    // 随机选择丢包的PSN（从sent_psns中选lost_count个）
+    printf("\n[SIM] 开始模拟丢包：共选择%d个PSN丢弃\n", lost_count);
+    for (int i = 0; i < lost_count; i++) {
+        int random_idx = rand() % total_pkts;
+        lost_psns[i] = sent_psns[random_idx];
+        // 标记为已丢弃（设为0）
+        sent_psns[random_idx] = 0;
+        printf("[LOST] 选择丢弃PSN=%u\n", lost_psns[i]);
+    }
+
+    printf("\n===== 开始模拟RDMA数据包发送（乱序，含丢包）=====\n");
+    printf("连接三元组：src_ip=%s, dst_ip=%s, dst_qp=%u\n",
+           src_ip_str, dst_ip_str, dst_qp);
+    printf("总数据包数量：%d | 丢包数量：%d\n", total_pkts, lost_count);
+    printf("=============================================\n");
+
+    unsigned char pkt_buf[MEM_BLOCK_SIZE - sizeof(memblock_header)]; // 数据包缓冲区（不超过内存块可用空间）
     int pkt_len;
-    int total_pkts = packet_count;
     int success_count = 0;
     int fail_count = 0;
 
-    // 生成乱序PSN数组（1~300乱序）
-    uint32_t psn_list[packet_count];
-    for (int i = 0; i < packet_count; i++) {
-        psn_list[i] = i + 1;
-    }
-    // 打乱PSN顺序（模拟网络乱序）
-    for (int i = packet_count - 1; i > 0; i--) {
-        int j = rand() % (i + 1);
-        uint32_t temp = psn_list[i];
-        psn_list[i] = psn_list[j];
-        psn_list[j] = temp;
-    }
-
-    printf("\n===== 开始模拟RoCEv2数据包 =====\n");
-    printf("连接: %s:%u (QP%u) -> %s:%u (QP%u)\n",
-           src_ip, src_port, src_qp,
-           dst_ip, dst_port, dest_qp);
-    printf("总数据包数量: %d\n", total_pkts);
-    printf("=========================================\n");
-
-    // 逐个发送数据包
+    // 逐个发送/缓存数据包（跳过丢包的PSN）
     for (int i = 0; i < total_pkts; i++) {
-        uint32_t psn = psn_list[i];
-        // 生成RoCEv2包
-        generate_roce_packet(pkt_buf, &pkt_len, psn);
+        uint32_t psn = sent_psns[i];
+        if (psn == 0) {
+            // 丢包的PSN，跳过缓存
+            printf("[SKIP] PSN=%u 被丢弃，不缓存\n", lost_psns[fail_count]);
+            fail_count++;
+            continue;
+        }
 
-        // 添加到缓存
-        int ret = add_packet_to_cache(
-            src_ip, dst_ip,
-            src_port, dst_port,
-            src_qp, dest_qp,
-            psn, pkt_buf, pkt_len
-        );
+        // 生成RDMA数据包
+        generate_rdma_packet(pkt_buf, &pkt_len, psn);
 
-        // 统计结果
+        // 缓存数据包
+        int ret = cache_rdma_packet(&key, psn, pkt_buf, pkt_len);
         if (ret == 0) {
             success_count++;
         } else {
@@ -117,8 +105,8 @@ void simulate_roce_traffic() {
 
         // 每50个包输出进度
         if ((i + 1) % 50 == 0) {
-            printf("已处理 %d/%d 包 | 成功: %d | 失败: %d | 最后PSN: %u \n",
-                   i + 1, total_pkts, success_count, fail_count, psn);
+            printf("\n[PROGRESS] 已处理 %d/%d 包 | 成功缓存：%d | 失败/丢包：%d\n",
+                   i + 1, total_pkts, success_count, fail_count);
         }
 
         // 模拟网络延迟
@@ -126,82 +114,65 @@ void simulate_roce_traffic() {
     }
 
     printf("\n===== 数据包发送完成 =====\n");
-    printf("总计发送: %d | 成功缓存: %d | 缓存失败: %d\n",
+    printf("总计发送：%d | 成功缓存：%d | 丢包/失败：%d\n",
            total_pkts, success_count, fail_count);
-}
-
-// 验证缓存结果
-void verify_cache_result() {
-    printf("\n===== 开始验证缓存结果 =====\n");
-
-    // 打印所有连接状态
-    print_all_connections_status();
-
-    // 模拟重传请求（ePSN=100）
-    printf("\n===== 模拟重传请求（ePSN=100）=====\n");
-    // 找到第一个连接缓存
-    struct connection_cache *cache = NULL;
-    if (g_cache_mgr && g_cache_mgr->conn_caches && g_cache_mgr->total_connections > 0) {
-        for (size_t i = 0; i < g_cache_mgr->max_connections; i++) {
-            if (g_cache_mgr->conn_caches[i]) {
-                cache = g_cache_mgr->conn_caches[i];
-                break;
-            }
-        }
-    }
-
-    if (cache) {
-        struct cached_packet *retrans_pkts = NULL;
-        size_t retrans_count = 0;
-
-        // 处理重传请求
-        int ret = process_retransmit_request(cache, 100, &retrans_pkts, &retrans_count);
-
-        if (ret == 0) {
-            printf("重传包数量: %zu (PSN ≥ 100)\n", retrans_count);
-            if (retrans_pkts) {
-                // 打印前5个重传包信息
-                int show_count = retrans_count > 5 ? 5 : retrans_count;
-                for (int i = 0; i < show_count; i++) {
-                    printf("  重传包 %d: PSN=%u, 长度=%d\n",
-                           i + 1, retrans_pkts[i].psn, retrans_pkts[i].data_len);
-                }
-                free(retrans_pkts);
-            }
-        } else {
-            printf("重传请求处理失败！\n");
-        }
-
-        // 重传后再次打印连接状态
-        printf("\n===== 重传后连接状态 =====");
-        print_connection_status(cache);
-    } else {
-        printf("未找到连接缓存，无法验证重传逻辑！\n");
-    }
 }
 
 int main() {
     // 初始化随机数
     srand(time(NULL));
 
-    // 1. 初始化缓存管理器
-    printf("===== 初始化缓存管理器 =====\n");
-    g_cache_mgr = init_cache_manager(10);  // 最大10个连接
-    if (!g_cache_mgr) {
-        fprintf(stderr, "缓存管理器初始化失败！\n");
+    // 配置参数
+    const int total_pkts = 300;    // 总数据包数量
+    const int lost_count = 5;      // 丢包数量
+    uint32_t sent_psns[total_pkts];// 发送的PSN列表
+    int lost_psns[lost_count];     // 丢包的PSN列表
+    uint32_t found_lost_psns[total_pkts]; // 查找出的丢包PSN列表
+
+    // 步骤1：模拟RDMA流量（含丢包）
+    simulate_rdma_traffic(sent_psns, total_pkts, lost_psns, lost_count);
+
+    // 步骤2：获取连接的环形数组（测试用连接三元组）
+    connection_key key;
+    key.src_ip = ip_str_to_uint("192.168.239.132");
+    key.dst_ip = ip_str_to_uint("192.168.239.134");
+    key.dst_qp = 2001;
+    uint64_t* ring_buffer = find_connection_ring_buffer(&key);
+    if (!ring_buffer) {
+        fprintf(stderr, "未找到连接的环形数组，程序退出\n");
         return -1;
     }
 
-    // 2. 模拟RoCEv2流量
-    simulate_roce_traffic();
+    // 步骤3：ePSN查找丢包（ePSN范围：1~300）
+    uint32_t epsn_start = 1;
+    uint32_t epsn_end = total_pkts;
+    int found_lost_count = find_lost_packets(ring_buffer, epsn_start, epsn_end, found_lost_psns, total_pkts);
 
-    // 3. 验证缓存结果
-    verify_cache_result();
+    // 步骤4：验证丢包结果
+    printf("\n===== 丢包结果验证 =====\n");
+    printf("预期丢包PSN：");
+    for (int i = 0; i < lost_count; i++) {
+        printf("%u ", lost_psns[i]);
+    }
+    printf("\n查找出的丢包PSN：");
+    for (int i = 0; i < found_lost_count; i++) {
+        printf("%u ", found_lost_psns[i]);
+    }
+    printf("\n");
 
-    // 4. 清理资源
-    printf("\n===== 清理缓存资源 =====\n");
-    destroy_cache_manager(g_cache_mgr);
-    printf("缓存资源清理完成！\n");
+    // 步骤5：释放所有数据包内存（清理资源）
+    printf("\n===== 开始释放所有数据包内存 =====\n");
+    for (uint32_t psn = epsn_start; psn <= epsn_end; psn++) {
+        free_packet_by_psn(ring_buffer, psn);
+    }
+
+    // 步骤6：释放连接缓存（清理资源）
+    for (int i = 0; i < g_connection_count; i++) {
+        free(g_connection_table[i]);
+        g_connection_table[i] = NULL;
+    }
+    g_connection_count = 0;
+    printf("\n[CLEAN] 所有资源已清理完成\n");
 
     return 0;
 }
