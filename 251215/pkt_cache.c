@@ -127,12 +127,21 @@ int cache_rdma_packet(ConnectionCache* conn, uint32_t psn, const unsigned char* 
         return -1;
     }
 
-    // 步骤4：将内存块首地址存入环形数组对应位置（转换为uint64_t存储）
+        // 步骤4：处理环形数组冲突（覆盖旧数据包）
+    if (conn->ring_buffer[ring_index] != 0) {
+        // 存在旧数据包，先释放其内存块
+        unsigned char* old_mem_block = (unsigned char*)(uintptr_t)conn->ring_buffer[ring_index];
+        free(old_mem_block);
+        printf("[OVERWRITE] 环形数组索引=%d 存在旧数据包（PSN可能为%u），已释放旧内存块（地址=0x%lx）\n",
+               ring_index, psn - (psn % RING_BUFFER_SIZE) + ring_index, (uintptr_t)old_mem_block);
+    }
+
+    // 步骤5：将内存块首地址存入环形数组对应位置（转换为uint64_t存储）
     conn->ring_buffer[ring_index] = (uint64_t)(uintptr_t)mem_block;
     printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | 数据长度=%d\n",
            psn, ring_index, (uintptr_t)mem_block, data_len);
 
-    // 步骤5：更新连接的PSN参数（直接操作传入的conn，无需循环查找）
+    // 步骤6：更新连接的PSN参数（直接操作传入的conn，无需循环查找）
     // 更新start_psn（最小PSN）
     if (conn->start_psn == 0 || psn < conn->start_psn) {
         conn->start_psn = psn;
@@ -220,7 +229,7 @@ int process_retransmit_by_epsn(ConnectionCache* conn, uint32_t epsn, uint64_t** 
     // 步骤1：删除psn < epsn的数据包（释放内存，环形数组置0）
     int delete_count = 0;
     for (uint32_t psn = psn_start; psn < epsn && psn <= psn_end; psn++) {
-        int ring_index = psn - 1;
+        int ring_index = psn % RING_BUFFER_SIZE;
         if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
             continue;
         }
@@ -240,7 +249,7 @@ int process_retransmit_by_epsn(ConnectionCache* conn, uint32_t epsn, uint64_t** 
     int retrans_temp_count = 0;
     // 先统计数量
     for (uint32_t psn = epsn; psn <= psn_end; psn++) {
-        int ring_index = psn - 1;
+        int ring_index = psn % RING_BUFFER_SIZE;
         if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
             continue;
         }
@@ -261,7 +270,7 @@ int process_retransmit_by_epsn(ConnectionCache* conn, uint32_t epsn, uint64_t** 
         // 收集地址
         int idx = 0;
         for (uint32_t psn = epsn; psn <= psn_end; psn++) {
-            int ring_index = psn - 1;
+            int ring_index = psn % RING_BUFFER_SIZE;
             if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
                 continue;
             }
@@ -298,7 +307,7 @@ int free_packet_by_psn(ConnectionCache* conn, uint32_t psn) {
         return -1;
     }
 
-    int ring_index = psn - 1;
+    int ring_index = psn % RING_BUFFER_SIZE;
     if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
         printf("[ERROR] 释放数据包失败：PSN=%u 对应的索引超出范围（索引=%d）\n", psn, ring_index);
         return -1;
