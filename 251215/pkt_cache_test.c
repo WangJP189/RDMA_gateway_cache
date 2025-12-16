@@ -16,13 +16,13 @@ gcc pkt_cache_test.c pkt_cache.c -o pkt_cache_test -lpthread -lrdmacm -libverbs
 
 // 生成模拟RDMA数据包（RoCEv2格式，简化版）
 void generate_rdma_packet(unsigned char* buf, int* len, uint32_t psn) {
-    // 简化的RoCEv2数据包结构（实际可替换为真实RDMA数据包）
+    // 简化的RoCEv2数据包结构
     const int header_len = 16; // 模拟RoCEv2包头长度
-    // 数据包总长度：包头+随机载荷（范围：128~4096字节，不超过内存块可用空间）
+    // 数据包总长度：包头+随机载荷（128~4096字节，不超过内存块可用空间）
     int payload_len = 128 + (rand() % (4096 - 128));
     *len = header_len + payload_len;
 
-    // 填充包头（简单标识）
+    // 填充包头
     memset(buf, 0, header_len);
     memcpy(buf, "RDMA_PKT", 8); // 包头标识
     memcpy(buf + 8, &psn, 4);   // 包头存储PSN
@@ -35,9 +35,9 @@ void generate_rdma_packet(unsigned char* buf, int* len, uint32_t psn) {
            psn, *len, header_len, payload_len);
 }
 
-// 模拟300个乱序RDMA数据包生成、缓存，以及丢包模拟
+// 模拟乱序RDMA数据包生成、缓存，以及丢包模拟
 void simulate_rdma_traffic(ConnectionCache* conn, uint32_t* sent_psns, int total_pkts, int* lost_psns, int lost_count) {
-    // 初始化发送的PSN列表（1~300）
+    // 初始化发送的PSN列表（1~total_pkts）
     for (int i = 0; i < total_pkts; i++) {
         sent_psns[i] = i + 1;
     }
@@ -50,13 +50,12 @@ void simulate_rdma_traffic(ConnectionCache* conn, uint32_t* sent_psns, int total
         sent_psns[j] = temp;
     }
 
-    // 随机选择丢包的PSN（从sent_psns中选lost_count个）
+    // 随机选择丢包的PSN
     printf("\n[SIM] 开始模拟丢包：共选择%d个PSN丢弃\n", lost_count);
     for (int i = 0; i < lost_count; i++) {
         int random_idx = rand() % total_pkts;
         lost_psns[i] = sent_psns[random_idx];
-        // 标记为已丢弃（设为0）
-        sent_psns[random_idx] = 0;
+        sent_psns[random_idx] = 0; // 标记为丢弃
         printf("[LOST] 选择丢弃PSN=%u\n", lost_psns[i]);
     }
 
@@ -64,12 +63,12 @@ void simulate_rdma_traffic(ConnectionCache* conn, uint32_t* sent_psns, int total
     printf("总数据包数量：%d | 丢包数量：%d\n", total_pkts, lost_count);
     printf("=============================================\n");
 
-    unsigned char pkt_buf[MEM_BLOCK_SIZE - sizeof(MemBlockHeader)]; // 数据包缓冲区（不超过内存块可用空间）
+    unsigned char pkt_buf[MEM_BLOCK_SIZE - sizeof(MemBlockHeader)]; // 数据包缓冲区
     int pkt_len;
     int success_count = 0;
     int fail_count = 0;
 
-    // 逐个发送/缓存数据包（跳过丢包的PSN）
+    // 逐个发送/缓存数据包
     for (int i = 0; i < total_pkts; i++) {
         uint32_t psn = sent_psns[i];
         if (psn == 0) {
@@ -82,7 +81,7 @@ void simulate_rdma_traffic(ConnectionCache* conn, uint32_t* sent_psns, int total
         // 生成RDMA数据包
         generate_rdma_packet(pkt_buf, &pkt_len, psn);
 
-        // 缓存数据包（直接传入conn，由调用方处理查表）
+        // 缓存数据包
         int ret = cache_rdma_packet(conn, psn, pkt_buf, pkt_len);
         if (ret == 0) {
             success_count++;
@@ -90,13 +89,7 @@ void simulate_rdma_traffic(ConnectionCache* conn, uint32_t* sent_psns, int total
             fail_count++;
         }
 
-        // 每50个包输出进度
-        if ((i + 1) % 50 == 0) {
-            printf("\n[PROGRESS] 已处理 %d/%d 包 | 成功缓存：%d | 失败/丢包：%d\n",
-                   i + 1, total_pkts, success_count, fail_count);
-        }
-
-        // 模拟网络延迟
+        // 模拟网络延迟（微秒级，不影响老化时间）
         usleep(1000);
     }
 
@@ -107,7 +100,7 @@ void simulate_rdma_traffic(ConnectionCache* conn, uint32_t* sent_psns, int total
 
 int main() {
     // 初始化随机数
-    srand(time(NULL));
+    srand((unsigned int)time(NULL));
 
     // 配置参数
     const int total_pkts = 10;    // 总数据包数量
@@ -154,8 +147,16 @@ int main() {
     }
     printf("\n");
 
-    // 步骤7：模拟ePSN重传（选择ePSN=100）
-    uint32_t epsn = 100;
+    // 步骤7：模拟老化处理（等待超过最大老化时间）
+    printf("\n===== 等待数据包过期（%d ms）=====\n", MAX_AGE_MILLISECONDS);
+    usleep(MAX_AGE_MILLISECONDS * 2); // 等待120ms，确保数据包过期
+    // 获取当前毫秒级时间戳，传入老化函数
+    uint64_t current_ts_ms = get_current_timestamp_ms();
+    int expired_count = age_out_expired_packets(conn, current_ts_ms);
+    printf("[TEST] 老化处理完成，共清理过期数据包：%d个\n", expired_count);
+
+    // 步骤8：模拟ePSN重传（选择ePSN=5）
+    uint32_t epsn = 5;
     int ret = process_retransmit_by_epsn(conn, epsn, &retrans_addrs, &retrans_count);
     if (ret == 0 && retrans_count > 0) {
         printf("\n===== 重传包信息 =====\n");
@@ -165,11 +166,10 @@ int main() {
             printf("0x%lx ", (uintptr_t)retrans_addrs[i]);
         }
         printf("\n");
-        // 释放重传地址数组
-        free(retrans_addrs);
+        free(retrans_addrs); // 释放重传地址数组
     }
 
-    // 步骤8：释放所有剩余数据包内存（清理资源）
+    // 步骤9：释放所有剩余数据包内存
     printf("\n===== 开始释放所有剩余数据包内存 =====\n");
     uint32_t psn_start = conn->start_psn;
     uint32_t psn_end = conn->end_psn;
@@ -179,7 +179,7 @@ int main() {
         }
     }
 
-    // 步骤9：释放连接缓存（清理资源）
+    // 步骤10：释放连接缓存（清理资源）
     for (int i = 0; i < g_connection_count; i++) {
         free(g_connection_table[i]);
         g_connection_table[i] = NULL;
