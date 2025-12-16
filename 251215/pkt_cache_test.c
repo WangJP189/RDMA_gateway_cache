@@ -36,18 +36,7 @@ void generate_rdma_packet(unsigned char* buf, int* len, uint32_t psn) {
 }
 
 // 模拟300个乱序RDMA数据包生成、缓存，以及丢包模拟
-void simulate_rdma_traffic(uint32_t* sent_psns, int total_pkts, int* lost_psns, int lost_count) {
-    // 固定连接三元组（测试用）
-    const char* src_ip_str = "192.168.239.132";
-    const char* dst_ip_str = "192.168.239.134";
-    const uint32_t dst_qp = 2001;
-
-    // 构建连接键
-    connection_key key;
-    key.src_ip = ip_str_to_uint(src_ip_str);
-    key.dst_ip = ip_str_to_uint(dst_ip_str);
-    key.dst_qp = dst_qp;
-
+void simulate_rdma_traffic(ConnectionCache* conn, uint32_t* sent_psns, int total_pkts, int* lost_psns, int lost_count) {
     // 初始化发送的PSN列表（1~300）
     for (int i = 0; i < total_pkts; i++) {
         sent_psns[i] = i + 1;
@@ -72,12 +61,10 @@ void simulate_rdma_traffic(uint32_t* sent_psns, int total_pkts, int* lost_psns, 
     }
 
     printf("\n===== 开始模拟RDMA数据包发送（乱序，含丢包）=====\n");
-    printf("连接三元组：src_ip=%s, dst_ip=%s, dst_qp=%u\n",
-           src_ip_str, dst_ip_str, dst_qp);
     printf("总数据包数量：%d | 丢包数量：%d\n", total_pkts, lost_count);
     printf("=============================================\n");
 
-    unsigned char pkt_buf[MEM_BLOCK_SIZE - sizeof(memblock_header)]; // 数据包缓冲区（不超过内存块可用空间）
+    unsigned char pkt_buf[MEM_BLOCK_SIZE - sizeof(MemBlockHeader)]; // 数据包缓冲区（不超过内存块可用空间）
     int pkt_len;
     int success_count = 0;
     int fail_count = 0;
@@ -95,8 +82,8 @@ void simulate_rdma_traffic(uint32_t* sent_psns, int total_pkts, int* lost_psns, 
         // 生成RDMA数据包
         generate_rdma_packet(pkt_buf, &pkt_len, psn);
 
-        // 缓存数据包
-        int ret = cache_rdma_packet(&key, psn, pkt_buf, pkt_len);
+        // 缓存数据包（直接传入conn，由调用方处理查表）
+        int ret = cache_rdma_packet(conn, psn, pkt_buf, pkt_len);
         if (ret == 0) {
             success_count++;
         } else {
@@ -123,32 +110,39 @@ int main() {
     srand(time(NULL));
 
     // 配置参数
-    const int total_pkts = 300;    // 总数据包数量
-    const int lost_count = 5;      // 丢包数量
+    const int total_pkts = 10;    // 总数据包数量
+    const int lost_count = 2;      // 丢包数量
     uint32_t sent_psns[total_pkts];// 发送的PSN列表
     int lost_psns[lost_count];     // 丢包的PSN列表
     uint32_t found_lost_psns[total_pkts]; // 查找出的丢包PSN列表
+    uint64_t* retrans_addrs = NULL;// 重传的数据包地址列表
+    int retrans_count = 0;
 
-    // 步骤1：模拟RDMA流量（含丢包）
-    simulate_rdma_traffic(sent_psns, total_pkts, lost_psns, lost_count);
-
-    // 步骤2：获取连接的环形数组（测试用连接三元组）
-    connection_key key;
+    // 步骤1：构建测试连接键
+    ConnectionKey key;
     key.src_ip = ip_str_to_uint("192.168.239.132");
     key.dst_ip = ip_str_to_uint("192.168.239.134");
     key.dst_qp = 2001;
-    uint64_t* ring_buffer = find_connection_ring_buffer(&key);
-    if (!ring_buffer) {
-        fprintf(stderr, "未找到连接的环形数组，程序退出\n");
+
+    // 步骤2：添加连接到表（若不存在）
+    if (find_connection_by_key(&key) == NULL) {
+        add_connection_to_table(&key);
+    }
+
+    // 步骤3：获取连接缓存
+    ConnectionCache* conn = find_connection_by_key(&key);
+    if (!conn) {
+        fprintf(stderr, "未找到连接的缓存结构，程序退出\n");
         return -1;
     }
 
-    // 步骤3：ePSN查找丢包（ePSN范围：1~300）
-    uint32_t epsn_start = 1;
-    uint32_t epsn_end = total_pkts;
-    int found_lost_count = find_lost_packets(ring_buffer, epsn_start, epsn_end, found_lost_psns, total_pkts);
+    // 步骤4：模拟RDMA流量（含丢包）
+    simulate_rdma_traffic(conn, sent_psns, total_pkts, lost_psns, lost_count);
 
-    // 步骤4：验证丢包结果
+    // 步骤5：在连接有效PSN范围内查找丢包
+    int found_lost_count = find_lost_packets(conn, found_lost_psns, total_pkts);
+
+    // 步骤6：验证丢包结果
     printf("\n===== 丢包结果验证 =====\n");
     printf("预期丢包PSN：");
     for (int i = 0; i < lost_count; i++) {
@@ -160,13 +154,32 @@ int main() {
     }
     printf("\n");
 
-    // 步骤5：释放所有数据包内存（清理资源）
-    printf("\n===== 开始释放所有数据包内存 =====\n");
-    for (uint32_t psn = epsn_start; psn <= epsn_end; psn++) {
-        free_packet_by_psn(ring_buffer, psn);
+    // 步骤7：模拟ePSN重传（选择ePSN=100）
+    uint32_t epsn = 100;
+    int ret = process_retransmit_by_epsn(conn, epsn, &retrans_addrs, &retrans_count);
+    if (ret == 0 && retrans_count > 0) {
+        printf("\n===== 重传包信息 =====\n");
+        printf("ePSN=%u 对应的重传包数量：%d\n", epsn, retrans_count);
+        printf("重传包地址列表：");
+        for (int i = 0; i < retrans_count; i++) {
+            printf("0x%lx ", (uintptr_t)retrans_addrs[i]);
+        }
+        printf("\n");
+        // 释放重传地址数组
+        free(retrans_addrs);
     }
 
-    // 步骤6：释放连接缓存（清理资源）
+    // 步骤8：释放所有剩余数据包内存（清理资源）
+    printf("\n===== 开始释放所有剩余数据包内存 =====\n");
+    uint32_t psn_start = conn->start_psn;
+    uint32_t psn_end = conn->end_psn;
+    if (psn_start != 0 && psn_start <= psn_end) {
+        for (uint32_t psn = psn_start; psn <= psn_end; psn++) {
+            free_packet_by_psn(conn, psn);
+        }
+    }
+
+    // 步骤9：释放连接缓存（清理资源）
     for (int i = 0; i < g_connection_count; i++) {
         free(g_connection_table[i]);
         g_connection_table[i] = NULL;
