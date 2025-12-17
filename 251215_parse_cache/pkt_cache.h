@@ -13,7 +13,7 @@
 #define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
 #define CONNECTION_TABLE_SIZE 2048 // 哈希表定义
 
-// ==================== 连接表相关定义 ==================== WTC
+// ==================== 连接表相关定义 ====================
 
 // 连接表键结构
 struct connection_table_key {
@@ -85,7 +85,7 @@ void release_meta_array(struct ConnectionCache *meta);
 // 每个连接的缓存指针数组
 struct ConnectionCache 
 {
-    uintptr_t*  MemArray[RING_BUFFER_SIZE];   // 记录内存块地址针的环形数组
+    uintptr_t*  MemArray[RING_BUFFER_SIZE];   // 记录内存块地址的环形数组
     uint32_t    start_psn;
     uint32_t    end_psn;
     uint32_t    current_psn;
@@ -98,7 +98,7 @@ struct ConnectionCache
 // 整体内存块布局：[MemBlockHeader][RDMA数据包数据]，总大小≤5KB
 typedef struct {
     int data_len;                  // 有效RDMA数据包长度
-    uint64_t timestamp_ms;         // 毫秒级时间戳，记录数据包缓存时间（自解释命名）
+    uint64_t timestamp_ms;         // 毫秒级时间戳，记录数据包缓存时间
 } MemBlockHeader;
 
 
@@ -117,7 +117,7 @@ int free_packet_by_psn(struct ConnectionCache* conn, uint32_t psn);
 // IP字符串转网络字节序的uint32_t
 uint32_t ip_str_to_uint(const char* ip);
 
-// 老化处理函数：根据毫秒级时间戳清理过期的数据包（核心修改）
+// 老化处理函数：根据毫秒级时间戳清理过期的数据包
 int age_out_expired_packets(struct ConnectionCache* conn, uint64_t current_timestamp_ms);
 
 // 辅助函数：获取当前系统的毫秒级时间戳
@@ -128,34 +128,11 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
                            uint32_t dest_qp, uint32_t psn,
                            const unsigned char *packet, int packet_len);
 
-// 创建连接键
-// struct connection_key create_connection_key(const char *src_ip, const char *dst_ip,
-//                                             uint16_t src_port, uint16_t dst_port,
-//                                             uint8_t service_type, uint16_t pkey, uint32_t dest_qp);
-
-// 查找或创建连接缓存
-// struct connection_cache* get_or_create_connection_cache(
-//         struct cache_manager *mgr, const struct connection_key *key);
-// get_or_create
-
-
-// 计算连接键的哈希值
-//uint32_t calculate_hash(const struct connection_key *key, size_t table_size);
-
-// 比较两个连接键是否相等
-//int connection_keys_equal(const struct connection_key *a,
-//                          const struct connection_key *b);
-
-// 连接缓存管理
-// 创建新的连接缓存
+// 创建连接缓存
 struct connection_cache* create_connection_cache();
 
 // 销毁连接缓存
 void destroy_connection_cache(struct connection_cache *cache);
-
-// 打印连接键信息
-//void print_connection_key(const struct connection_key *key);
-
 
 
 #endif
