@@ -417,6 +417,7 @@ int cache_rdma_packet(struct ConnectionCache* conn, uint32_t psn, const unsigned
     MemBlockHeader* header = (MemBlockHeader*)mem_block;
     header->data_len = data_len;
     header->timestamp_ms = get_current_timestamp_ms(); // 写入毫秒级时间戳
+    header->psn = psn; // 写入当前内存块对应的PSN
     memcpy(mem_block + sizeof(MemBlockHeader), data, data_len);
 
     // 计算PSN对应的环形数组索引（取模实现环形逻辑）
@@ -463,12 +464,17 @@ int find_lost_packets(struct ConnectionCache* conn, uint32_t* lost_psns, int max
         return -1;
     }
 
+    // 空缓存检查
+    if (conn->start_psn == UINT32_MAX || conn->end_psn == 0) {
+        return 0;  // 无缓存数据，返回0个丢失包
+    }
+
     uint32_t psn_start = conn->start_psn;
     uint32_t psn_end = conn->end_psn;
 
-    if (psn_start == 0 || psn_start > psn_end) {
-        printf("[WARN] 连接无有效PSN范围（start_psn=%u, end_psn=%u），无丢包可查\n",
-               psn_start, psn_end);
+    // 处理未初始化的情况（首次缓存前）
+    if (psn_start == UINT32_MAX) {
+        printf("[WARN] 连接未缓存任何数据包，无丢包可查\n");
         return 0;
     }
 
@@ -476,7 +482,7 @@ int find_lost_packets(struct ConnectionCache* conn, uint32_t* lost_psns, int max
     printf("\n[FIND] 开始查找连接有效PSN范围[%u~%u]的丢包情况：\n", psn_start, psn_end);
 
     // 遍历有效PSN范围，检查环形数组对应位置是否为空
-    for (uint32_t psn = psn_start; psn <= psn_end && lost_count < max_lost; psn++) {
+    for (uint32_t psn = psn_start; psn <= psn_end; psn++) {
         int ring_index = psn % RING_BUFFER_SIZE;
         if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
             printf("[WARN] PSN=%u 对应的索引超出范围（索引=%d），跳过\n", psn, ring_index);
@@ -491,8 +497,16 @@ int find_lost_packets(struct ConnectionCache* conn, uint32_t* lost_psns, int max
             // 验证内存块数据
             unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
             MemBlockHeader* header = (MemBlockHeader*)mem_block;
-            printf("[FOUND] PSN=%u → 环形数组索引=%d | 地址=0x%lx | 数据长度=%d | 时间戳=%lu ms（正常）\n",
-                   psn, ring_index, (uintptr_t)mem_block, header->data_len, header->timestamp_ms);
+
+            // 检查头部PSN是否匹配
+            if(header->psn != psn) {
+                printf("[WARN] PSN=%u 数据包被覆盖：环形数组索引=%d | 地址=0x%lx | 头部PSN=%u（预期PSN=%u）\n", psn, ring_index, (uintptr_t)mem_block, header->psn, psn);
+                lost_psns[lost_count++] = psn;
+            }
+            else{
+                printf("[FOUND] PSN=%u → 环形数组索引=%d | 地址=0x%lx | 数据长度=%d | 时间戳=%lu ms（正常）\n",
+                    psn, ring_index, (uintptr_t)mem_block, header->data_len, header->timestamp_ms);
+            }
         }
     }
 
@@ -508,16 +522,28 @@ int process_retransmit_by_epsn(struct ConnectionCache* conn, uint32_t epsn, uint
         return -1;
     }
 
+    if (conn->start_psn > conn->end_psn) {
+        printf("[WARN] 连接无有效PSN范围，无需处理重传\n");
+        return -2;
+    }
+
+    if(conn->start_psn==UINT32_MAX || conn->end_psn==0){
+        printf("[WARN] 连接未缓存任何数据包，无需处理重传\n");
+        return -3;
+    }
+
+    if(conn->start_psn >= epsn){
+        printf("[INFO] 连接start_psn=%u 已大于等于ePSN=%u，无需处理重传\n", conn->start_psn, epsn);
+        *retrans_count = 0;
+        *retrans_addrs = NULL;
+        return -4;
+    }
+
     *retrans_count = 0;
     *retrans_addrs = NULL;
 
     uint32_t psn_start = conn->start_psn;
     uint32_t psn_end = conn->end_psn;
-
-    if (psn_start == 0 || psn_start > psn_end) {
-        printf("[WARN] 连接无有效PSN范围，无需处理重传\n");
-        return 0;
-    }
 
     printf("\n[RETRANS] 开始处理ePSN=%u的重传请求：\n", epsn);
     printf("原有效PSN范围：%u~%u\n", psn_start, psn_end);
@@ -531,12 +557,22 @@ int process_retransmit_by_epsn(struct ConnectionCache* conn, uint32_t epsn, uint
         }
 
         if (conn->MemArray[ring_index] != NULL) {
+            // 验证内存块数据
             unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
-            free(mem_block);
-            conn->MemArray[ring_index] = NULL;
-            delete_count++;
-            printf("[DELETE] PSN=%u → 环形数组索引=%d | 内存块已释放（psn < ePSN）\n",
-                   psn, ring_index);
+            MemBlockHeader* header = (MemBlockHeader*)mem_block;
+            if(header->psn != psn) {
+                printf("[WARN] PSN=%u 旧数据包被覆盖：环形数组索引=%d | 地址=0x%lx | 头部PSN=%u（预期PSN=%u）\n",
+                       psn, ring_index, (uintptr_t)mem_block, header->psn, psn);
+                continue;
+            }
+            else{
+                unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
+                free(mem_block);
+                conn->MemArray[ring_index] = NULL;
+                delete_count++;
+                printf("[DELETE] PSN=%u → 环形数组索引=%d | 内存块已释放（psn < ePSN）\n",
+                    psn, ring_index);
+            }
         }
     }
 
@@ -607,12 +643,9 @@ int free_packet_by_psn(struct ConnectionCache* conn, uint32_t psn) {
     // 释放内存块
     if (conn->MemArray[ring_index] != NULL) {
         unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
-        MemBlockHeader* header = (MemBlockHeader*)mem_block;
-        uint64_t survival_time = get_current_timestamp_ms() - header->timestamp_ms;
         free(mem_block);
         conn->MemArray[ring_index] = NULL;
-        printf("[FREE] PSN=%u → 环形数组索引=%d | 内存块已释放（存活时间=%lu ms）\n",
-               psn, ring_index, survival_time);
+        printf("[FREE] PSN=%u → 环形数组索引=%d | 内存块已释放\n", psn, ring_index);
     } else {
         printf("[WARN] PSN=%u → 环形数组索引=%d | 地址为空，无需释放\n", psn, ring_index);
     }

@@ -90,6 +90,7 @@ struct ConnectionCache
     uint32_t    end_psn;
     uint32_t    current_psn;
     int         arraylength;
+    uint64_t    last_age_stamp;              // 上次老化时间记录
     
     volatile int ref_count;     // 引用计数，正向/反向连接指向同一缓存指针数组
 };
@@ -99,6 +100,7 @@ struct ConnectionCache
 typedef struct {
     int data_len;                  // 有效RDMA数据包长度
     uint64_t timestamp_ms;         // 毫秒级时间戳，记录数据包缓存时间
+    uint32_t psn;                  // 新增：当前内存块对应的PSN
 } MemBlockHeader;
 
 
