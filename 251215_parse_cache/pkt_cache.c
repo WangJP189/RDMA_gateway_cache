@@ -250,7 +250,14 @@ void release_meta_array(struct ConnectionCache *meta) {
 
     // 原子递减引用计数
     if (__sync_sub_and_fetch(&meta->ref_count, 1) == 0) {
-        // 引用计数归零，执行真正的物理释放
+        // 1. 释放环形数组中的所有内存块
+        for (int i = 0; i < meta->arraylength; i++) {
+            if (meta->MemArray[i] != 0) {
+                free((void*)meta->MemArray[i]);
+                meta->MemArray[i] = 0;
+            }
+        }
+        // 2. 释放结构体本身
         free(meta);
         printf("ConnectionCache已彻底释放\n");
     }
@@ -288,19 +295,93 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
                            uint32_t dest_qp, uint32_t psn,
                            const unsigned char *packet_data, int packet_len)
 {
-    // 暂未实现具体逻辑
+    // 检查输入参数有效性
+    if (!src_ip || !dst_ip || !packet_data || packet_len <= 0 || packet_len > (MEM_BLOCK_SIZE - sizeof(MemBlockHeader))) {
+        printf("无效的缓存参数: 输入为空或数据包过长\n");
+        return -1;
+    }
+
+    // 查找对应的连接表条目
+    struct connection_table_entry* entry = find_connection_entry(src_ip, dst_ip, dest_qp);
+    if (!entry) {
+        printf("未找到匹配的连接条目，无法缓存数据包\n");
+        return -1;
+    }
+
+    // 获取连接关联的缓存结构
+    struct ConnectionCache* conn_cache = entry->cache_array;
+    if (!conn_cache) {
+        printf("连接缓存未初始化，创建新缓存\n");
+        conn_cache = create_meta_array(RING_BUFFER_SIZE);
+        if (!conn_cache) {
+            return -1;
+        }
+        entry->cache_array = conn_cache;
+        __sync_fetch_and_add(&conn_cache->ref_count, 1);
+    }
+
+    // 调用缓存函数处理数据包
+    int ret = cache_rdma_packet(conn_cache, psn, packet_data, packet_len);
+    if (ret != 0) {
+        printf("数据包缓存失败 (PSN: %u)\n", psn);
+        return ret;
+    }
+
+    // 更新缓存的PSN范围
+    if (psn < conn_cache->start_psn) {
+        conn_cache->start_psn = psn;
+    }
+    if (psn > conn_cache->end_psn) {
+        conn_cache->end_psn = psn;
+    }
+
+    printf("数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n",
+           psn, packet_len, conn_cache->start_psn, conn_cache->end_psn);
     return 0;
 }
 
 struct connection_cache* create_connection_cache()
 {
-    // 暂未实现具体逻辑
-    return NULL;
+    // 分配缓存结构体内存
+    struct ConnectionCache* cache = (struct ConnectionCache*)malloc(sizeof(struct ConnectionCache));
+    if (!cache) {
+        perror("创建连接缓存失败");
+        return NULL;
+    }
+
+    // 初始化基础字段
+    memset(cache, 0, sizeof(struct ConnectionCache));
+    cache->arraylength = RING_BUFFER_SIZE;
+    cache->start_psn = UINT32_MAX;  // 初始化为最大PSN，便于首次更新
+    cache->end_psn = 0;
+    cache->current_psn = 0;
+    cache->ref_count = 1;  // 初始引用计数为1
+
+    // 初始化环形数组（所有元素设为NULL）
+    memset(cache->MemArray, 0, sizeof(cache->MemArray));
+
+    printf("创建新连接缓存: 容量=%d, 地址=%p\n", RING_BUFFER_SIZE, (void*)cache);
+    return (struct connection_cache*)cache;
 }
 
 void destroy_connection_cache(struct connection_cache *cache)
 {
-    // 暂未实现具体逻辑
+    if (!cache) return;
+
+    struct ConnectionCache* conn_cache = (struct ConnectionCache*)cache;
+
+    // 释放环形数组中所有内存块
+    for (int i = 0; i < conn_cache->arraylength; i++) {
+        if (conn_cache->MemArray[i] != 0) {
+            // 释放完整的内存块（包含头部和数据）
+            free((void*)conn_cache->MemArray[i]);
+            conn_cache->MemArray[i] = 0;
+        }
+    }
+
+    // 释放缓存结构体本身
+    free(conn_cache);
+    printf("连接缓存已销毁: 地址=%p\n", (void*)cache);
 }
 
 // 辅助函数：获取当前系统的毫秒级时间戳

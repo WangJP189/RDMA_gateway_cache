@@ -54,8 +54,10 @@ void display_menu(void) {
 
     printf("8. 压力测试(批量发送)\n");
 
+    printf("9. 查看缓存状态\n");  // 新增选项
+
     printf("0. 退出程序\n");
-    printf("请选择操作 (0-7): ");
+    printf("请选择操作 (0-9): ");
 }
 
 /**
@@ -253,6 +255,28 @@ void cleanup_resources() {
     printf("资源清理完成\n");
 }
 
+//功能9: 查看缓存状态
+void check_cache_status() {
+    printf("\n------ 查看缓存状态 -----\n");
+    // 遍历正向连接表，打印每个连接的缓存信息
+    for (int i = 0; i < CONNECTION_TABLE_SIZE; i++) {
+        struct connection_table_entry* entry = g_connection_table_forward[i];
+        while (entry) {
+            print_connection_table_key(&entry->connection_table_key);
+            printf(" 的缓存信息:\n");
+            struct ConnectionCache* cache = entry->cache_array;
+            if (cache) {
+                printf("  PSN范围: %u-%u, 缓存项数量: %d, 引用计数: %d\n",
+                       cache->start_psn, cache->end_psn, cache->arraylength, cache->ref_count);
+            } else {
+                printf("  无缓存\n");
+            }
+            entry = entry->next;
+        }
+    }
+    printf("---------------------\n");
+}
+
 /**
  * 主程序循环
  */
@@ -311,6 +335,12 @@ void menu_loop() {
                     // 只有这里需要用大括号包起来，因为定义了局部变量
                     send_batch_tcp_message(20, "Test"); 
                 }
+
+            case 9:
+            {
+                check_cache_status();
+                break;
+            }
 
             default:
                 printf("无效选择，请重新输入\n");

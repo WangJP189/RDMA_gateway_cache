@@ -325,8 +325,7 @@ void process_data_packet(const unsigned char *buffer, ssize_t length, int bth_of
         
         // 添加到缓存
         uint8_t service_type = infer_service_type(opcode);
-        add_to_connection_cache(src_ip, dst_ip, src_port, dst_port,
-                               service_type, pkey, dest_qp, psn,
+        add_to_connection_cache(src_ip, dst_ip, dest_qp, psn,
                                app_data, app_data_len);
     }
     
