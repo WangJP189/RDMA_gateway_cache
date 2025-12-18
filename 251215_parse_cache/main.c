@@ -13,14 +13,14 @@
 #include "sr_control.h"
 
 // 全局控制变量
-static volatile sig_atomic_t g_shutdown_requested = 0;
+static volatile sig_atomic_t g_shutdown_requested = 1;
 
 /**
  * 信号处理函数 - 用于优雅退出
  */
 void signal_handler(int sig) {
 
-    printf("\n接收到信号 %d ，强制退出\n", sig);
+    // printf("\n接收到信号 %d ，强制退出\n", sig);
 
     g_shutdown_requested = 1;
 
@@ -133,7 +133,7 @@ void start_receiver() {
 
     //char interface[16];
     
-    const char* interface = "ens37";
+    const char* interface = "eth0";
 
     printf("\n---- 启动报文接收 ----\n");
     
@@ -290,6 +290,21 @@ void menu_loop() {
     while (running && !g_shutdown_requested) {
 
         display_menu();
+
+        // 使用select实现非阻塞输入，避免scanf阻塞
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        struct timeval tv = {1, 0}; // 1秒超时
+        
+        int ret = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            perror("select error");
+            break;
+        } else if (ret == 0) {
+            // 超时，继续循环（检查退出标志）
+            continue;
+        }
         
         if (scanf("%d", &choice) != 1) {
             printf("输入无效，请输入数字\n");

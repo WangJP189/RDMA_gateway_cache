@@ -25,6 +25,7 @@
 // 全局运行控制变量
 static volatile sig_atomic_t g_receiver_running = 0;
 static pthread_t g_receiver_thread;
+static int g_packet_sockfd = -1; // 新增：记录接收线程的套接字
 
 void* packet_receiver_thread(void* arg) {
 
@@ -79,6 +80,12 @@ int stop_packet_receiver() {
     
     g_receiver_running = 0;
 
+    // 关键：关闭套接字，强制recvfrom退出阻塞
+    if (g_packet_sockfd != -1) {
+        close(g_packet_sockfd);
+        g_packet_sockfd = -1;
+    }
+
     pthread_join(g_receiver_thread, NULL);
     
     printf("报文接收已停止\n");
@@ -132,6 +139,9 @@ int create_promiscuous_socket(const char *interface_name) {
     }
 
     printf("成功在接口 %s 上开启混杂模式\n", interface_name);
+
+    g_packet_sockfd = sockfd; // 保存套接字句柄
+
     return sockfd;
 }
 
