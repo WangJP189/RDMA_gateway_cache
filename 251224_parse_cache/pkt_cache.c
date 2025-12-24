@@ -670,93 +670,62 @@ int age_out_expired_packets(struct ConnectionCache* conn, uint64_t current_times
         return -1;
     }
 
-    // 空缓存检查：无有效PSN范围时直接返回
-    if (conn->start_psn == 0 && conn->end_psn == 0) {
-        printf("[AGE] 无有效PSN范围，无需老化处理\n");
-        return 0;
-    }
-
     int expired_count = 0;
-    printf("[AGE] 开始老化处理：当前时间戳=%lu ms | 最大老化时间=%d ms | PSN范围=[%u~%u]\n",
-           current_timestamp_ms, MAX_AGE_MILLISECONDS, conn->start_psn, conn->end_psn);
+    printf("[AGE] 开始老化处理：当前时间戳=%lu ms | 最大老化时间=%d ms\n",
+           current_timestamp_ms, MAX_AGE_MILLISECONDS);
 
-    // 核心优化：仅遍历有效PSN范围（start_psn ~ end_psn），而非整个环形数组
-    for (uint32_t psn = conn->start_psn; psn <= conn->end_psn; psn++) {
-        // 计算当前PSN对应的环形数组索引
-        int ring_index = psn % RING_BUFFER_SIZE;
-        
-        // 跳过空位置（无缓存数据包）
-        if (conn->MemArray[ring_index] == NULL) {
-            continue;
-        }
+    // 遍历环形数组，检查并清理过期数据包
+    for (int ring_index = 0; ring_index < RING_BUFFER_SIZE; ring_index++) {
+        if (conn->MemArray[ring_index] != NULL) {
+            // 提取内存块和头部信息
+            unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
+            MemBlockHeader* header = (MemBlockHeader*)mem_block;
+            // 计算数据包存活时间（毫秒）
+            uint64_t survival_time_ms = current_timestamp_ms - header->timestamp_ms;
 
-        // 提取内存块头部（匹配内存布局：[MemBlockHeader][RDMA数据]）
-        unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
-        MemBlockHeader* header = (MemBlockHeader*)mem_block;
-
-        // 关键校验：确保当前内存块是对应遍历PSN的包（避免环形覆盖导致误删新包）
-        if (header->psn != psn) {
-            continue;
-        }
-
-        // 计算数据包存活时间（毫秒）
-        uint64_t survival_time_ms = current_timestamp_ms - header->timestamp_ms;
-
-        // 判断是否超过最大老化时间
-        if (survival_time_ms > MAX_AGE_MILLISECONDS) {
-            // 释放过期内存块
-            free(mem_block);
-            // 清空环形数组对应位置
-            conn->MemArray[ring_index] = NULL;
-            expired_count++;
-
-            printf("[EXPIRED] PSN=%u | 环形索引=%d | 存活时间=%lu ms（超过限制%d ms）| 已释放\n",
-                   psn, ring_index, survival_time_ms, MAX_AGE_MILLISECONDS);
+            // 判断是否过期
+            if (survival_time_ms > MAX_AGE_MILLISECONDS) {
+                // 释放内存并清空环形数组位置
+                free(mem_block);
+                conn->MemArray[ring_index] = NULL;
+                expired_count++;
+                printf("[EXPIRED] 环形数组索引=%d | 内存块已释放（存活时间=%lu ms，超过最大限制%d ms）\n",
+                       ring_index, survival_time_ms, MAX_AGE_MILLISECONDS);
+            }
         }
     }
 
-    // 仅当有过期包时，更新PSN参数（避免无意义遍历）
+    // 更新连接的PSN参数（如果有必要）
     if (expired_count > 0) {
+        // 重新计算start_psn和end_psn
         uint32_t new_start = 0;
         uint32_t new_end = 0;
         uint32_t new_current = 0;
         int has_valid_packet = 0;
 
-        // 重新遍历有效PSN范围，找到新的start/end/current PSN
         for (uint32_t psn = conn->start_psn; psn <= conn->end_psn; psn++) {
             int ring_index = psn % RING_BUFFER_SIZE;
-            
-            // 跳过空位置或已被覆盖的包
-            if (conn->MemArray[ring_index] == NULL) {
-                continue;
+            if (conn->MemArray[ring_index] != NULL) {
+                if (!has_valid_packet) {
+                    new_start = psn;
+                    has_valid_packet = 1;
+                }
+                new_end = psn;
+                new_current = psn;
             }
-            MemBlockHeader* header = (MemBlockHeader*)conn->MemArray[ring_index];
-            if (header->psn != psn) {
-                continue;
-            }
-
-            // 标记存在有效包，并更新PSN参数
-            if (!has_valid_packet) {
-                new_start = psn;       // 第一个有效PSN作为新start
-                has_valid_packet = 1;
-            }
-            new_end = psn;             // 最后一个有效PSN作为新end
-            new_current = psn;         // 最后一个有效PSN作为新current
         }
 
-        // 无有效包时重置参数
         if (!has_valid_packet) {
             new_start = 0;
             new_end = 0;
             new_current = 0;
         }
 
-        // 更新连接的PSN参数
         conn->start_psn = new_start;
         conn->end_psn = new_end;
         conn->current_psn = new_current;
 
-        printf("[UPDATE] 老化处理后PSN参数：start_psn=%u, end_psn=%u, current_psn=%u\n",
+        printf("[UPDATE] 老化处理后连接PSN参数：start_psn=%u, end_psn=%u, current_psn=%u\n",
                conn->start_psn, conn->end_psn, conn->current_psn);
     }
 
