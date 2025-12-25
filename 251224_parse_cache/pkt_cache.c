@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 199309L
+
 #include "pkt_cache.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,7 +89,7 @@ int add_to_connection_table(struct connection_table_entry** table,
 
 int add_connection_table_entry(const char *src_ip, const char *dst_ip, 
                         uint32_t src_qp, uint32_t dst_qp) {
-    struct ConnectionCache *shared_meta = create_meta_array(120);
+    struct ConnectionCache *shared_meta = create_cache_array(120);
     if (!shared_meta) return -1;
     
     // 创建正向键值对: (src_ip, dst_ip, dst_qp) -> src_qp
@@ -169,7 +171,7 @@ void free_connection_table(struct connection_table_entry** table) {
             current = current->next;
 
             if (temp->cache_array) {
-                release_meta_array(temp->cache_array);
+                release_cache_array(temp->cache_array);
             }
 
             free(temp);
@@ -184,44 +186,44 @@ void free_all_connection_tables() {
     printf("连接表内存已释放\n");
 }
 
-uint32_t lookup_qp_mapping(const char *src_ip, const char *dst_ip, uint32_t dest_qp){
+// uint32_t lookup_qp_mapping(const char *src_ip, const char *dst_ip, uint32_t dest_qp){
 
-    if (!src_ip || !dst_ip) {
-        return -1;
-    }
+//     if (!src_ip || !dst_ip) {
+//         return -1;
+//     }
     
-    // 创建查找的key
-    struct connection_table_key tmp_key = create_connection_table_key(src_ip, dst_ip, dest_qp);
-    unsigned int tmp_hash = calculate_connection_table_hash(&tmp_key);
+//     // 创建查找的key
+//     struct connection_table_key tmp_key = create_connection_table_key(src_ip, dst_ip, dest_qp);
+//     unsigned int tmp_hash = calculate_connection_table_hash(&tmp_key);
     
-    // 在正向表中查找
-    struct connection_table_entry *entry = g_connection_table_forward[tmp_hash];
-    while (entry) {
-        if (connection_table_key_equal(&entry->connection_table_key, &tmp_key)) {
-            printf("正向表找到映射: SrcQP=%u\n", entry->Src_QP);
-            return entry->Src_QP;
-        }
-        entry = entry->next;
-    }
+//     // 在正向表中查找
+//     struct connection_table_entry *entry = g_connection_table_forward[tmp_hash];
+//     while (entry) {
+//         if (connection_table_key_equal(&entry->connection_table_key, &tmp_key)) {
+//             printf("正向表找到映射: SrcQP=%u\n", entry->Src_QP);
+//             return entry->Src_QP;
+//         }
+//         entry = entry->next;
+//     }
     
-    // 在反向表中查找
-    entry = g_connection_table_reverse[tmp_hash];
-    while (entry) {
-        if (connection_table_key_equal(&entry->connection_table_key, &tmp_key)) {
-            printf("反向表找到映射: 源QP %u\n", entry->Src_QP);
-            return entry->Src_QP;
-        }
-        entry = entry->next;
-    }
+//     // 在反向表中查找
+//     entry = g_connection_table_reverse[tmp_hash];
+//     while (entry) {
+//         if (connection_table_key_equal(&entry->connection_table_key, &tmp_key)) {
+//             printf("反向表找到映射: 源QP %u\n", entry->Src_QP);
+//             return entry->Src_QP;
+//         }
+//         entry = entry->next;
+//     }
     
-    // 两个表中都没找到
-    printf("未找到QP映射: SrcIP=%s, DstIP=%s, DstQP=%u\n", 
-           src_ip, dst_ip, dest_qp);
-    return -1;
+//     // 两个表中都没找到
+//     printf("未找到QP映射: SrcIP=%s, DstIP=%s, DstQP=%u\n", 
+//            src_ip, dst_ip, dest_qp);
+//     return -1;
 
-}
+// }
 
-struct ConnectionCache* create_meta_array(int length) {
+struct ConnectionCache* create_cache_array(int length) {
     // 分配 ConnectionCache 结构体本身的内存
     struct ConnectionCache *meta = (struct ConnectionCache*)malloc(sizeof(struct ConnectionCache));
     if (!meta) {
@@ -245,7 +247,7 @@ struct ConnectionCache* create_meta_array(int length) {
     return meta;
 }
 
-void release_meta_array(struct ConnectionCache *meta) {
+void release_cache_array(struct ConnectionCache *meta) {
     if (!meta) return;
 
     // 原子递减引用计数
@@ -265,6 +267,8 @@ void release_meta_array(struct ConnectionCache *meta) {
 
 // 根据三元组查找连接表条目，用于关联缓存
 struct connection_table_entry* find_connection_entry(const char* src_ip, const char* dst_ip, uint32_t dst_qp) {
+    if (!src_ip || !dst_ip) return NULL;
+
     struct connection_table_key key = create_connection_table_key(src_ip, dst_ip, dst_qp);
     unsigned int hash = calculate_connection_table_hash(&key);
 
@@ -287,6 +291,155 @@ struct connection_table_entry* find_connection_entry(const char* src_ip, const c
     }
 
     return NULL; // 未找到
+}
+
+uint64_t get_current_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+void update_entry_timestamp(struct connection_table_entry *entry) {
+    if (!entry) return;
+
+    // 1. 获取当前时间 (只获取一次，保证双向同步)
+    uint64_t now = get_current_time_ns();
+
+    // 2. 刷新当前条目
+    entry->last_active_ns = now;
+
+    // 3. 寻找并刷新“对端”条目
+    // 利用当前条目的信息，推导对端的 Key
+    // 原理：我的 Src 是你的 Dst，我的 Dst 是你的 Src，我的 Value(SrcQP) 是你的 Key(DstQP)
+    struct connection_table_key peer_key;
+    peer_key.Src_IP = entry->connection_table_key.Dst_IP;
+    peer_key.Dst_IP = entry->connection_table_key.Src_IP;
+    peer_key.Dst_QP = entry->Src_QP; // 关键：利用 Value 推导 Key
+
+    // 计算对端的哈希值
+    unsigned int hash = calculate_connection_table_hash(&peer_key);
+
+    // 4. 在正向表和反向表中查找对端
+    // 因为不知道 entry 是来自正向表还是反向表，对端可能在任意一个表中
+    // 我们两个都查一下（通常只会在其中一个找到）
+
+    // 尝试在正向表找 peer
+    struct connection_table_entry *peer = g_connection_table_forward[hash];
+    while (peer) {
+        if (connection_table_key_equal(&peer->connection_table_key, &peer_key)) {
+            peer->last_active_ns = now;
+            // printf("联动刷新(Fwd): QP=%u\n", peer->connection_table_key.Dst_QP);
+            return; // 找到了就返回
+        }
+        peer = peer->next;
+    }
+
+    // 尝试在反向表找 peer
+    peer = g_connection_table_reverse[hash];
+    while (peer) {
+        if (connection_table_key_equal(&peer->connection_table_key, &peer_key)) {
+            peer->last_active_ns = now;
+            // printf("联动刷新(Rev): QP=%u\n", peer->connection_table_key.Dst_QP);
+            return; // 找到了就返回
+        }
+        peer = peer->next;
+    }
+}
+
+static void remove_entry_from_table(struct connection_table_entry **table, struct connection_table_key *key) {
+    unsigned int hash = calculate_connection_table_hash(key);
+    struct connection_table_entry *prev = NULL;
+    struct connection_table_entry *curr = table[hash];
+
+    while (curr) {
+        if (connection_table_key_equal(&curr->connection_table_key, key)) {
+            // 摘除节点
+            if (prev) {
+                prev->next = curr->next;
+            } else {
+                table[hash] = curr->next;
+            }
+            
+            // 释放资源
+            if (curr->cache_array) {
+                release_cache_array(curr->cache_array);
+            }
+            free(curr);
+            return; // 找到并删除后返回
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
+void cleanup_expired_connections(void) {
+    uint64_t now = get_current_time_ns();
+    int cleaned_count = 0;
+
+    for (int i = 0; i < CONNECTION_TABLE_SIZE; i++) {
+        struct connection_table_entry *prev = NULL;
+        struct connection_table_entry *curr = g_connection_table_forward[i];
+
+        while (curr) {
+
+            // =============== [新增打印] ===============
+            // printf("[DEBUG] 触发 TimeOutCheck | 当前时间: %lu ns (约 %.2f 秒)\n", 
+            //        now, (double)now / 1000000000.0);
+            // =========================================
+
+            // 检查是否超时
+            if ((now - curr->last_active_ns) > CONN_TIMEOUT_NS) {
+                struct connection_table_entry *to_free = curr;
+                
+                // =============== [打印时间戳] ===============
+                printf("[DEBUG] 判定超时: QP=%u | 当前时间: %.2f s | 最后活跃: %.2f s | 差值: %.2f s > 阈值\n",
+                       to_free->Src_QP,
+                       (double)now / 1e9,
+                       (double)to_free->last_active_ns / 1e9,
+                       (double)(now - to_free->last_active_ns) / 1e9);
+                // ==========================================
+
+                // 1. 准备反向删除的数据 (SrcIP <-> DstIP, Value是SrcQP)
+                // 注意：在正向表中，key是(SrcA, DstB, QP_B), Value是QP_A
+                // 反向表的Key应该是 (DstB, SrcA, QP_A)
+                
+                // 我们需要手动构建反向Key来清理反向表
+                struct connection_table_key rev_key;
+                rev_key.Src_IP = to_free->connection_table_key.Dst_IP; // 反向Src = 正向Dst
+                rev_key.Dst_IP = to_free->connection_table_key.Src_IP; // 反向Dst = 正向Src
+                rev_key.Dst_QP = to_free->Src_QP;                      // 反向DstQP = 正向的Value(SrcQP)
+
+                // 2. 从正向链表中摘除
+                if (prev) {
+                    prev->next = curr->next;
+                } else {
+                    g_connection_table_forward[i] = curr->next;
+                }
+                curr = curr->next; // 移动遍历指针
+
+                // 3. 去反向表中删除对应项
+                remove_entry_from_table(g_connection_table_reverse, &rev_key);
+
+                // 4. 释放正向节点资源
+                if (to_free->cache_array) {
+                    release_cache_array(to_free->cache_array);
+                }
+                
+                // 打印日志方便调试
+                char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &to_free->connection_table_key.Src_IP, src_ip, INET_ADDRSTRLEN);
+                inet_ntop(AF_INET, &to_free->connection_table_key.Dst_IP, dst_ip, INET_ADDRSTRLEN);
+                printf("[Timeout] 清理连接: %s <-> %s\n", src_ip, dst_ip);
+
+                free(to_free);
+                cleaned_count++;
+            } else {
+                // 未超时，继续
+                prev = curr;
+                curr = curr->next;
+            }
+        }
+    }
 }
 
 // ==================== 连接缓存相关定义 ====================
@@ -312,7 +465,7 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
     struct ConnectionCache* conn_cache = entry->cache_array;
     if (!conn_cache) {
         printf("连接缓存未初始化，创建新缓存\n");
-        conn_cache = create_meta_array(RING_BUFFER_SIZE);
+        conn_cache = create_cache_array(RING_BUFFER_SIZE);
         if (!conn_cache) {
             return -1;
         }
@@ -670,62 +823,93 @@ int age_out_expired_packets(struct ConnectionCache* conn, uint64_t current_times
         return -1;
     }
 
+    // 空缓存检查：无有效PSN范围时直接返回
+    if (conn->start_psn == 0 && conn->end_psn == 0) {
+        printf("[AGE] 无有效PSN范围，无需老化处理\n");
+        return 0;
+    }
+
     int expired_count = 0;
-    printf("[AGE] 开始老化处理：当前时间戳=%lu ms | 最大老化时间=%d ms\n",
-           current_timestamp_ms, MAX_AGE_MILLISECONDS);
+    printf("[AGE] 开始老化处理：当前时间戳=%lu ms | 最大老化时间=%d ms | PSN范围=[%u~%u]\n",
+           current_timestamp_ms, MAX_AGE_MILLISECONDS, conn->start_psn, conn->end_psn);
 
-    // 遍历环形数组，检查并清理过期数据包
-    for (int ring_index = 0; ring_index < RING_BUFFER_SIZE; ring_index++) {
-        if (conn->MemArray[ring_index] != NULL) {
-            // 提取内存块和头部信息
-            unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
-            MemBlockHeader* header = (MemBlockHeader*)mem_block;
-            // 计算数据包存活时间（毫秒）
-            uint64_t survival_time_ms = current_timestamp_ms - header->timestamp_ms;
+    // 核心优化：仅遍历有效PSN范围（start_psn ~ end_psn），而非整个环形数组
+    for (uint32_t psn = conn->start_psn; psn <= conn->end_psn; psn++) {
+        // 计算当前PSN对应的环形数组索引
+        int ring_index = psn % RING_BUFFER_SIZE;
+        
+        // 跳过空位置（无缓存数据包）
+        if (conn->MemArray[ring_index] == NULL) {
+            continue;
+        }
 
-            // 判断是否过期
-            if (survival_time_ms > MAX_AGE_MILLISECONDS) {
-                // 释放内存并清空环形数组位置
-                free(mem_block);
-                conn->MemArray[ring_index] = NULL;
-                expired_count++;
-                printf("[EXPIRED] 环形数组索引=%d | 内存块已释放（存活时间=%lu ms，超过最大限制%d ms）\n",
-                       ring_index, survival_time_ms, MAX_AGE_MILLISECONDS);
-            }
+        // 提取内存块头部（匹配内存布局：[MemBlockHeader][RDMA数据]）
+        unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];
+        MemBlockHeader* header = (MemBlockHeader*)mem_block;
+
+        // 关键校验：确保当前内存块是对应遍历PSN的包（避免环形覆盖导致误删新包）
+        if (header->psn != psn) {
+            continue;
+        }
+
+        // 计算数据包存活时间（毫秒）
+        uint64_t survival_time_ms = current_timestamp_ms - header->timestamp_ms;
+
+        // 判断是否超过最大老化时间
+        if (survival_time_ms > MAX_AGE_MILLISECONDS) {
+            // 释放过期内存块
+            free(mem_block);
+            // 清空环形数组对应位置
+            conn->MemArray[ring_index] = NULL;
+            expired_count++;
+
+            printf("[EXPIRED] PSN=%u | 环形索引=%d | 存活时间=%lu ms（超过限制%d ms）| 已释放\n",
+                   psn, ring_index, survival_time_ms, MAX_AGE_MILLISECONDS);
         }
     }
 
-    // 更新连接的PSN参数（如果有必要）
+    // 仅当有过期包时，更新PSN参数（避免无意义遍历）
     if (expired_count > 0) {
-        // 重新计算start_psn和end_psn
         uint32_t new_start = 0;
         uint32_t new_end = 0;
         uint32_t new_current = 0;
         int has_valid_packet = 0;
 
+        // 重新遍历有效PSN范围，找到新的start/end/current PSN
         for (uint32_t psn = conn->start_psn; psn <= conn->end_psn; psn++) {
             int ring_index = psn % RING_BUFFER_SIZE;
-            if (conn->MemArray[ring_index] != NULL) {
-                if (!has_valid_packet) {
-                    new_start = psn;
-                    has_valid_packet = 1;
-                }
-                new_end = psn;
-                new_current = psn;
+            
+            // 跳过空位置或已被覆盖的包
+            if (conn->MemArray[ring_index] == NULL) {
+                continue;
             }
+            MemBlockHeader* header = (MemBlockHeader*)conn->MemArray[ring_index];
+            if (header->psn != psn) {
+                continue;
+            }
+
+            // 标记存在有效包，并更新PSN参数
+            if (!has_valid_packet) {
+                new_start = psn;       // 第一个有效PSN作为新start
+                has_valid_packet = 1;
+            }
+            new_end = psn;             // 最后一个有效PSN作为新end
+            new_current = psn;         // 最后一个有效PSN作为新current
         }
 
+        // 无有效包时重置参数
         if (!has_valid_packet) {
             new_start = 0;
             new_end = 0;
             new_current = 0;
         }
 
+        // 更新连接的PSN参数
         conn->start_psn = new_start;
         conn->end_psn = new_end;
         conn->current_psn = new_current;
 
-        printf("[UPDATE] 老化处理后连接PSN参数：start_psn=%u, end_psn=%u, current_psn=%u\n",
+        printf("[UPDATE] 老化处理后PSN参数：start_psn=%u, end_psn=%u, current_psn=%u\n",
                conn->start_psn, conn->end_psn, conn->current_psn);
     }
 

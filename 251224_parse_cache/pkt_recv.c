@@ -147,6 +147,7 @@ int create_promiscuous_socket(const char *interface_name) {
 
 void receive_and_parse_frames(int sockfd) {
 
+    // copy 2times ToDo  AF_packet --> DPDK?
     unsigned char buffer[2048];
     struct sockaddr_ll saddr;
     socklen_t saddr_len = sizeof(saddr);
@@ -157,6 +158,8 @@ void receive_and_parse_frames(int sockfd) {
     tv.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
+    uint64_t last_cleanup_time = get_current_time_ns();
+    //const uint64_t BUSY_CHECK_INTERVAL = 5ULL * 1000000000ULL; // 5秒
 
     //while (g_receiver_running && !g_graceful_shutdown_recv) {
     while (g_receiver_running) {
@@ -168,6 +171,10 @@ void receive_and_parse_frames(int sockfd) {
         if (msg_len < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // 超时，继续检查运行状态
+                // 接收超时(即网络空闲)，执行清理
+                cleanup_expired_connections();
+                // 重置忙时计时器
+                last_cleanup_time = get_current_time_ns();
                 continue;
             //} else if (g_receiver_running && !g_graceful_shutdown_recv) {
             } else if (g_receiver_running) {
@@ -181,6 +188,19 @@ void receive_and_parse_frames(int sockfd) {
         // 调用完整的解析函数
         process_rdma_packet(buffer, msg_len);
 
+        // 如果一直有包，recvfrom不会超时，需要主动检查
+        // uint64_t now = get_current_time_ns();
+
+        // if (now - last_cleanup_time > BUSY_CHECK_INTERVAL) {
+            // =============== [新增打印] ===============
+            // printf("[DEBUG] 触发 BusyCheck | 当前时间: %lu ns (约 %.2f 秒)\n", 
+            //        now, (double)now / 1000000000.0);
+            // =========================================
+            
+            // ToDo block not connection
+            // cleanup_expired_connections();
+            // last_cleanup_time = now;
+        // }
     }
 }
 
@@ -290,9 +310,6 @@ int parse_bth_header(const unsigned char *bth_start,
         case PKT_TYPE_DATA:
             printf("DATA/REQUEST:");
             break;
-        case PKT_TYPE_READ_RESPONSE:
-            printf("READREP:");
-            break;
         case PKT_TYPE_ACK:
             printf("ACK:");
             break;
@@ -331,37 +348,37 @@ void process_data_packet(const unsigned char *buffer, ssize_t length, int bth_of
     
     if (app_data_len > 0 && app_data_offset + app_data_len <= length) {
 
-        const unsigned char *app_data = buffer + app_data_offset;
+        const unsigned char *app_data = buffer; //+ app_data_offset;
         
         // 添加到缓存
-        uint8_t service_type = infer_service_type(opcode);
+        //uint8_t service_type = infer_service_type(opcode);
         add_to_connection_cache(src_ip, dst_ip, dest_qp, psn,
-                               app_data, app_data_len);
+                               app_data, length);
     }
     
 };
 
-uint8_t infer_service_type(uint8_t opcode) {
-    // RC (Reliable Connected) 服务类型的操作码范围
-    if ((opcode >= 0x00 && opcode <= 0x1F) || 
-        (opcode >= 0x80 && opcode <= 0x9F)) {
-        return 1;  // RC
-    }
-    // UC (Unreliable Connected) 服务类型的操作码范围  
-    else if ((opcode >= 0x20 && opcode <= 0x3F) ||
-             (opcode >= 0xA0 && opcode <= 0xBF)) {
-        return 2;  // UC
-    }
-    // UD (Unreliable Datagram) 服务类型的操作码范围
-    else if ((opcode >= 0x40 && opcode <= 0x5F) ||
-             (opcode >= 0xC0 && opcode <= 0xDF)) {
-        return 3;  // UD
-    }
-    // RAW (Raw Datagram) 等服务类型
-    else {
-        return 0;  // 未知或其它
-    }
-}
+// uint8_t infer_service_type(uint8_t opcode) {
+//     // RC (Reliable Connected) 服务类型的操作码范围
+//     if ((opcode >= 0x00 && opcode <= 0x1F) || 
+//         (opcode >= 0x80 && opcode <= 0x9F)) {
+//         return 1;  // RC
+//     }
+//     // UC (Unreliable Connected) 服务类型的操作码范围  
+//     else if ((opcode >= 0x20 && opcode <= 0x3F) ||
+//              (opcode >= 0xA0 && opcode <= 0xBF)) {
+//         return 2;  // UC
+//     }
+//     // UD (Unreliable Datagram) 服务类型的操作码范围
+//     else if ((opcode >= 0x40 && opcode <= 0x5F) ||
+//              (opcode >= 0xC0 && opcode <= 0xDF)) {
+//         return 3;  // UD
+//     }
+//     // RAW (Raw Datagram) 等服务类型
+//     else {
+//         return 0;  // 未知或其它
+//     }
+// }
 
 void process_ack_packet(const unsigned char *buffer, ssize_t length,
                        int bth_offset,
@@ -384,17 +401,34 @@ void process_ack_packet(const unsigned char *buffer, ssize_t length,
     
     const unsigned char *aeth_start = buffer + aeth_offset;
     uint8_t syndrome;
-    uint32_t epsn;
+    uint32_t msn;
     
     // TODO: RC类型的ACK报文一定有AETH头吗？
     // 对于RC（Reliable Connected）服务类型，ACK报文通常都包含AETH头，但存在一些特殊情况。
-    if (parse_aeth_header(aeth_start, &syndrome, &epsn) != 0) {
+    if (parse_aeth_header(aeth_start, &syndrome, &msn) != 0) {
         printf("AETH解析失败\n");
         return;
     }
-    
+
+    // AETH Syndrome 的高 3 位决定了是 ACK, RNR 还是 NAK
+    // Mask: 1110 0000 (0xE0)
+    uint8_t type_bits = (syndrome >> 5) & 0x07;
+
+    switch (type_bits) {
+        case 0x00: // 000xxxxx -> ACK
+            handle_ack_received(src_ip, dst_ip, dest_qp, psn);
+            break;
+        case 0x01: // 001xxxxx -> RNR (Receiver Not Ready)
+            handle_nack_received(src_ip, dst_ip, dest_qp, psn);
+            break;
+        case 0x03: // 011xxxxx -> NAK (Sequence Error, etc.)
+            handle_nack_received(src_ip, dst_ip, dest_qp, psn);
+            break;
+        default:
+            break;
+    }
     // 处理ACK逻辑：确认数据包接收，可以清理缓存
-    handle_ack_received(src_ip, dst_ip, src_port, dst_port, pkey, epsn);
+    //handle_ack_received(src_ip, dst_ip, src_port, dst_port, pkey, epsn);
 
 };
 
@@ -419,41 +453,38 @@ void process_nack_packet(const unsigned char *buffer, ssize_t length,
     
     const unsigned char *aeth_start = buffer + aeth_offset;
     uint8_t syndrome;
-    uint32_t epsn;
+    uint32_t msn;
     
-    if (parse_aeth_header(aeth_start, &syndrome, &epsn) != 0) {
+    if (parse_aeth_header(aeth_start, &syndrome, &msn) != 0) {
         printf("AETH解析失败\n");
         return;
     }
     
     // 处理NACK逻辑：触发重传
-    handle_nack_received(src_ip, dst_ip, src_port, dst_port, pkey, epsn, syndrome);
+    handle_nack_received(src_ip, dst_ip, dest_qp, psn);
 };
 
-// WARNING
+// WTC
 int parse_aeth_header(const unsigned char *aeth_start,
-                     uint8_t *syndrome, uint32_t *epsn) {
+                     uint8_t *syndrome, uint32_t *msn) {
 
     struct aeth *aeth = (struct aeth*)aeth_start;
     
-    // WARNING
     *syndrome = aeth->syndrome;
-    *epsn = aeth->MSN;
-    
+    *msn = get_24bit_value(aeth->MSN) & 0x00FFFFFF;
+
     return 0;
 }
 
 void handle_ack_received(const char *src_ip, const char *dst_ip,
-                        uint16_t src_port, uint16_t dst_port,
-                        uint16_t pkey, uint32_t ack_epsn) {
+                        uint32_t dest_qp, uint32_t ack_epsn) {
 
     // ToDo
 
 }
 
 void handle_nack_received(const char *src_ip, const char *dst_ip,
-                         uint16_t src_port, uint16_t dst_port,
-                         uint16_t pkey, uint32_t nack_epsn, uint8_t syndrome) {
+                         uint32_t dest_qp, uint32_t nack_epsn) {
 
     // ToDo
 

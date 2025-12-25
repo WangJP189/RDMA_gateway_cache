@@ -1,17 +1,20 @@
-#ifndef CACHE_MANAGER_H
-#define CACHE_MANAGER_H
+#ifndef PKT_CACHE_H
+#define PKT_CACHE_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
 #include <sys/time.h>
-
+#include <time.h>
 
 // 配置参数
 #define MEM_BLOCK_SIZE 5120        // 固定5KB内存块大小
-#define RING_BUFFER_SIZE 1000      // 环形数组大小（存储内存首地址）
+#define RING_BUFFER_SIZE 120000      // 环形数组大小（存储内存首地址）
 #define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
 #define CONNECTION_TABLE_SIZE 2048 // 哈希表定义
+
+// 超时时间定义：30秒
+#define CONN_TIMEOUT_NS (30ULL * 1000000000ULL)
 
 // ==================== 连接表相关定义 ====================
 
@@ -27,7 +30,10 @@ struct connection_table_key {
 struct connection_table_entry {
     struct connection_table_key     connection_table_key;   // 键
     uint32_t                        Src_QP;                 // 值（对应的QP号）
+    
     struct ConnectionCache          *cache_array;           // 缓存指针数组
+    volatile uint64_t               last_active_ns;         // 最后活跃时间 (纳秒)
+
     struct connection_table_entry   *next;                  // 哈希冲突链表
 };
 
@@ -70,14 +76,28 @@ void free_connection_table(struct connection_table_entry** table);
 // 释放连接表
 void free_all_connection_tables();
 
-// 查找QP映射关系（根据源IP、目的IP和目的QP查找对应的源QP）
-uint32_t lookup_qp_mapping(const char *src_ip, const char *dst_ip, uint32_t dest_qp);
+// // 查找QP映射关系（根据源IP、目的IP和目的QP查找对应的源QP）
+// uint32_t lookup_qp_mapping(const char *src_ip, const char *dst_ip, uint32_t dest_qp);
 
-struct ConnectionCache* create_meta_array(int length);
+// // 查找QP映射关系（根据源IP、目的IP和目的QP查找）返回 Entry 指针
+// struct connection_table_entry* lookup_connection_entry(
+//     const char *src_ip, const char *dst_ip, uint32_t dest_qp);
 
-void release_meta_array(struct ConnectionCache *meta);
+struct ConnectionCache* create_cache_array(int length);
 
+void release_cache_array(struct ConnectionCache *meta);
 
+// 根据三元组查找连接表条目，用于关联缓存
+struct connection_table_entry* find_connection_entry(const char* src_ip, const char* dst_ip, uint32_t dst_qp);
+
+// [新增] 获取当前纳秒时间
+uint64_t get_current_time_ns();
+
+// [新增] 刷新条目时间戳
+void update_entry_timestamp(struct connection_table_entry *entry);
+
+// [新增] 清理过期连接
+void cleanup_expired_connections(void);
 
 
 // ==================== 连接缓存相关定义 ====================
@@ -89,6 +109,7 @@ struct ConnectionCache
     uint32_t    start_psn;
     uint32_t    end_psn;
     uint32_t    current_psn;
+
     int         arraylength;
     uint64_t    last_age_stamp;              // 上次老化时间记录
     
