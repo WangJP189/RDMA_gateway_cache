@@ -134,6 +134,16 @@ typedef enum {
 } RetransmitProcessResult;
 
 
+// 创建连接缓存
+struct connection_cache* create_connection_cache();
+
+// 销毁连接缓存
+void destroy_connection_cache(struct connection_cache *cache);
+
+
+//============================连接缓存操作====================================
+
+
 // 缓存RDMA数据包到内存，并将地址存入环形数组
 int cache_rdma_packet(struct ConnectionCache* conn, uint32_t psn, const unsigned char* data, int data_len);
 
@@ -142,6 +152,9 @@ int find_lost_packets(struct ConnectionCache* conn, uint32_t* lost_psns, int max
 
 // 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
 RetransmitProcessResult process_retransmit_by_epsn(struct ConnectionCache* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
+
+// 收到ACK后清理已被确认的报文（PSN ≤ ack_msn），释放对应内存块
+int clean_acked_packets(struct ConnectionCache* conn, uint32_t ack_msn);
 
 // 释放指定PSN对应的内存块，并清空环形数组对应位置
 int free_packet_by_psn(struct ConnectionCache* conn, uint32_t psn);
@@ -159,12 +172,6 @@ uint64_t get_current_timestamp_ms(void);
 int add_to_connection_cache(const char *src_ip, const char *dst_ip,
                            uint32_t dest_qp, uint32_t psn,
                            const unsigned char *packet, int packet_len);
-
-// 创建连接缓存
-struct connection_cache* create_connection_cache();
-
-// 销毁连接缓存
-void destroy_connection_cache(struct connection_cache *cache);
 
 
 #endif

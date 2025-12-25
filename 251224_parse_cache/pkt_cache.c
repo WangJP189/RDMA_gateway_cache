@@ -773,6 +773,76 @@ RetransmitProcessResult process_retransmit_by_epsn(struct ConnectionCache* conn,
     return RETRANS_SUCCESS;
 }
 
+// 收到ACK后清理已被确认的报文（PSN ≤ ack_msn），释放对应内存块
+int clean_acked_packets(struct ConnectionCache* conn, uint32_t ack_msn) {
+    if (!conn) {
+        printf("[ERROR] 清理已确认报文失败：连接缓存为空\n");
+        return -1;
+    }
+
+    // 空缓存检查：无有效PSN范围时直接返回
+    if (conn->start_psn == 0 && conn->end_psn == 0) {
+        printf("[ACK CLEAN] 无有效PSN范围，无需清理\n");
+        return 0;
+    }
+
+    int cleaned_count = 0;
+    uint32_t original_start = conn->start_psn;
+    uint32_t original_end = conn->end_psn;
+    uint32_t new_start = original_start;  // 新的start_psn初始化为原始start
+    int has_valid_packet = 0;
+
+    printf("[ACK CLEAN] 开始清理已确认报文：ACK MSN=%u | 原始PSN范围=[%u~%u]\n",
+           ack_msn, original_start, original_end);
+
+    // 遍历缓存中所有有效PSN，清理≤ack_msn的已确认报文
+    for (uint32_t psn = original_start; psn <= original_end; psn++) {
+        int ring_index = psn % RING_BUFFER_SIZE;
+        unsigned char* mem_block = (unsigned char*)conn->MemArray[ring_index];  // 显式类型转换
+
+        // 跳过空位置或已被覆盖的报文（PSN不匹配）
+        if (!mem_block) {
+            continue;
+        }
+        MemBlockHeader* header = (MemBlockHeader*)mem_block;
+        if (header->psn != psn) {
+            continue;
+        }
+
+        // 若PSN≤ack_msn，视为已确认，进行清理
+        if (psn <= ack_msn) {
+            free(mem_block);
+            conn->MemArray[ring_index] = NULL;
+            cleaned_count++;
+            printf("[ACKED] PSN=%u | 环形索引=%d | 已被MSN=%u确认，释放内存\n",
+                   psn, ring_index, ack_msn);
+        } else {
+            // 未确认的报文：更新新的start_psn（第一个未确认的PSN）
+            if (!has_valid_packet) {
+                new_start = psn;
+                has_valid_packet = 1;
+            }
+        }
+    }
+
+    // 更新连接缓存的PSN参数
+    if (has_valid_packet) {
+        conn->start_psn = new_start;
+        // end_psn和current_psn保持不变（未确认的报文范围从new_start到original_end）
+        printf("[ACK UPDATE] 清理后PSN范围：start_psn=%u, end_psn=%u, current_psn=%u\n",
+               conn->start_psn, conn->end_psn, conn->current_psn);
+    } else {
+        // 所有报文均已被确认，重置PSN参数
+        conn->start_psn = 0;
+        conn->end_psn = 0;
+        conn->current_psn = 0;
+        printf("[ACK UPDATE] 所有报文已被确认，PSN参数重置为0\n");
+    }
+
+    printf("[ACK CLEAN] 清理完成：共释放已确认报文=%d个\n", cleaned_count);
+    return cleaned_count;
+}
+
 // 释放指定PSN对应的内存块，并清空环形数组对应位置
 int free_packet_by_psn(struct ConnectionCache* conn, uint32_t psn) {
     if (!conn) {
