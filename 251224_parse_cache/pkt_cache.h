@@ -124,6 +124,15 @@ typedef struct {
     uint32_t psn;                  // 新增：当前内存块对应的PSN
 } MemBlockHeader;
 
+// 定义重传处理结果的枚举类型
+typedef enum {
+    RETRANS_SUCCESS = 0,                  // 处理成功
+    RETRANS_INVALID_PARAM = -1,           // 参数无效
+    RETRANS_NO_VALID_PSN_RANGE = -2,      // 无有效PSN范围
+    RETRANS_NO_CACHED_PACKETS = -3,       // 未缓存任何数据包
+    RETRANS_NO_NEED = -4                  // 无需处理重传（start_psn >= epsn）
+} RetransmitProcessResult;
+
 
 // 缓存RDMA数据包到内存，并将地址存入环形数组
 int cache_rdma_packet(struct ConnectionCache* conn, uint32_t psn, const unsigned char* data, int data_len);
@@ -132,7 +141,7 @@ int cache_rdma_packet(struct ConnectionCache* conn, uint32_t psn, const unsigned
 int find_lost_packets(struct ConnectionCache* conn, uint32_t* lost_psns, int max_lost);
 
 // 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
-int process_retransmit_by_epsn(struct ConnectionCache* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
+RetransmitProcessResult process_retransmit_by_epsn(struct ConnectionCache* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
 
 // 释放指定PSN对应的内存块，并清空环形数组对应位置
 int free_packet_by_psn(struct ConnectionCache* conn, uint32_t psn);

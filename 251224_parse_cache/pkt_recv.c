@@ -19,8 +19,9 @@
 
 #include <signal.h>             // sig_atomic_t
 //#include <time.h>
-//#include <sys/time.h>         // timeval
+#include <sys/time.h>           // timeval
 #include <errno.h>
+
 
 // 全局运行控制变量
 static volatile sig_atomic_t g_receiver_running = 0;
