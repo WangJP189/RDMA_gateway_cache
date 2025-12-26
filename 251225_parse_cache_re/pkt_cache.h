@@ -148,10 +148,10 @@ void remove_connection_entry(struct connection_key key);
 void destroy_connection_table();
 
 // 缓存RDMA数据包到内存，并将地址存入环形数组
-int cache_rdma_packet(struct connection_table_entry* conn, uint32_t psn, const unsigned char* data, int data_len);
+int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const unsigned char* data, int data_len);
 
 // 在连接的有效PSN范围（start_psn~end_psn）内查找丢包的数据包
-int find_lost_packets(struct connection_table_entry* conn, uint32_t* lost_psns, int max_lost);
+int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, int max_lost);
 
 // 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
 retransmit_process_result process_retransmit_by_epsn(struct connection_table_entry* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);

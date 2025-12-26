@@ -103,6 +103,7 @@ static int delete_flow_entry_internal(struct flow_table_entry **table, struct fl
     return 0; // 返回 0 表示未找到
 }
 
+// 调试打印流表条目
 void print_flow_entry(struct flow_table_entry *entry, const char* type) {
     char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
     // 注意：这里需要将 host 序转回网络序打印，或者直接打印 host 值
@@ -481,23 +482,31 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
         return -1;
     }
 
-    // 查找对应的连接表条目
-    struct connection_table_entry* entry = find_connection_entry(src_ip, dst_ip, dest_qp);
-    if (!entry) {
-        printf("未找到匹配的连接条目，无法缓存数据包\n");
+    // 通过流表查找获取构造连接键所需的参数（src_qp、端口、pkey等）
+    // 假设数据包的源端口和目的端口暂为0，实际使用时需根据实际情况传入
+    struct flow_table_entry* flow_entry = lookup_flow(src_ip, dst_ip, 0, 0, dest_qp, 0);
+    if (!flow_entry) {
+        printf("未找到匹配的流表条目，无法缓存数据包\n");
         return -1;
     }
 
-    // 获取连接关联的缓存结构
-    struct connection_cache_array* conn_cache = entry->cache_array;
+    // 构造连接键（使用流表中获取的关键参数）
+    struct connection_key conn_key = create_connection_key(
+        src_ip,
+        dst_ip,
+        flow_entry->flow_key.src_port,  // 从流表键获取源端口
+        flow_entry->flow_key.dst_port,  // 从流表键获取目的端口
+        flow_entry->src_qp,             // 从流表值获取源QP
+        dest_qp,                        // 目标QP（即目的QP）
+        flow_entry->flow_key.pkey,      // 从流表键获取pkey
+        0                               // 保留字段
+    );
+
+    // 查找或创建连接表条目对应的缓存结构
+    struct connection_cache_array* conn_cache = get_or_create_connection_table(conn_key);
     if (!conn_cache) {
-        printf("连接缓存未初始化，创建新缓存\n");
-        conn_cache = create_cache_array(RING_BUFFER_SIZE);
-        if (!conn_cache) {
-            return -1;
-        }
-        entry->cache_array = conn_cache;
-        __sync_fetch_and_add(&conn_cache->ref_count, 1);
+        printf("获取或创建连接缓存失败\n");
+        return -1;
     }
 
     // 调用缓存函数处理数据包
@@ -507,7 +516,7 @@ int add_to_connection_cache(const char *src_ip, const char *dst_ip,
         return ret;
     }
 
-    // 更新缓存的PSN范围
+    // 更新缓存的PSN范围（cache_rdma_packet中已更新，这里做冗余保障）
     if (psn < conn_cache->start_psn) {
         conn_cache->start_psn = psn;
     }
@@ -569,12 +578,12 @@ int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const u
     }
 
     // 存入新数据包地址
-    conn->ring_buf[ring_index] = (uintptr_t*)mem_block;
+    conn->ring_buf[ring_index] = (uintptr_t)mem_block;
     printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | 数据长度=%d | 时间戳=%lu ms\n",
            psn, ring_index, (uintptr_t)mem_block, data_len, header->timestamp_ms);
 
     // 更新连接的PSN参数
-    if (psn < conn->start_psn) {
+    if (psn < conn->start_psn || conn->start_psn == 0) { // 兼容初始值0的情况
         conn->start_psn = psn;
     }
     if (psn > conn->end_psn) {
@@ -596,68 +605,51 @@ int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, 
     }
 
     // 空缓存检查
-    if (conn->start_psn == UINT32_MAX || conn->end_psn == 0) {
+    if (conn->start_psn == 0 || conn->end_psn == 0) {
         return 0;  // 无缓存数据，返回0个丢失包
     }
 
     uint32_t psn_start = conn->start_psn;
     uint32_t psn_end = conn->end_psn;
 
-    // 处理未初始化的情况（首次缓存前）
-    if (psn_start == UINT32_MAX) {
-        printf("[WARN] 连接未缓存任何数据包，无丢包可查\n");
-        return 0;
-    }
-
     int lost_count = 0;
     printf("\n[FIND] 开始查找连接有效PSN范围[%u~%u]的丢包情况：\n", psn_start, psn_end);
 
     // 遍历有效PSN范围，检查环形数组对应位置是否为空
     for (uint32_t psn = psn_start; psn <= psn_end; psn++) {
-        // 新增：如果已找到的丢包数达到max_lost，停止查找（避免越界）
         if (lost_count >= max_lost) {
             printf("[WARN] 已达到最大丢包存储数（max_lost=%d），停止查找\n", max_lost);
             break;
         }
 
         int ring_index = psn % RING_BUFFER_SIZE;
-        if (ring_index < 0 || ring_index >= RING_BUFFER_SIZE) {
-            printf("[WARN] PSN=%u 对应的索引超出范围（索引=%d），跳过\n", psn, ring_index);
-            continue;
-        }
 
         if (conn->ring_buf[ring_index] == NULL) {
-            // 地址为空，说明丢包：仅在未超max_lost时存储
+            // 地址为空，说明丢包
             lost_psns[lost_count++] = psn;
             printf("[LOST] PSN=%u → 环形数组索引=%d | 地址为空（丢包）\n", psn, ring_index);
         } else {
-            // 验证内存块数据
+            // 验证内存块PSN是否匹配
             unsigned char* mem_block = (unsigned char*)conn->ring_buf[ring_index];
             struct mem_block_header* header = (struct mem_block_header*) mem_block;
-
-            // 检查头部PSN是否匹配
-            if(header->psn != psn) {
-                printf("[WARN] PSN=%u 数据包被覆盖：环形数组索引=%d | 地址=0x%lx | 头部PSN=%u（预期PSN=%u）\n", psn, ring_index, (uintptr_t)mem_block, header->psn, psn);
-                // 新增：仅在未超max_lost时存储
+            if (header->psn != psn) {
+                printf("[WARN] PSN=%u 数据包被覆盖：环形数组索引=%d | 头部PSN=%u（预期PSN=%u）\n", 
+                       psn, ring_index, header->psn, psn);
                 if (lost_count < max_lost) {
                     lost_psns[lost_count++] = psn;
-                    
-                    //不匹配的话，释放内存块，防止误用
-                    free(mem_block);
-                    conn->ring_buf[ring_index] = NULL;
-                } else {
-                    printf("[WARN] 已达到最大丢包存储数，不再记录\n");
+                    free(mem_block); // 释放不匹配的旧数据
+                    conn->ring_buf[ring_index] = NULL;// 标记为空，表示丢包
                 }
             } else {
-                printf("[FOUND] PSN=%u → 环形数组索引=%d | 地址=0x%lx | 数据长度=%d | 时间戳=%lu ms（正常）\n",
-                    psn, ring_index, (uintptr_t)mem_block, header->data_len, header->timestamp_ms);
+                printf("[FOUND] PSN=%u → 环形数组索引=%d | 数据长度=%d（正常）\n",
+                       psn, ring_index, header->data_len);
             }
         }
     }
 
-    printf("[FIND] 查找完成：有效PSN范围[%u~%u] | 总检查PSN数=%u | 丢包数=%d（最大可存储=%d）\n",
-           psn_start, psn_end, psn_end - psn_start + 1, lost_count, max_lost);
-    return lost_count;  // 返回实际找到的丢包数（不超过max_lost）
+    printf("[FIND] 查找完成：有效PSN范围[%u~%u] | 丢包数=%d\n",
+           psn_start, psn_end, lost_count);
+    return lost_count;
 }
 
 
@@ -669,18 +661,13 @@ retransmit_process_result process_retransmit_by_epsn(struct connection_cache_arr
         return RETRANS_INVALID_PARAM;
     }
 
-    if (conn->start_psn > conn->end_psn) {
-        printf("[WARN] 连接无有效PSN范围，无需处理重传\n");
-        return RETRANS_NO_VALID_PSN_RANGE;
-    }
-
-    if (conn->start_psn == UINT32_MAX || conn->end_psn == 0) {
+    if (conn->start_psn == 0 || conn->end_psn == 0) {
         printf("[WARN] 连接未缓存任何数据包，无需处理重传\n");
         return RETRANS_NO_CACHED_PACKETS;
     }
 
     if (conn->start_psn >= epsn) {
-        printf("[INFO] 连接start_psn=%u 已大于等于ePSN=%u，无需处理重传\n", conn->start_psn, epsn);
+        printf("[INFO] 连接start_psn=%u ≥ ePSN=%u，无需处理重传\n", conn->start_psn, epsn);
         *retrans_count = 0;
         *retrans_addrs = NULL;
         return RETRANS_NO_NEED;
@@ -699,47 +686,41 @@ retransmit_process_result process_retransmit_by_epsn(struct connection_cache_arr
     int delete_count = 0;
     for (uint32_t psn = psn_start; psn < epsn && psn <= psn_end; psn++) {
         int ring_index = psn % RING_BUFFER_SIZE;
-
         if (conn->ring_buf[ring_index] != NULL) {
-            // 验证内存块数据
             unsigned char* mem_block = (unsigned char*)conn->ring_buf[ring_index];
-            struct mem_block_header* header = (struct mem_block_header*)mem_block;
             free(mem_block);
             conn->ring_buf[ring_index] = NULL;
             delete_count++;
-            printf("[DELETE] PSN=%u → 环形数组索引=%d | 内存块已释放（psn < ePSN）\n",
-                    psn, ring_index);
+            printf("[DELETE] PSN=%u → 环形数组索引=%d（psn < ePSN）\n", psn, ring_index);
         }
     }
 
-    // 步骤2：收集psn ≥ epsn的数据包地址
-    int retrans_temp_count = 0;
-    for (uint32_t psn = epsn; psn <= psn_end; psn++) {
-        int ring_index = psn % RING_BUFFER_SIZE;
-
-        if (conn->ring_buf[ring_index] != NULL) {
-            retrans_temp_count++;
-        }
-    }
-
-    if (retrans_temp_count > 0) {
-        *retrans_addrs = (uint64_t*)malloc(sizeof(uint64_t) * retrans_temp_count);
+    // 步骤2：合并统计数量和收集地址为一次循环，减少遍历开销
+    int max_retrans = psn_end >= epsn ? (psn_end - epsn + 1) : 0; // 最大可能的重传包数（用于预分配）
+    if (max_retrans > 0) {
+        *retrans_addrs = (uint64_t*)malloc(sizeof(uint64_t) * max_retrans);
         if (!*retrans_addrs) {
             printf("[ERROR] 分配重传地址数组失败\n");
             return RETRANS_INVALID_PARAM;
         }
 
-        int idx = 0;
+        *retrans_count = 0;
         for (uint32_t psn = epsn; psn <= psn_end; psn++) {
             int ring_index = psn % RING_BUFFER_SIZE;
-
-            if (conn->ring_buf[ring_index] != NULL) {
-                (*retrans_addrs)[idx++] = (uint64_t)(uintptr_t)conn->ring_buf[ring_index];
-                printf("[COLLECT] PSN=%u → 环形数组索引=%d | 地址=0x%lx（用于重传）\n",
-                       psn, ring_index, (uintptr_t)conn->ring_buf[ring_index]);
+            if (conn->ring_buf[ring_index] != 0) { // 只收集有效数据包
+                (*retrans_addrs)[*retrans_count] = (uint64_t)(uintptr_t)conn->ring_buf[ring_index];
+                printf("[COLLECT] PSN=%u → 环形数组索引=%d（用于重传）\n", psn, ring_index);
+                (*retrans_count)++;
             }
         }
-        *retrans_count = idx;
+
+        // 若实际重传数小于最大可能值，可收缩数组（可选优化）
+        if (*retrans_count < max_retrans) {
+            uint64_t* temp = (uint64_t*)realloc(*retrans_addrs, sizeof(uint64_t) * (*retrans_count));
+            if (temp) {
+                *retrans_addrs = temp;
+            }
+        }
     }
 
     // 步骤3：更新连接的start_psn为epsn
@@ -750,10 +731,7 @@ retransmit_process_result process_retransmit_by_epsn(struct connection_cache_arr
         conn->cur_psn = 0;
     }
 
-    printf("[RETRANS] 重传处理完成：删除psn<ePSN的包数量=%d | 收集重传包数量=%d\n",
-           delete_count, *retrans_count);
-    printf("[UPDATE] 连接新的有效PSN范围：%u~%u\n", conn->start_psn, conn->end_psn);
-
+    printf("[RETRANS] 重传处理完成：删除包数量=%d | 重传包数量=%d\n", delete_count, *retrans_count);
     return RETRANS_SUCCESS;
 }
 
@@ -764,8 +742,8 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
         return -1;
     }
 
-    // 空缓存检查：无有效PSN范围时直接返回
-    if (conn->start_psn == 0 && conn->end_psn == 0) {
+    // 空缓存检查
+    if (conn->start_psn == 0 || conn->end_psn == 0) {
         printf("[ACK CLEAN] 无有效PSN范围，无需清理\n");
         return 0;
     }
@@ -773,7 +751,7 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
     int cleaned_count = 0;
     uint32_t original_start = conn->start_psn;
     uint32_t original_end = conn->end_psn;
-    uint32_t new_start = original_start;  // 新的start_psn初始化为原始start
+    uint32_t new_start = original_start;
     int has_valid_packet = 0;
 
     printf("[ACK CLEAN] 开始清理已确认报文：ACK MSN=%u | 原始PSN范围=[%u~%u]\n",
@@ -782,26 +760,21 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
     // 遍历缓存中所有有效PSN，清理≤ack_msn的已确认报文
     for (uint32_t psn = original_start; psn <= original_end; psn++) {
         int ring_index = psn % RING_BUFFER_SIZE;
-        unsigned char* mem_block = (unsigned char*)conn->ring_buf[ring_index];  // 显式类型转换
+        //如果该位置为空，跳过
+        if (conn->ring_buf[ring_index] == NULL) continue;
 
-        // 跳过空位置或已被覆盖的报文（PSN不匹配）
-        if (!mem_block) {
-            continue;
-        }
+        unsigned char* mem_block = (unsigned char*)conn->ring_buf[ring_index];
         struct mem_block_header* header = (struct mem_block_header*)mem_block;
-        if (header->psn != psn) {
-            continue;
-        }
+        
+        // 如果PSN不匹配，说明该位置数据已被覆盖，跳过
+        if (header->psn != psn) continue;
 
-        // 若PSN≤ack_msn，视为已确认，进行清理
         if (psn <= ack_msn) {
             free(mem_block);
             conn->ring_buf[ring_index] = NULL;
             cleaned_count++;
-            printf("[ACKED] PSN=%u | 环形索引=%d | 已被MSN=%u确认，释放内存\n",
-                   psn, ring_index, ack_msn);
+            printf("[ACKED] PSN=%u | 已被MSN=%u确认，释放内存\n", psn, ack_msn);
         } else {
-            // 未确认的报文：更新新的start_psn（第一个未确认的PSN）
             if (!has_valid_packet) {
                 new_start = psn;
                 has_valid_packet = 1;
@@ -809,21 +782,16 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
         }
     }
 
-    // 更新连接缓存的PSN参数
+    // 更新PSN参数
     if (has_valid_packet) {
         conn->start_psn = new_start;
-        // end_psn和cur_psn保持不变（未确认的报文范围从new_start到original_end）
-        printf("[ACK UPDATE] 清理后PSN范围：start_psn=%u, end_psn=%u, cur_psn=%u\n",
-               conn->start_psn, conn->end_psn, conn->cur_psn);
     } else {
-        // 所有报文均已被确认，重置PSN参数
         conn->start_psn = 0;
         conn->end_psn = 0;
         conn->cur_psn = 0;
-        printf("[ACK UPDATE] 所有报文已被确认，PSN参数重置为0\n");
     }
 
-    printf("[ACK CLEAN] 清理完成：共释放已确认报文=%d个\n", cleaned_count);
+    printf("[ACK CLEAN] 清理完成：释放已确认报文=%d个\n", cleaned_count);
     return cleaned_count;
 }
 
@@ -876,12 +844,12 @@ int age_out_expired_packets(struct connection_cache_array* conn, uint64_t curren
     // 一次遍历完成：从原始start到原始end，按顺序处理
     for (uint32_t psn = original_start; psn <= original_end; psn++) {
         int ring_index = psn % RING_BUFFER_SIZE;
-        unsigned char* mem_block = (unsigned char*)conn->ring_buf[ring_index];
-
         // 跳过空位置或已被覆盖的包（PSN不匹配）
-        if (!mem_block) {
+        if (conn->ring_buf[ring_index] == NULL) {
             continue;
         }
+        
+        unsigned char* mem_block = (unsigned char*)conn->ring_buf[ring_index];
         struct mem_block_header* header = (struct mem_block_header*)mem_block;
         if (header->psn != psn) {
             continue;
