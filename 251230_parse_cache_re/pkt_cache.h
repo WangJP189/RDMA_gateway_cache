@@ -17,8 +17,15 @@
 #define BUFFER_MASK       RING_BUFFER_SIZE - 1  // 环形数组掩码（环形数组大小-1）
 
 // 超时定义
-#define CONN_IDLE_TIMEOUT 30         // 连接空闲超时时间（秒）
+#define CONN_IDLE_EXPIRE_THRESHOLD_MS  30000   // 连接老化阈值（30秒）
 #define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
+#define CONN_AGE_CHECK_INTERVAL_MS    5       // 连接级检查间隔（5ms）
+#define AGE_THREAD_SLEEP_SEC          10       // 全局老化线程休眠间隔（10秒）
+
+//全局哈希桶定义
+#define CONN_BUCKET_COUNT 1024  // 哈希桶总数
+extern struct connection_bucket *g_conn_buckets;
+
 // ==================== DataStruct定义 ====================
 
 
@@ -73,6 +80,7 @@ struct connection_cache_array {
     uint32_t            end_psn;
     uint32_t            cur_psn;
     uint64_t            last_age_stamp;     // 上次老化时间记录
+    uint64_t            last_active_stamp;  // 连接最后活动时间（收/发包）
     // pthread_rwlock_t    rwlock;             // 连接级读写锁
 };// ring_buf需动态malloc，防止stack溢出
 
@@ -81,7 +89,7 @@ struct connection_entry {
     struct connection_key           connection_key;
     struct connection_cache_array   *cache_array; 
     struct connection_entry         *next;              // 哈希冲突链表
-    uint32_t    last_active_ts; // 最后活动时间戳（秒级）
+    uint32_t    last_active_stamp; // 最后活动时间戳（秒级）
     int         valid;          // 连接有效性（1=有效，0=无效）
 };
 

@@ -26,6 +26,11 @@ static volatile sig_atomic_t g_receiver_running = 0;
 static pthread_t g_receiver_thread;
 static int g_packet_sockfd = -1; // 新增：记录接收线程的套接字
 
+
+//全局连接老化线程控制变量
+static int g_age_thread_running = 1;            // 老化线程运行标志
+static pthread_t g_global_age_thread;           // 全局老化线程ID
+
 void* packet_receiver_thread(void* arg) {
 
     //const char* interface = (const char*)arg;
@@ -368,8 +373,29 @@ void process_data_packet(const unsigned char *buffer, ssize_t length, int bth_of
             // ============================================================
             
             // 添加到缓存
-            // add_to_connection_cache(src_ip, dst_ip, dest_qp, psn,
-            //                        app_data, length);
+            // add_to_connection_cache(cache, psn, packet, app_data_len);
+
+
+
+                // ========== 新增：连接级老化处理 ==========
+            // 1. 获取当前连接的缓存结构体（替换为你实际的查找函数）
+            struct connection_cache_array *conn = get_connection_cache(bucket, key);
+            if (!conn) return;
+
+            // 2. 时间戳逻辑
+            uint64_t cur_stamp = get_current_timestamp_ms();
+            uint64_t five_ms_stamp = CONN_AGE_CHECK_INTERVAL_MS;
+
+            // 初始化连接的老化检查时间戳（复用conn->last_age_stamp字段）
+            if (conn->last_age_stamp == 0) {
+                conn->last_age_stamp = cur_stamp + five_ms_stamp;
+            }
+
+            // 达到检查时间，执行老化
+            if (cur_stamp >= conn->last_age_stamp) {
+                age_out_expired_packets(conn, cur_stamp);
+                conn->last_age_stamp = cur_stamp + five_ms_stamp; // 更新下次检查时间
+            }
             
         }
 
@@ -518,6 +544,129 @@ void handle_nack_received(struct connection_bucket *bucket, struct connection_ke
     // ToDo
 
 }
+
+
+
+
+
+
+
+
+
+
+//======================全局连接老化线程相关=======================
+
+/**
+ * @brief 全局老化线程：遍历哈希桶，清理超期空闲的连接
+ */
+static void *global_conn_age_thread(void *arg) {
+    (void)arg;
+    while (g_age_thread_running) { // 全局运行标志，需外部定义
+        uint64_t current_ts = get_current_timestamp_ms(); // 当前时间戳(毫秒)
+
+        // 遍历所有哈希桶（最小化锁范围）
+        for (int bucket_idx = 0; bucket_idx < CONN_BUCKET_COUNT; bucket_idx++) {
+            struct connection_bucket *cur_bucket = &g_conn_buckets[bucket_idx];
+            if (!cur_bucket) continue;
+
+            // ========== 哈希桶级写锁（后续替换为王滕超的锁逻辑） ==========
+            // pthread_rwlock_wrlock(&cur_bucket->rwlock); 
+
+            // 遍历当前桶的连接链表（节点类型为connection_entry）
+            struct connection_entry *prev_entry = NULL;
+            struct connection_entry *cur_entry = cur_bucket->head;
+            
+            while (cur_entry) {
+                // 跳过无效连接（提前标记为无效的可直接清理）
+                if (cur_entry->valid != 1) {
+                    struct connection_entry *next_entry = cur_entry->next;
+                    // 从链表移除无效节点
+                    if (prev_entry == NULL) {
+                        cur_bucket->head = next_entry;
+                    } else {
+                        prev_entry->next = next_entry;
+                    }
+                    // 释放资源
+                    if (cur_entry->cache_array) {
+                        free_connection_array(cur_entry->cache_array);
+                        cur_entry->cache_array = NULL;
+                    }
+                    free(cur_entry); // 释放连接条目本身
+                    cur_entry = next_entry;
+                    printf("[GLOBAL_AGE] 清理无效连接，桶索引=%d\n", bucket_idx);
+                    continue;
+                }
+
+                // 判断连接是否空闲超期：最后活动时间 + 阈值 ≤ 当前时间
+                int is_expired = 0;
+                if (cur_entry->cache_array && cur_entry->cache_array->last_active_stamp != 0) {
+                    uint64_t idle_duration_ms = current_ts - cur_entry->last_active_stamp;
+                    if (idle_duration_ms >= CONN_IDLE_EXPIRE_THRESHOLD_MS) {
+                        is_expired = 1;
+                    }
+                }
+
+                if (is_expired) {
+                    // 1. 从链表中移除当前连接条目
+                    struct connection_entry *next_entry = cur_entry->next;
+                    if (prev_entry == NULL) {
+                        // 头节点
+                        cur_bucket->head = next_entry;
+                    } else {
+                        prev_entry->next = next_entry;
+                    }
+
+                    // 2. 清理当前连接的所有资源
+                    if (cur_entry->cache_array) {
+                        free_connection_array(cur_entry->cache_array);
+                        cur_entry->cache_array = NULL;
+                    }
+                    free(cur_entry); // 释放连接条目结构体
+                    
+                    // 3. 输出日志
+                    printf("[GLOBAL_AGE] 清理超期空闲连接，桶索引=%d\n", bucket_idx);
+                    
+                    // 4. 移动到下一个节点
+                    cur_entry = next_entry;
+                } else {
+                    // 未过期，继续遍历
+                    prev_entry = cur_entry;
+                    cur_entry = cur_entry->next;
+                }
+            }
+
+            // ========== 解锁哈希桶 ==========
+            // pthread_rwlock_unlock(&cur_bucket->rwlock);
+
+            usleep(100); // 桶间休眠，降低CPU占用（微秒级）
+        }
+
+        sleep(AGE_THREAD_SLEEP_SEC); // 全局线程休眠（秒级）
+    }
+    return NULL;
+}
+
+/**
+ * @brief 启动全局老化线程
+ */
+int init_global_conn_age_thread(void) {
+    int ret = pthread_create(&g_global_age_thread, NULL, global_conn_age_thread, NULL);
+    if (ret != 0) {
+        printf("[ERROR] 全局老化线程创建失败，错误码：%d\n", ret);
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 停止全局老化线程
+ */
+void stop_global_conn_age_thread(void) {
+    g_age_thread_running = 0;
+    pthread_join(g_global_age_thread, NULL);
+}
+
+
 
 
 #ifdef STANDALONE_TEST

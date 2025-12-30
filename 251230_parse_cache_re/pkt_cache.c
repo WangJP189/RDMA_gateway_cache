@@ -350,8 +350,9 @@ static void free_cache_array(struct connection_cache_array *cache) {
     if (cache->ring_buf) {
         for (int i = 0; i < cache->array_length; i++) {
             if (cache->ring_buf[i] != 0) {
-                // 强转为 void* 释放，具体类型取决于存的数据结构
-                free((void*)cache->ring_buf[i]); 
+                struct mem_block_header *block = (struct mem_block_header*)(uintptr_t)cache->ring_buf[i];
+                free(block); // 释放内存块（header+数据）
+                cache->ring_buf[i] = NULL;
             }
         }
         // 释放数组本身
