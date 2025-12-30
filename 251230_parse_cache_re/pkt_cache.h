@@ -6,9 +6,19 @@
 #include <stdint.h>
 #include <pthread.h>
 
+//大小定义
 #define     RING_BUFFER_SIZE    120000      // 环形数组大小（存储内存首地址）
 #define     TABLE_SIZE          2048        // 表大小
+#define MEM_BLOCK_SIZE 5120        // 固定5KB内存块大小
 
+// PSN定义，解决end_psn<start_psn的问题
+#define PSN_MASK          0xFFFFFF  // 24位PSN掩码（0~16777215）
+#define PSN_MAX_VALUE     PSN_MASK        // PSN最大值（2^24-1）
+#define BUFFER_MASK       RING_BUFFER_SIZE - 1  // 环形数组掩码（环形数组大小-1）
+
+// 超时定义
+#define CONN_IDLE_TIMEOUT 30         // 连接空闲超时时间（秒）
+#define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
 // ==================== DataStruct定义 ====================
 
 
@@ -171,7 +181,7 @@ void destroy_connection_table();
 
 // ==================== CACHEOPERATION接口声明 ====================
 
-// 分配连接缓存结构
+// 将数据包存入连接缓存结构
 int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t psn,
                             const unsigned char *packet_data, int packet_len);
 
@@ -183,16 +193,16 @@ int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const u
 int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, int max_lost);
 
 // 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
-retransmit_process_result process_retransmit_by_epsn(struct connection_table_entry* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
+retransmit_process_result process_retransmit_by_epsn(struct connection_cache_array* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
 
 // 收到ACK后清理已被确认的报文（PSN ≤ ack_msn），释放对应内存块
-int clean_acked_packets(struct connection_table_entry* conn, uint32_t ack_msn);
+int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn);
 
 // 释放指定PSN对应的内存块，并清空环形数组对应位置
-int free_packet_by_psn(struct connection_table_entry* conn, uint32_t psn);
+retransmit_process_result free_packet_by_psn(struct connection_cache_array* conn, uint32_t psn);
 
 // 老化处理函数：根据毫秒级时间戳清理过期的数据包
-int age_out_expired_packets(struct connection_table_entry* conn, uint64_t current_timestamp_ms);
+int age_out_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
 
 // 辅助函数：获取当前系统的毫秒级时间戳
 uint64_t get_current_timestamp_ms(void);
