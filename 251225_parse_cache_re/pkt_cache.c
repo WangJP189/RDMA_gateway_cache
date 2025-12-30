@@ -472,6 +472,152 @@ void destroy_connection_table() {
 
 //============================连接缓存操作====================================
 
+// 完善PSN遍历函数（处理溢出）
+void traverse_by_direct_index(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn) {
+    printf("直接索引遍历: 0x%06X ~ 0x%06X\n", start_psn, end_psn);
+    
+    uint32_t count = calc_psn_count(start_psn, end_psn);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t current_psn = (start_psn + i) & PSN_MASK;
+        uint32_t index = current_psn & BUFFER_MASK;
+        
+        if (packet_buffers[index].valid) {
+            if (packet_buffers[index].psn == current_psn) {
+                printf("  处理PSN: 0x%06X (索引: %u)\n", current_psn, index);
+                // TODO: 替换为实际报文处理逻辑（如转发、解析）
+            } else {
+                printf("  警告: 索引%u PSN不匹配(缓存:0x%06X, 期望:0x%06X)\n",
+                       index, packet_buffers[index].psn, current_psn);
+            }
+        }
+    }
+}
+
+// ========== 2. 连接老化核心函数 ==========
+// 老化检查线程（后台运行）
+void* conn_aging_check_thread(void* arg) {
+    (void)arg;
+    printf("连接老化线程启动，超时阈值: %d秒\n", CONN_IDLE_TIMEOUT);
+    
+    while (1) {
+        sleep(5); // 每5秒检查一次（可调整）
+        pthread_mutex_lock(&conn_table_mutex);
+        
+        time_t now = time(NULL);
+        int cleaned = 0;
+        
+        // 遍历所有连接
+        for (int i = 0; i < MAX_CONN_ENTRY; i++) {
+            struct conn_entry* conn = &global_conn_table[i];
+            if (!conn->valid) continue;
+            
+            // 超时判断
+            if ((now - conn->last_active_ts) > CONN_IDLE_TIMEOUT) {
+                memset(conn, 0, sizeof(struct conn_entry));
+                conn->valid = 0;
+                cleaned++;
+                printf("清理超时连接: 索引%d (空闲%ld秒)\n", i, now - conn->last_active_ts);
+            }
+        }
+        
+        pthread_mutex_unlock(&conn_table_mutex);
+        if (cleaned > 0) {
+            printf("本次清理%d个超时连接\n", cleaned);
+        }
+    }
+    return NULL;
+}
+
+// 更新连接最后活动时间（收/发包时调用）
+int update_conn_last_active(const struct flow_key* key) {
+    if (!key) return -1;
+    
+    pthread_mutex_lock(&conn_table_mutex);
+    for (int i = 0; i < MAX_CONN_ENTRY; i++) {
+        struct conn_entry* conn = &global_conn_table[i];
+        if (conn->valid &&
+            conn->key.src_ip == key->src_ip &&
+            conn->key.dst_ip == key->dst_ip &&
+            conn->key.src_port == key->src_port &&
+            conn->key.dst_port == key->dst_port &&
+            conn->key.dst_qp == key->dst_qp &&
+            conn->key.pkey == key->pkey) {
+            
+            conn->last_active_ts = time(NULL);
+            pthread_mutex_unlock(&conn_table_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&conn_table_mutex);
+    fprintf(stderr, "未找到匹配连接，更新活动时间失败\n");
+    return -1;
+}
+
+// 创建新连接（初始化活动时间）
+int create_new_conn(const struct flow_key* key, uint32_t start_psn, uint32_t end_psn) {
+    if (!key) return -1;
+    
+    pthread_mutex_lock(&conn_table_mutex);
+    // 找空闲槽位
+    int free_idx = -1;
+    for (int i = 0; i < MAX_CONN_ENTRY; i++) {
+        if (!global_conn_table[i].valid) {
+            free_idx = i;
+            break;
+        }
+    }
+    if (free_idx == -1) {
+        pthread_mutex_unlock(&conn_table_mutex);
+        fprintf(stderr, "连接表已满，创建失败\n");
+        return -1;
+    }
+    
+    // 初始化连接
+    struct conn_entry* conn = &global_conn_table[free_idx];
+    memcpy(&conn->key, key, sizeof(struct flow_key));
+    conn->start_psn = start_psn & PSN_MASK;
+    conn->end_psn = end_psn & PSN_MASK;
+    conn->last_active_ts = time(NULL);
+    conn->valid = 1;
+    
+    pthread_mutex_unlock(&conn_table_mutex);
+    printf("创建新连接: 索引%d (PSN:0x%06X~0x%06X)\n", free_idx, start_psn, end_psn);
+    return free_idx;
+}
+
+// 启动老化线程（程序初始化时调用）
+int start_conn_aging_thread() {
+    pthread_t tid;
+    int ret = pthread_create(&tid, NULL, conn_aging_check_thread, NULL);
+    if (ret != 0) {
+        fprintf(stderr, "启动老化线程失败: %d\n", ret);
+        return -1;
+    }
+    pthread_detach(tid); // 分离线程，无需主线程join
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 int add_to_connection_cache(const char *src_ip, const char *dst_ip,
                            uint32_t dest_qp, uint32_t psn,
                            const unsigned char *packet_data, int packet_len)
@@ -848,7 +994,7 @@ int age_out_expired_packets(struct connection_cache_array* conn, uint64_t curren
         if (conn->ring_buf[ring_index] == NULL) {
             continue;
         }
-        
+
         unsigned char* mem_block = (unsigned char*)conn->ring_buf[ring_index];
         struct mem_block_header* header = (struct mem_block_header*)mem_block;
         if (header->psn != psn) {

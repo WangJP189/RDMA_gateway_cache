@@ -8,14 +8,6 @@
 
 #define     RING_BUFFER_SIZE    120000      // 环形数组大小（存储内存首地址）
 #define     TABLE_SIZE          2048        // 表大小
-#define PSN_MASK          0xFFFFFF  // 24位PSN掩码（0~16777215）
-#define PSN_MAX_VALUE     PSN_MASK        // PSN最大值（2^24-1）
-#define MEM_BLOCK_SIZE 5120        // 固定5KB内存块大小
-#define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
-#define BUFFER_MASK       0x7FFFFF   // 缓存索引掩码（根据实际缓存大小调整）
-
-// 整个连接超时时间定义：30秒,超时就销毁连接
-#define CONN_IDLE_TIMEOUT 30         // 连接空闲超时时间（秒）
 
 // ==================== DataStruct定义 ====================
 
@@ -40,11 +32,11 @@ enum gateway_role {
 };
 
 // 流条目
-struct flow_table_entry {
+struct flow_entry {
     struct flow_key         flow_key;     // 流表-键
     uint32_t                src_qp;       // 流表-值
     enum gateway_role       role;         // 网关角色 
-    struct flow_table_entry *next;        // 哈希冲突链表
+    struct flow_entry       *next;        // 哈希冲突链表
 };
 
 
@@ -66,19 +58,19 @@ struct connection_key {
 // 每个连接的缓存指针数组
 struct connection_cache_array {
     uintptr_t*          ring_buf;           // 记录内存块地址的环形数组
+    uint32_t            array_length;
     uint32_t            start_psn;
     uint32_t            end_psn;
     uint32_t            cur_psn;
-    int                 array_length;
     uint64_t            last_age_stamp;     // 上次老化时间记录
-    pthread_rwlock_t    rwlock;             // 连接级读写锁    
+    // pthread_rwlock_t    rwlock;             // 连接级读写锁
 };// ring_buf需动态malloc，防止stack溢出
 
 // 连接条目
-struct connection_table_entry {
-    struct connection_key         connection_key;
-    struct connection_cache_array *cache_array; 
-    struct connection_table_entry *next;              // 哈希冲突链表
+struct connection_entry {
+    struct connection_key           connection_key;
+    struct connection_cache_array   *cache_array; 
+    struct connection_entry         *next;              // 哈希冲突链表
     uint32_t    last_active_ts; // 最后活动时间戳（秒级）
     int         valid;          // 连接有效性（1=有效，0=无效）
 };
@@ -91,6 +83,11 @@ struct mem_block_header{
     uint32_t psn;                  // 新增：当前内存块对应的PSN
 };
 
+struct connection_bucket {
+    pthread_rwlock_t                rwlock;     // 哈希桶级读写锁
+    struct connection_entry         *head;
+}__attribute__((aligned(64)));
+
 // 定义重传处理结果的枚举类型
 typedef enum {
     RETRANS_SUCCESS = 0,                  // 处理成功
@@ -100,16 +97,15 @@ typedef enum {
     RETRANS_NO_NEED = -4                  // 无需处理重传（start_psn >= epsn）
 } retransmit_process_result;
 
-
 // ==================== FlowTable接口声明 ====================
 
-extern struct flow_table_entry*       g_flow_table_forward[TABLE_SIZE];
-extern struct flow_table_entry*       g_flow_table_reverse[TABLE_SIZE];
+extern struct flow_entry*       g_flow_table_forward[TABLE_SIZE];
+extern struct flow_entry*       g_flow_table_reverse[TABLE_SIZE];
 
 // 创建流键
 struct flow_key create_flow_key(const char *src_ip, const char *dst_ip, 
                                 uint16_t src_port, uint16_t dst_port,
-                                uint32_t dst_qp, uint16_t pkey, uint16_t resv);
+                                uint32_t dst_qp, uint16_t pkey);
 
 // 添加条目到双向流表                             
 int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str, 
@@ -118,7 +114,7 @@ int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str,
                       uint16_t pkey);
                  
 // 查找流表
-struct flow_table_entry* lookup_flow(const char *pkt_src_ip, const char *pkt_dst_ip,
+struct flow_entry* lookup_flow(const char *pkt_src_ip, const char *pkt_dst_ip,
                                      uint16_t pkt_src_port, uint16_t pkt_dst_port,
                                      uint32_t pkt_dst_qp, uint16_t pkt_pkey);
 
@@ -129,28 +125,56 @@ void destroy_flow_tables();
 void remove_flow_entry(struct connection_key key);
 
 // 打印流条
-void print_flow_entry(struct flow_table_entry *entry, const char* type);
+void print_flow_entry(struct flow_entry *entry, const char* type);
 
 // ==================== ConnectionTable接口声明 ====================
 
-// extern struct connection_table_entry* connection_table[TABLE_SIZE];  //非全局
+extern struct connection_bucket connection_table[TABLE_SIZE];
+
+// [新增] 初始化连接表
+int init_connection_table(void);
+
+// [新增] 获取 Bucket 指针
+struct connection_bucket* get_connection_bucket(struct connection_key key);
 
 // 创建连接键
 struct connection_key create_connection_key(const char *src_ip, const char *dst_ip, 
                                             uint16_t src_port, uint16_t dst_port, 
-                                            uint32_t src_qp, uint32_t dst_qp,
-                                            uint16_t pkey, uint16_t resv);
+                                            uint32_t src_qp, uint32_t dst_qp, uint16_t pkey);
 /**
  * @brief 查找或创建连接表条目
  * @return 连接缓存数组指针
  */
-struct connection_cache_array* get_or_create_connection_table(struct connection_key key);
+struct connection_cache_array* get_or_create_connection_cache_array(struct connection_bucket *bucket, struct connection_key key);
 
-// 销毁特定连接条目
+/**
+ * @brief [纯查找]仅查找连接缓存
+ * @return 找到返回 cache 指针，未找到返回 NULL
+ */
+struct connection_cache_array* get_connection_cache(struct connection_entry *entry, struct connection_key key);
+
+/**
+ * @brief [纯创建] 创建新连接并分配缓存
+ * @note 如果连接已存在，会打印警告并返回现有缓存
+ */
+struct connection_cache_array* create_connection_cache(struct connection_bucket *bucket, struct connection_key key);
+
+/**
+ * @brief 销毁特定连接条目
+ * @note 外部调用仅供持有锁时
+ */
 void remove_connection_entry(struct connection_key key);
 
 // 销毁连接表
 void destroy_connection_table();
+
+
+// ==================== CACHEOPERATION接口声明 ====================
+
+// 分配连接缓存结构
+int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t psn,
+                            const unsigned char *packet_data, int packet_len);
+
 
 // 缓存RDMA数据包到内存，并将地址存入环形数组
 int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const unsigned char* data, int data_len);
@@ -172,12 +196,4 @@ int age_out_expired_packets(struct connection_table_entry* conn, uint64_t curren
 
 // 辅助函数：获取当前系统的毫秒级时间戳
 uint64_t get_current_timestamp_ms(void);
-
-// 添加连接缓存条目
-int add_to_connection_cache(const char *src_ip, const char *dst_ip,
-                           uint32_t dest_qp, uint32_t psn,
-                           const unsigned char *packet, int packet_len);
-
-
-
 #endif
