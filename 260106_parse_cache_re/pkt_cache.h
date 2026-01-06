@@ -7,7 +7,7 @@
 #include <pthread.h>
 
 //大小定义
-#define     RING_BUFFER_SIZE    120000      // 环形数组大小（存储内存首地址）
+#define     RING_BUFFER_SIZE    10240      // 环形数组大小（存储内存首地址）
 #define     TABLE_SIZE          2048        // 表大小
 #define MEM_BLOCK_SIZE 5120        // 固定5KB内存块大小
 

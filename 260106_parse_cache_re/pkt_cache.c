@@ -325,8 +325,8 @@ static struct connection_cache_array* alloc_cache_array(int size) {
 
     // 2. 初始化控制字段
     cache->array_length = size;
-    cache->start_psn    = 0; 
-    cache->end_psn      = 0;
+    cache->start_psn    = 0x1000000; 
+    cache->end_psn      = 0x1000000;
     cache->cur_psn      = 0;
     cache->last_age_stamp = 0; // 需要配合时间函数初始化
 
@@ -655,10 +655,10 @@ int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const u
            psn, ring_index, (uintptr_t)mem_block, data_len, header->timestamp_ms);
 
     // 更新连接的PSN参数
-    if (psn < conn->start_psn || conn->start_psn == 0) { // 兼容初始值0的情况
+    if (psn < conn->start_psn || conn->start_psn == 0x1000000) { // 兼容初始值0的情况
         conn->start_psn = psn;
     }
-    if (psn > conn->end_psn) {
+    if (psn > conn->end_psn || conn->end_psn == 0x1000000) {
         conn->end_psn = psn;
     }
     conn->cur_psn = psn;
@@ -677,7 +677,7 @@ int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, 
     }
 
     // 空缓存检查
-    if (conn->start_psn == 0 || conn->end_psn == 0) {
+    if (conn->start_psn == 0x1000000 || conn->end_psn == 0x1000000) {
         return RETRANS_NO_CACHED_PACKETS;       // 未缓存任何数据包
     }
 
@@ -748,7 +748,7 @@ retransmit_process_result process_retransmit_by_epsn(struct connection_cache_arr
         return RETRANS_INVALID_PARAM;
     }
 
-    if (conn->start_psn == 0 || conn->end_psn == 0) {
+    if (conn->start_psn == 0x1000000 || conn->end_psn == 0x1000000) {
         printf("[WARN] 连接未缓存任何数据包，无需处理重传\n");
         return RETRANS_NO_CACHED_PACKETS;
     }
@@ -831,8 +831,8 @@ retransmit_process_result process_retransmit_by_epsn(struct connection_cache_arr
     conn->start_psn = epsn;
     // 处理start_psn超过end_psn的场景（无有效缓存）
     if (psn_less_than(conn->end_psn, conn->start_psn)) {
-        conn->start_psn = 0;
-        conn->end_psn = 0;
+        conn->start_psn = 0x1000000;
+        conn->end_psn = 0x1000000;
         conn->cur_psn = 0;
         printf("[INFO] 更新start_psn=%u后无有效缓存，重置连接PSN\n", epsn);
     }
@@ -849,7 +849,7 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
     }
 
     // 空缓存检查
-    if (conn->start_psn == 0 || conn->end_psn == 0) {
+    if (conn->start_psn == 0x1000000 || conn->end_psn == 0x1000000) {
         printf("[ACK CLEAN] 无有效PSN范围，无需清理\n");
         return RETRANS_NO_VALID_PSN_RANGE;
     }
@@ -909,9 +909,9 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
     // 更新PSN参数
     if (has_valid_packet) {
         conn->start_psn = new_start;
-    } else {
-        conn->start_psn = 0;
-        conn->end_psn = 0;
+    } else { // 无有效包，重置PSN参数
+        conn->start_psn = 0x1000000;
+        conn->end_psn = 0x1000000;
         conn->cur_psn = 0;
     }
 
@@ -949,7 +949,7 @@ int age_out_expired_packets(struct connection_cache_array* conn, uint64_t curren
     }
 
     // 空缓存检查：无有效PSN范围时直接返回
-    if (conn->start_psn == 0 && conn->end_psn == 0) {
+    if (conn->start_psn == 0x1000000 || conn->end_psn == 0x1000000) {
         printf("[AGE] 无有效PSN范围，无需老化处理\n");
         return RETRANS_NO_VALID_PSN_RANGE;
     }
@@ -1026,8 +1026,8 @@ int age_out_expired_packets(struct connection_cache_array* conn, uint64_t curren
         conn->cur_psn = new_current;
     } else {
         // 无有效包时重置
-        conn->start_psn = 0;
-        conn->end_psn = 0;
+        conn->start_psn = 0x1000000;
+        conn->end_psn = 0x1000000;
         conn->cur_psn = 0;
     }
 
