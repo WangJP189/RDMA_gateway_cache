@@ -9,5 +9,5 @@
         "stdlib.h": "c",
         "signal.h": "c"
     },
-    "C_Cpp.errorSquiggles": "disabled"
+    "C_Cpp.errorSquiggles": "enabled"
 }

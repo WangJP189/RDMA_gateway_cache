@@ -114,7 +114,8 @@ typedef enum {
     RETRANS_INVALID_PARAM = -1,           // 参数无效
     RETRANS_NO_VALID_PSN_RANGE = -2,      // 无有效PSN范围
     RETRANS_NO_CACHED_PACKETS = -3,       // 未缓存任何数据包
-    RETRANS_NO_NEED = -4                  // 无需处理重传（start_psn >= epsn）
+    RETRANS_NO_NEED = -4,                 // 无需处理重传（start_psn >= epsn）
+    RETRANS_DATA_ALLOC_FAIL = -5,         // 内存分配失败
 } retransmit_process_result;
 
 // ==================== FlowTable接口声明 ====================
@@ -217,20 +218,19 @@ int psn_less_than(uint32_t a, uint32_t b);
 int psn_greater_equal(uint32_t a, uint32_t b);
 
 // 批量清理指定PSN范围内的数据包
-int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, uint32_t end)
+int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, uint32_t end);
 
-// 辅助函数3：二分查找区间内最大的过期PSN（线性区间，非回绕）
-uint32_t binary_search_linear_range(struct connection_cache_array* conn, uint32_t left, uint32_t right, uint64_t current_ts);
+// // 辅助函数3：二分查找区间内最大的过期PSN（线性区间，非回绕）
+// uint32_t binary_search_linear_range(struct connection_cache_array* conn, uint32_t left, uint32_t right, uint64_t current_ts);
 
-// 辅助函数4：二分查找全局最大的过期PSN（处理回绕）
-uint32_t binary_search_last_expired_psn(struct connection_cache_array* conn, uint64_t current_ts);
+// // 辅助函数4：二分查找全局最大的过期PSN（处理回绕）
+// uint32_t binary_search_last_expired_psn(struct connection_cache_array* conn, uint64_t current_ts);
 
 // // 在连接的有效PSN范围（start_psn~end_psn）内查找丢包的数据包
 // int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, int max_lost);
 
 // // 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
 // retransmit_process_result process_retransmit_by_epsn(struct connection_cache_array* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
-
 
 
 #endif
