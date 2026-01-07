@@ -13,14 +13,16 @@
 
 // PSN定义，解决end_psn<start_psn的问题
 #define PSN_MASK          0xFFFFFF  // 24位PSN掩码（0~16777215）
+#define PSN_HALF_CYCLE 0x800000  // 24位PSN的半周期（判断回绕的阈值）
 #define PSN_MAX_VALUE     PSN_MASK        // PSN最大值（2^24-1）
-#define BUFFER_MASK       RING_BUFFER_SIZE - 1  // 环形数组掩码（环形数组大小-1）
 
 // 超时定义
+#define TIME_STAMP_UNIT_MS     1          // 时间戳单位：毫秒
 #define CONN_IDLE_EXPIRE_THRESHOLD_MS  30000   // 连接老化阈值（30秒）
 #define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
 #define CONN_AGE_CHECK_INTERVAL_MS    5       // 连接级检查间隔（5ms）
 #define AGE_THREAD_SLEEP_SEC          10       // 全局老化线程休眠间隔（10秒）
+#define GLOBAL_AGE_BATCH_SIZE  100        // 全局老化分批次遍历大小
 
 //全局哈希桶定义
 #define CONN_BUCKET_COUNT 1024  // 哈希桶总数
@@ -97,7 +99,7 @@ struct connection_entry {
 // 整体内存块布局：[mem_block_header][RDMA数据包数据]，总大小≤5KB
 struct mem_block_header{
     int data_len;                  // 有效RDMA数据包长度
-    uint64_t timestamp_ms;         // 毫秒级时间戳，记录数据包缓存时间
+    uint64_t recv_stamp;         // 毫秒级时间戳，记录数据包缓存时间
     uint32_t psn;                  // 新增：当前内存块对应的PSN
 };
 
@@ -197,21 +199,38 @@ int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t 
 // 缓存RDMA数据包到内存，并将地址存入环形数组
 int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const unsigned char* data, int data_len);
 
-// 在连接的有效PSN范围（start_psn~end_psn）内查找丢包的数据包
-int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, int max_lost);
-
-// 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
-retransmit_process_result process_retransmit_by_epsn(struct connection_cache_array* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
-
 // 收到ACK后清理已被确认的报文（PSN ≤ ack_msn），释放对应内存块
 int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn);
-
-// 释放指定PSN对应的内存块，并清空环形数组对应位置
-retransmit_process_result free_packet_by_psn(struct connection_cache_array* conn, uint32_t psn);
 
 // 老化处理函数：根据毫秒级时间戳清理过期的数据包
 int age_out_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
 
-// 辅助函数：获取当前系统的毫秒级时间戳
+
+//======辅助函数=====
+// 获取当前系统的毫秒级时间戳
 uint64_t get_current_timestamp_ms(void);
+
+// PSN比较函数，处理24位PSN的回绕问题,主要判断start_psn是否需要更新，以及是否发生回绕
+int psn_less_than(uint32_t a, uint32_t b);
+
+// PSN比较函数，处理24位PSN的回绕问题,主要判断end_psn是否需要更新
+int psn_greater_equal(uint32_t a, uint32_t b);
+
+// 批量清理指定PSN范围内的数据包
+int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, uint32_t end)
+
+// 辅助函数3：二分查找区间内最大的过期PSN（线性区间，非回绕）
+uint32_t binary_search_linear_range(struct connection_cache_array* conn, uint32_t left, uint32_t right, uint64_t current_ts);
+
+// 辅助函数4：二分查找全局最大的过期PSN（处理回绕）
+uint32_t binary_search_last_expired_psn(struct connection_cache_array* conn, uint64_t current_ts);
+
+// // 在连接的有效PSN范围（start_psn~end_psn）内查找丢包的数据包
+// int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, int max_lost);
+
+// // 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
+// retransmit_process_result process_retransmit_by_epsn(struct connection_cache_array* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
+
+
+
 #endif
