@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <pthread.h>
+// #include <bits/pthreadtypes.h>
 
 //大小定义
 #define     RING_BUFFER_SIZE    10240      // 环形数组大小（存储内存首地址）
@@ -188,6 +189,9 @@ void remove_connection_entry(struct connection_key key);
 
 // 销毁连接表
 void destroy_connection_table();
+
+// 释放连接缓存数组及其内存块
+void free_cache_array(struct connection_cache_array *cache);
 
 
 // ==================== CACHEOPERATION接口声明 ====================

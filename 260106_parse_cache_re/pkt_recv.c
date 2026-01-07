@@ -376,32 +376,10 @@ void process_data_packet(const unsigned char *buffer, ssize_t length, int bth_of
             add_to_connection_cache(cache, psn, packet, app_data_len);
 
 
-
-        //         // ========== 新增：连接级老化处理 ==========
-        //     // 1. 获取当前连接的缓存结构体（替换为你实际的查找函数）
-        //     struct connection_cache_array *conn = get_connection_cache(bucket, key);
-        //     if (!conn) return;
-
-        //     // 2. 时间戳逻辑
-        //     uint64_t cur_stamp = get_current_timestamp_ms();
-        //     uint64_t five_ms_stamp = CONN_AGE_CHECK_INTERVAL_MS;
-
-        //     // 初始化连接的老化检查时间戳（复用conn->last_age_stamp字段）
-        //     if (conn->last_age_stamp == 0) {
-        //         conn->last_age_stamp = cur_stamp + five_ms_stamp;
-        //     }
-
-        //     // 达到检查时间，执行老化
-        //     if (cur_stamp >= conn->last_age_stamp) {
-        //         age_out_expired_packets(conn, cur_stamp);
-        //         conn->last_age_stamp = cur_stamp + five_ms_stamp; // 更新下次检查时间
-        //     }
-            
-        // }
-
         pthread_rwlock_unlock(&bucket->rwlock); // 解锁 
+        }
     }
-};
+}
     
 // uint8_t infer_service_type(uint8_t opcode) {
 //     // RC (Reliable Connected) 服务类型的操作码范围
@@ -588,7 +566,7 @@ static void *global_conn_age_thread(void *arg) {
                     }
                     // 释放资源
                     if (cur_entry->cache_array) {
-                        free_connection_array(cur_entry->cache_array);
+                        free_cache_array(cur_entry->cache_array);
                         cur_entry->cache_array = NULL;
                     }
                     free(cur_entry); // 释放连接条目本身
@@ -618,7 +596,7 @@ static void *global_conn_age_thread(void *arg) {
 
                     // 2. 清理当前连接的所有资源
                     if (cur_entry->cache_array) {
-                        free_connection_array(cur_entry->cache_array);
+                        free_cache_array(cur_entry->cache_array);
                         cur_entry->cache_array = NULL;
                     }
                     free(cur_entry); // 释放连接条目结构体

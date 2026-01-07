@@ -279,6 +279,7 @@ void remove_flow_entry(struct connection_key key) {
 // 连接表定义
 struct connection_bucket connection_table[TABLE_SIZE];
 
+
 // ==================== 辅助函数 ====================
 
 // 计算连接表哈希
@@ -342,7 +343,7 @@ static struct connection_cache_array* alloc_cache_array(int size) {
 }
 
 // 释放缓存结构
-static void free_cache_array(struct connection_cache_array *cache) {
+void free_cache_array(struct connection_cache_array *cache) {
     if (!cache) return;
 
     // 1. 释放环形数组里残留的数据包 (如果有)
@@ -352,7 +353,7 @@ static void free_cache_array(struct connection_cache_array *cache) {
             if (cache->ring_buf[i] != 0) {
                 struct mem_block_header *block = (struct mem_block_header*)(uintptr_t)cache->ring_buf[i];
                 free(block); // 释放内存块（header+数据）
-                cache->ring_buf[i] = NULL;
+                cache->ring_buf[i] = 0;
             }
         }
         // 释放数组本身
@@ -591,7 +592,7 @@ int is_psn_expired(struct connection_cache_array* conn, uint32_t psn, uint64_t c
     uint32_t cache_index = psn_24 % RING_BUFFER_SIZE;
 
     // 空指针/PSN不匹配 → 视为已过期（无有效数据）
-    if (conn->ring_buf[cache_index] == NULL) return 2;
+    if (conn->ring_buf[cache_index] == 0) return 2;
     unsigned char* mem_block = (unsigned char*)conn->ring_buf[cache_index];
     struct mem_block_header* header = (struct mem_block_header*)mem_block;
     if (header->psn != psn_24) return 1;
@@ -611,10 +612,10 @@ int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, u
         // 非回绕：直接遍历[start, end]
         for (uint32_t psn = start_24; psn <= end_24; psn++) {
             uint32_t idx = psn % RING_BUFFER_SIZE;
-            if (conn->ring_buf[idx] == NULL) continue;
+            if (conn->ring_buf[idx] == 0) continue;
             
             free((unsigned char*)conn->ring_buf[idx]);
-            conn->ring_buf[idx] = NULL;
+            conn->ring_buf[idx] = 0;
             cleaned_count++;
             printf("[EXPIRED BATCH] PSN=%u | 批量清理过期数据包\n", psn);
         }
@@ -622,19 +623,19 @@ int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, u
         // 回绕：分两段遍历[start→PSN_MASK] + [0→end]
         for (uint32_t psn = start_24; psn <= PSN_MASK; psn++) {
             uint32_t idx = psn % RING_BUFFER_SIZE;
-            if (conn->ring_buf[idx] == NULL) continue;
+            if (conn->ring_buf[idx] == 0) continue;
             
             free((unsigned char*)conn->ring_buf[idx]);
-            conn->ring_buf[idx] = NULL;
+            conn->ring_buf[idx] = 0;
             cleaned_count++;
             printf("[EXPIRED BATCH] PSN=%u | 批量清理过期数据包（回绕段1）\n", psn);
         }
         for (uint32_t psn = 0; psn <= end_24; psn++) {
             uint32_t idx = psn % RING_BUFFER_SIZE;
-            if (conn->ring_buf[idx] == NULL) continue;
+            if (conn->ring_buf[idx] == 0) continue;
             
             free((unsigned char*)conn->ring_buf[idx]);
-            conn->ring_buf[idx] = NULL;
+            conn->ring_buf[idx] = 0;
             cleaned_count++;
             printf("[EXPIRED BATCH] PSN=%u | 批量清理过期数据包（回绕段2）\n", psn);
         }
@@ -785,7 +786,7 @@ int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const u
     int ring_index = psn % RING_BUFFER_SIZE;
 
     // 处理环形数组冲突（覆盖旧数据包，释放旧内存）
-    if (conn->ring_buf[ring_index] != NULL) {
+    if (conn->ring_buf[ring_index] != 0) {
         unsigned char* old_mem_block = (unsigned char*)conn->ring_buf[ring_index];
         free(old_mem_block); // 释放旧数据包内存
         printf("[OVERWRITE] 环形数组索引=%d 存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
@@ -852,12 +853,12 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
         for (uint32_t psn = current_start; psn <= temp_end; psn++) {
             uint32_t cache_index = psn % RING_BUFFER_SIZE;
             // 空指针跳过
-            if (conn->ring_buf[cache_index] == NULL) continue;
+            if (conn->ring_buf[cache_index] == 0) continue;
             
             // 释放内存块并置空
             unsigned char* mem_block = (unsigned char*)conn->ring_buf[cache_index];
             free(mem_block);
-            conn->ring_buf[cache_index] = NULL;
+            conn->ring_buf[cache_index] = 0;
             cleaned_count++;
             printf("[ACKED] PSN=%u | 已被MSN=%u确认，释放内存\n", psn, temp_end);
         }
@@ -867,22 +868,22 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
         // 第一段：current_start → PSN_MASK（0xFFFFFF）
         for (uint32_t psn = current_start; psn <= PSN_MASK; psn++) {
             uint32_t cache_index = psn % RING_BUFFER_SIZE;
-            if (conn->ring_buf[cache_index] == NULL) continue;
+            if (conn->ring_buf[cache_index] == 0) continue;
             
             unsigned char* mem_block = (unsigned char*)conn->ring_buf[cache_index];
             free(mem_block);
-            conn->ring_buf[cache_index] = NULL;
+            conn->ring_buf[cache_index] = 0;
             cleaned_count++;
             printf("[ACKED] PSN=%u | 已被MSN=%u确认，释放内存（回绕段1）\n", psn, temp_end);
         }
         // 第二段：0 → temp_end
         for (uint32_t psn = 0; psn <= temp_end; psn++) {
             uint32_t cache_index = psn % RING_BUFFER_SIZE;
-            if (conn->ring_buf[cache_index] == NULL) continue;
+            if (conn->ring_buf[cache_index] == 0) continue;
             
             unsigned char* mem_block = (unsigned char*)conn->ring_buf[cache_index];
             free(mem_block);
-            conn->ring_buf[cache_index] = NULL;
+            conn->ring_buf[cache_index] = 0;
             cleaned_count++;
             printf("[ACKED] PSN=%u | 已被MSN=%u确认，释放内存（回绕段2）\n", psn, temp_end);
         }
