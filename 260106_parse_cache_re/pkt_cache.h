@@ -17,6 +17,7 @@
 #define PSN_MASK          0xFFFFFF  // 24位PSN掩码（0~16777215）
 #define PSN_HALF_CYCLE 0x800000  // 24位PSN的半周期（判断回绕的阈值）
 #define PSN_MAX_VALUE     PSN_MASK        // PSN最大值（2^24-1）
+#define PSN_INVALID       0x1000000  // 无效PSN（大于最大值，表示未初始化）
 
 // 超时定义
 #define TIME_STAMP_UNIT_MS     1          // 时间戳单位：毫秒
@@ -208,8 +209,8 @@ int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const u
 // 收到ACK后清理已被确认的报文（PSN ≤ ack_msn），释放对应内存块
 int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn);
 
-// 老化处理函数：根据毫秒级时间戳清理过期的数据包
-int age_out_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
+// 定时老化处理函数：根据毫秒级时间戳清理过期的数据包
+int periodic_age_out_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
 
 
 //======辅助函数=====
@@ -225,6 +226,8 @@ int psn_greater_equal(uint32_t a, uint32_t b);
 // 批量清理指定PSN范围内的数据包
 int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, uint32_t end);
 
+// 二分法查找最大过期PSN（兼容回绕）
+uint32_t binary_find_last_expired_psn(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn, uint64_t current_timestamp_ms);
 
 //=============全局资源老化功能相关=================
 
