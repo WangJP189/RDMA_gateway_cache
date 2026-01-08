@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <pthread.h>
+#include <time.h>
 // #include <bits/pthreadtypes.h>
 
 //大小定义
@@ -224,17 +225,20 @@ int psn_greater_equal(uint32_t a, uint32_t b);
 // 批量清理指定PSN范围内的数据包
 int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, uint32_t end);
 
-// // 辅助函数3：二分查找区间内最大的过期PSN（线性区间，非回绕）
-// uint32_t binary_search_linear_range(struct connection_cache_array* conn, uint32_t left, uint32_t right, uint64_t current_ts);
 
-// // 辅助函数4：二分查找全局最大的过期PSN（处理回绕）
-// uint32_t binary_search_last_expired_psn(struct connection_cache_array* conn, uint64_t current_ts);
+//=============全局资源老化功能相关=================
 
-// // 在连接的有效PSN范围（start_psn~end_psn）内查找丢包的数据包
-// int find_lost_packets(struct connection_cache_array* conn, uint32_t* lost_psns, int max_lost);
+// 2. 声明连接表锁（线程安全必备）
+extern pthread_mutex_t g_conn_table_mutex;
 
-// // 根据ePSN处理重传：删除psn<ePSN的包，收集psn≥ePSN的包地址用于重传
-// retransmit_process_result process_retransmit_by_epsn(struct connection_cache_array* conn, uint32_t epsn, uint64_t** retrans_addrs, int* retrans_count);
+// 3. 声明老化线程函数（供main.c创建线程）
+void *global_conn_age_thread(void *arg);
 
+// 4. 声明连接最后活动时间更新函数（供业务逻辑调用）
+void update_conn_last_active(struct connection_entry *conn);
+
+// 5. 声明连接清理函数（老化线程调用）
+void free_connection_entry(struct connection_entry *conn);
+void remove_conn_from_bucket(struct connection_entry *conn);
 
 #endif
