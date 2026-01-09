@@ -998,6 +998,11 @@ int age_expired_packets(struct connection_cache_array* conn, uint64_t current_ti
 
 //==================全局资源老化功能（未完善）==================
 
+// 全局变量：线程控制标记 + 老化线程ID + 连接桶指针
+static pthread_t g_aging_tid = 0;
+static volatile int g_aging_thread_running = 0;
+static volatile uint32_t g_conn_idle_threshold = CONN_IDLE_EXPIRE_THRESHOLD_MS;
+
 /**
  * @brief 释放单个connection_entry的全部资源
  * @param entry 待释放的连接条目
@@ -1008,25 +1013,22 @@ static void free_connection_entry(struct connection_entry *entry)
         return;
     }
 
-    // 1. 释放cache_array（按需补充connection_cache_array的释放逻辑）
+    // 1. 释放cache_array（调用专用释放函数）
     if (entry->cache_array != NULL) {
-        // 示例：若cache_array有动态内存，需递归释放
-        // free(entry->cache_array->data);
-        free(entry->cache_array);
-        entry->cache_array = NULL;
+        free_cache_array(entry->cache_array); // 清理环形数组+缓存结构体
+        entry->cache_array = NULL;            // 置空防止野指针
     }
 
-    // 2. 释放entry自身内存
+    // 2. 释放connection_entry自身内存
     free(entry);
 }
 
 /**
  * @brief 遍历单个哈希桶，清理空闲的connection_entry（保证链表连贯）
  * @param bucket_idx 哈希桶索引
- * @param idle_threshold 空闲阈值（秒）
  * @return 清理的条目数量
  */
-int connection_bucket_clean_idle(uint32_t bucket_idx, uint32_t idle_threshold)
+int clean_idle_entry(uint32_t bucket_idx)
 {
     if (bucket_idx >= CONN_BUCKET_COUNT || g_conn_buckets == NULL) {
         return 0;
@@ -1042,7 +1044,7 @@ int connection_bucket_clean_idle(uint32_t bucket_idx, uint32_t idle_threshold)
 
     while (curr != NULL) {
         // 判断是否空闲：最后活动时间 + 阈值 < 当前时间
-        if ((curr_time - curr->last_active_stamp) > idle_threshold) {
+        if ((curr_time - curr->last_active_stamp) > g_conn_idle_threshold) {
             struct connection_entry *to_delete = curr;
 
             // 1. 调整链表指针（保证连贯性）
@@ -1076,10 +1078,9 @@ int connection_bucket_clean_idle(uint32_t bucket_idx, uint32_t idle_threshold)
 
 /**
  * @brief 遍历所有哈希桶，清理空闲的connection_entry
- * @param idle_threshold 空闲阈值（秒）
  * @return 总清理条目数量
  */
-int connection_global_clean_idle(uint32_t idle_threshold)
+int clean_global_idle_entry()
 {
     int total_cleaned = 0;
     if (g_conn_buckets == NULL) {
@@ -1087,7 +1088,7 @@ int connection_global_clean_idle(uint32_t idle_threshold)
     }
 
     for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
-        total_cleaned += connection_bucket_clean_idle(i, idle_threshold);
+        total_cleaned += clean_idle_entry(i);
     }
     return total_cleaned;
 }
@@ -1095,10 +1096,9 @@ int connection_global_clean_idle(uint32_t idle_threshold)
 /**
  * @brief 备用函数：遍历单个哈希桶，将空闲条目标记为valid=0
  * @param bucket_idx 哈希桶索引
- * @param idle_threshold 空闲阈值（秒）
  * @return 标记的条目数量
  */
-int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx, uint32_t idle_threshold)
+int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx)
 {
     if (bucket_idx >= CONN_BUCKET_COUNT || g_conn_buckets == NULL) {
         return 0;
@@ -1111,7 +1111,7 @@ int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx, uint32_t idle_th
     // 加写锁：修改entry的valid属性需独占访问
     pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
     while (curr != NULL) {
-        if ((curr_time - curr->last_active_stamp) > idle_threshold) {
+        if ((curr_time - curr->last_active_stamp) > g_conn_idle_threshold) {
             curr->valid = 0;
             marked_count++;
         }
@@ -1172,7 +1172,7 @@ static int connection_bucket_clean_invalid(uint32_t bucket_idx)
  * @brief 备用函数：遍历所有哈希桶，清理所有valid=0的connection_entry
  * @return 总清理条目数量
  */
-int connection_global_clean_invalid(void)
+int connection_global_clean_invalid()
 {
     int total_cleaned = 0;
     if (g_conn_buckets == NULL) {
@@ -1187,25 +1187,20 @@ int connection_global_clean_invalid(void)
 
 /**
  * @brief 全局资源老化线程入口函数
- * @param arg 线程参数（传入空闲阈值，单位：秒）
  * @return NULL
  */
-void *connection_aging_thread(void *arg)
+void *connection_aging_thread()
 {
-    if (arg == NULL || g_conn_buckets == NULL) {
-        pthread_exit(NULL);
-    }
 
-    uint32_t idle_threshold = *(uint32_t *)arg;
-    const uint32_t check_interval = 60; // 检查周期：60秒（可配置）
+    const uint32_t check_interval = AGE_THREAD_SLEEP_SEC; // 检查周期
 
     while (1) {
         // 1. 方式1：直接清理空闲条目（推荐）
-        connection_global_clean_idle(idle_threshold);
+        clean_global_idle_entry(g_conn_idle_threshold);
 
         // 2. 方式2：先标记空闲条目为invalid，再清理（备用逻辑）
         // for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
-        //     connection_bucket_mark_idle_as_invalid(i, idle_threshold);
+        //     connection_bucket_mark_idle_as_invalid(i, g_conn_idle_threshold);
         // }
         // connection_global_clean_invalid();
 
@@ -1218,19 +1213,96 @@ void *connection_aging_thread(void *arg)
 
 /**
  * @brief 初始化老化线程（示例调用）
- * @param idle_threshold 空闲阈值（秒）
  * @return 线程ID（失败返回-1）
  */
-pthread_t connection_aging_thread_start(uint32_t idle_threshold)
+pthread_t connection_aging_thread_start()
 {
     pthread_t tid;
     if (g_conn_buckets == NULL) {
         return (pthread_t)-1;
     }
 
-    int ret = pthread_create(&tid, NULL, connection_aging_thread, &idle_threshold);
+    int ret = pthread_create(&tid, NULL, connection_aging_thread, &g_conn_idle_threshold);
     if (ret != 0) {
         return (pthread_t)-1;
     }
     return tid;
+}
+
+
+/**
+ * @brief 启动全局资源老化线程
+ * @param g_conn_idle_threshold 空闲超时阈值（毫秒）
+ * @return 0:成功, -1:失败
+ */
+int connection_aging_thread_start(uint32_t g_conn_idle_threshold)
+{
+    // 校验前置条件
+    if (g_conn_buckets == NULL) {
+        fprintf(stderr, "connection_aging_thread_start: conn buckets not init\n");
+        return -1;
+    }
+
+    // 若线程已运行，先停止
+    if (g_aging_thread_running) {
+        connection_aging_thread_stop();
+    }
+
+    // 更新全局空闲阈值
+    g_conn_idle_threshold = (g_conn_idle_threshold > 0) ? g_conn_idle_threshold : CONN_IDLE_EXPIRE_THRESHOLD_MS;
+
+    // 创建老化线程
+    int ret = pthread_create(&g_aging_tid, NULL, connection_aging_thread, NULL);
+    if (ret != 0) {
+        fprintf(stderr, "connection_aging_thread_start: create thread failed, ret=%d\n", ret);
+        g_aging_tid = 0;
+        return -1;
+    }
+    // 设置运行标记
+    g_aging_thread_running = 1;
+
+    // 短暂等待确保线程启动
+    usleep(10000);
+    if (!g_aging_thread_running) {
+        pthread_cancel(g_aging_tid);
+        g_aging_tid = 0;
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 停止全局资源老化线程
+ * @return 0:成功, -1:线程未运行/停止失败
+ */
+int connection_aging_thread_stop(void)
+{
+    // 校验线程状态
+    if (!g_aging_thread_running || g_aging_tid == 0) {
+        fprintf(stderr, "connection_aging_thread_stop: thread not running\n");
+        return -1;
+    }
+
+    // 设置退出标记，触发线程自然退出
+    g_aging_thread_running = 0;
+
+    // 等待线程退出（最多等待检查周期+1秒）
+    uint32_t wait_cnt = 0;
+    const uint32_t max_wait = AGE_THREAD_SLEEP_SEC + 1;
+    while (g_aging_thread_running && wait_cnt < max_wait) {
+        sleep(1);
+        wait_cnt++;
+    }
+
+    // 若仍未退出，强制取消线程（兜底逻辑）
+    if (g_aging_thread_running) {
+        pthread_cancel(g_aging_tid);
+        g_aging_tid = 0;
+        g_aging_thread_running = 0;
+        fprintf(stderr, "connection_aging_thread_stop: force cancel thread\n");
+        return -1;
+    }
+
+    return 0;
 }

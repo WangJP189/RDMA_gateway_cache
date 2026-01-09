@@ -24,7 +24,7 @@
 #define CONN_IDLE_EXPIRE_THRESHOLD_MS  30000   // 连接老化阈值（30秒）
 #define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
 #define CONN_AGE_CHECK_INTERVAL_MS    5       // 连接级检查间隔（5ms）
-#define AGE_THREAD_SLEEP_SEC          10       // 全局老化线程休眠间隔（10秒）
+#define AGE_THREAD_SLEEP_SEC          10000       // 全局老化线程休眠间隔（10秒）
 #define GLOBAL_AGE_BATCH_SIZE  100        // 全局老化分批次遍历大小
 
 //全局哈希桶定义
@@ -213,6 +213,37 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn);
 int age_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
 
 
+
+
+// 释放单个连接条目及其资源（全局资源老化功能调用）
+static void free_connection_entry(struct connection_entry *entry);
+
+//清理单个哈希桶中的空闲连接条目（全局资源老化功能调用）
+int clean_idle_entry(uint32_t bucket_idx);
+
+// 清理全局空闲连接条目（全局资源老化线程调用）
+int clean_global_idle_entry();
+
+// 标记空闲连接为无效（全局资源老化线程调用）
+int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx);
+// 清理单个哈希桶valid=0的连接条目（全局资源老化线程调用）
+static int connection_bucket_clean_invalid(uint32_t bucket_idx);
+// 清理全局valid=0的连接条目（全局资源老化线程调用）
+int connection_global_clean_invalid();
+
+// 全局资源老化线程入口函数
+void *connection_aging_thread();
+
+// 启动全局资源老化线程
+int connection_aging_thread_start(uint32_t g_conn_idle_threshold);
+
+// 停止全局资源老化线程
+int connection_aging_thread_stop(void);
+
+
+
+
+
 //======辅助函数=====
 // 获取当前系统的毫秒级时间戳
 uint64_t get_current_timestamp_ms(void);
@@ -229,18 +260,6 @@ int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, u
 // 二分法查找最大过期PSN（兼容回绕）
 uint32_t binary_find_last_expired_psn(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn, uint64_t current_timestamp_ms);
 
-//=============全局资源老化功能相关=================
 
-/**
- * @brief 启动全局连接老化线程（独立线程，无阻塞）
- * @return 0=成功，-1=失败
- */
-int start_global_conn_age_thread(void);
-
-/**
- * @brief 释放单个connection_cache_array的所有资源（内部调用）
- * @param cache_array 待释放的缓存数组指针
- */
-void free_connection_cache_array(struct connection_cache_array *cache_array);
 
 #endif
