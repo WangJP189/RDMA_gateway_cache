@@ -210,7 +210,7 @@ int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const u
 int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn);
 
 // 定时老化处理函数：根据毫秒级时间戳清理过期的数据包
-int periodic_age_out_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
+int age_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
 
 
 //======辅助函数=====
@@ -231,17 +231,16 @@ uint32_t binary_find_last_expired_psn(struct connection_cache_array* conn, uint3
 
 //=============全局资源老化功能相关=================
 
-// 2. 声明连接表锁（线程安全必备）
-extern pthread_mutex_t g_conn_table_mutex;
+/**
+ * @brief 启动全局连接老化线程（独立线程，无阻塞）
+ * @return 0=成功，-1=失败
+ */
+int start_global_conn_age_thread(void);
 
-// 3. 声明老化线程函数（供main.c创建线程）
-void *global_conn_age_thread(void *arg);
-
-// 4. 声明连接最后活动时间更新函数（供业务逻辑调用）
-void update_conn_last_active(struct connection_entry *conn);
-
-// 5. 声明连接清理函数（老化线程调用）
-void free_connection_entry(struct connection_entry *conn);
-void remove_conn_from_bucket(struct connection_entry *conn);
+/**
+ * @brief 释放单个connection_cache_array的所有资源（内部调用）
+ * @param cache_array 待释放的缓存数组指针
+ */
+void free_connection_cache_array(struct connection_cache_array *cache_array);
 
 #endif

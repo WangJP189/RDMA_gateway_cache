@@ -710,7 +710,7 @@ uint32_t binary_find_last_expired_psn(struct connection_cache_array* conn,
 int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t psn,
                             const unsigned char *packet_data, int packet_len)
 {
-    // 1. 检查新入参的有效性（适配新传参的参数校验）
+    // 检查新入参的有效性（适配新传参的参数校验）
     if (!conn_cache || !packet_data || packet_len <= 0 || 
         packet_len > (MEM_BLOCK_SIZE - sizeof(struct mem_block_header))) {
         printf("[ERROR] 无效的缓存参数: conn_cache=%p/输入数据=%p/数据包长度=%d（上限=%d）\n",
@@ -718,31 +718,24 @@ int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t 
         return -1;
     }
 
-    // 2. 调用缓存函数处理数据包（核心逻辑不变）
-    int ret = cache_rdma_packet(conn_cache, psn, packet_data, packet_len);
-    if (ret != 0) {
-        printf("[ERROR] 数据包缓存失败 (PSN: %u, 错误码: %d)\n", psn, ret);
-        return ret;
-    }
-
-    // 3. 新增：连接级老化处理逻辑（从pkt_recv.c迁移）
-    // 3.1 获取当前毫秒级时间戳
+    // 连接级老化处理逻辑（从pkt_recv.c迁移）
+    // 获取当前毫秒级时间戳
     uint64_t cur_stamp = get_current_timestamp_ms();
     if (cur_stamp == 0) { // 容错：时间戳获取失败时跳过老化
         printf("[WARN] 时间戳获取失败，跳过本次老化检查\n");
     } else {
-        // 3.2 初始化连接的老化检查时间戳（首次缓存时设置）
+        // 初始化连接的老化检查时间戳（首次缓存时设置）
         if (conn_cache->last_age_stamp == 0) {
             conn_cache->last_age_stamp = cur_stamp + CONN_AGE_CHECK_INTERVAL_MS;
             printf("[INFO] 初始化连接老化检查时间戳：下次检查时间=%lu ms\n", conn_cache->last_age_stamp);
         }
 
-        // 3.3 达到检查时间，执行老化处理
+        // 达到检查时间，执行老化处理
         if (cur_stamp >= conn_cache->last_age_stamp) {
             printf("[INFO] 达到老化检查时间（当前=%lu ms/上次检查=%lu ms），执行数据包老化\n",
                    cur_stamp, conn_cache->last_age_stamp);
             // 调用老化函数，捕获返回值（仅日志，不影响缓存结果）
-            int age_ret = age_out_expired_packets(conn_cache, cur_stamp);
+            int age_ret = age_expired_packets(conn_cache, cur_stamp);
             switch (age_ret) {
                 case RETRANS_NO_CACHED_PACKETS:
                     printf("[INFO] 老化处理：无缓存数据包\n");
@@ -754,7 +747,7 @@ int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t 
                     printf("[INFO] 老化处理完成：清理过期数据包=%d个\n", age_ret);
                     break;
             }
-            // 3.4 更新下次老化检查时间
+            // 更新下次老化检查时间
             conn_cache->last_age_stamp = cur_stamp + CONN_AGE_CHECK_INTERVAL_MS;
             printf("[INFO] 更新下次老化检查时间戳：%lu ms\n", conn_cache->last_age_stamp);
         } else {
@@ -764,7 +757,15 @@ int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t 
         }
     }
 
-    // 4. 打印缓存成功日志（调整日志内容，适配新传参）
+
+    // 调用缓存函数处理数据包（核心逻辑不变）
+    int ret = cache_rdma_packet(conn_cache, psn, packet_data, packet_len);
+    if (ret != 0) {
+        printf("[ERROR] 数据包缓存失败 (PSN: %u, 错误码: %d)\n", psn, ret);
+        return ret;
+    }
+
+    // 打印缓存成功日志（调整日志内容，适配新传参）
     printf("[INFO] 数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n",
            psn, packet_len, conn_cache->start_psn, conn_cache->end_psn);
     return 0;
@@ -928,7 +929,7 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
 
 
 // 老化处理函数：按指定二分逻辑优化版（处理回绕）
-int periodic_age_out_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms) {
+int age_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms) {
     // 1. 入参/空缓存检查
     if (!conn) {
         printf("[ERROR] 定时老化失败：连接缓存为空\n");
@@ -997,113 +998,239 @@ int periodic_age_out_expired_packets(struct connection_cache_array* conn, uint64
 
 //==================全局资源老化功能（未完善）==================
 
-// 1. 初始化连接表锁（全局唯一）
-pthread_mutex_t g_conn_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+/**
+ * @brief 释放单个connection_entry的全部资源
+ * @param entry 待释放的连接条目
+ */
+static void free_connection_entry(struct connection_entry *entry)
+{
+    if (entry == NULL) {
+        return;
+    }
 
-// 2. 实现：更新连接最后活动时间（业务逻辑调用，如收包/发包时）
-void update_conn_last_active(struct connection_entry *conn) {
-    if (conn == NULL) return;
-    // 加锁保证时间戳更新原子性（避免多线程同时写）
-    pthread_mutex_lock(&g_conn_table_mutex);
-    conn->last_active_stamp = time(NULL); // 秒级时间戳
-    pthread_mutex_unlock(&g_conn_table_mutex);
+    // 1. 释放cache_array（按需补充connection_cache_array的释放逻辑）
+    if (entry->cache_array != NULL) {
+        // 示例：若cache_array有动态内存，需递归释放
+        // free(entry->cache_array->data);
+        free(entry->cache_array);
+        entry->cache_array = NULL;
+    }
+
+    // 2. 释放entry自身内存
+    free(entry);
 }
 
-// 3. 实现：释放单个连接的内存（按需补充子资源释放）
-void free_connection_entry(struct connection_entry *conn) {
-    if (conn == NULL) return;
-    // 【关键】释放连接内的子资源（根据你的结构体补充）
-    // 示例：若有动态分配的缓冲区/IP字符串，需先释放
-    // if (conn->src_ip) free(conn->src_ip);
-    // if (conn->dst_ip) free(conn->dst_ip);
-    // if (conn->qp_ctx) free(conn->qp_ctx);
-    
-    // 释放连接本身
-    free(conn);
-}
+/**
+ * @brief 遍历单个哈希桶，清理空闲的connection_entry（保证链表连贯）
+ * @param bucket_idx 哈希桶索引
+ * @param idle_threshold 空闲阈值（秒）
+ * @return 清理的条目数量
+ */
+int connection_bucket_clean_idle(uint32_t bucket_idx, uint32_t idle_threshold)
+{
+    if (bucket_idx >= CONN_BUCKET_COUNT || g_conn_buckets == NULL) {
+        return 0;
+    }
 
-// 4. 实现：从哈希桶中移除连接（需遍历桶内链表找到并删除）
-void remove_conn_from_bucket(struct connection_entry *conn) {
-    if (conn == NULL) return;
-
-    pthread_mutex_lock(&g_conn_table_mutex);
-
-    // 假设g_conn_buckets是哈希桶数组，每个桶是connection_entry链表头
-    int bucket_idx = conn->bucket_idx; // 需保证connection_entry有bucket_idx字段（记录所属桶）
+    int cleaned_count = 0;
     struct connection_entry *prev = NULL;
-    struct connection_entry *curr = g_conn_buckets[bucket_idx].next; // 假设桶头是哨兵节点
+    struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
+    uint32_t curr_time = time(NULL); // 当前时间戳（秒级）
 
-    // 遍历链表找目标连接
+    // 加写锁：修改链表需独占访问（哈希桶内置读写锁）
+    pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
+
     while (curr != NULL) {
-        if (curr == conn) {
-            // 从链表中移除
-            if (prev != NULL) {
-                prev->next = curr->next;
+        // 判断是否空闲：最后活动时间 + 阈值 < 当前时间
+        if ((curr_time - curr->last_active_stamp) > idle_threshold) {
+            struct connection_entry *to_delete = curr;
+
+            // 1. 调整链表指针（保证连贯性）
+            if (prev == NULL) {
+                // 待删除节点是桶的头节点
+                g_conn_buckets[bucket_idx].head = curr->next;
             } else {
-                // 目标是链表第一个节点
-                g_conn_buckets[bucket_idx].next = curr->next;
+                // 待删除节点是中间/尾节点
+                prev->next = curr->next;
             }
-            break;
+
+            // 2. 移动当前指针（避免链表断裂）
+            curr = curr->next;
+
+            // 3. 解锁后释放资源（减少锁持有时间）
+            pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
+            free_connection_entry(to_delete);
+            pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
+
+            cleaned_count++;
+        } else {
+            // 非空闲节点，继续遍历
+            prev = curr;
+            curr = curr->next;
         }
-        prev = curr;
+    }
+
+    pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
+    return cleaned_count;
+}
+
+/**
+ * @brief 遍历所有哈希桶，清理空闲的connection_entry
+ * @param idle_threshold 空闲阈值（秒）
+ * @return 总清理条目数量
+ */
+int connection_global_clean_idle(uint32_t idle_threshold)
+{
+    int total_cleaned = 0;
+    if (g_conn_buckets == NULL) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
+        total_cleaned += connection_bucket_clean_idle(i, idle_threshold);
+    }
+    return total_cleaned;
+}
+
+/**
+ * @brief 备用函数：遍历单个哈希桶，将空闲条目标记为valid=0
+ * @param bucket_idx 哈希桶索引
+ * @param idle_threshold 空闲阈值（秒）
+ * @return 标记的条目数量
+ */
+int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx, uint32_t idle_threshold)
+{
+    if (bucket_idx >= CONN_BUCKET_COUNT || g_conn_buckets == NULL) {
+        return 0;
+    }
+
+    int marked_count = 0;
+    struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
+    uint32_t curr_time = time(NULL);
+
+    // 加写锁：修改entry的valid属性需独占访问
+    pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
+    while (curr != NULL) {
+        if ((curr_time - curr->last_active_stamp) > idle_threshold) {
+            curr->valid = 0;
+            marked_count++;
+        }
         curr = curr->next;
     }
+    pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
 
-    pthread_mutex_unlock(&g_conn_table_mutex);
+    return marked_count;
 }
 
-// 5. 核心：全局老化线程逻辑
-void *global_conn_age_thread(void *arg) {
-    (void)arg; // 忽略参数
-    printf("Global connection age thread start, sleep %d sec per loop\n", AGE_THREAD_SLEEP_SEC);
-
-    while (1) {
-        // 步骤1：休眠指定时间
-        sleep(AGE_THREAD_SLEEP_SEC);
-
-        // 步骤2：遍历所有哈希桶
-        time_t now = time(NULL);
-        pthread_mutex_lock(&g_conn_table_mutex); // 加锁保护遍历/修改
-
-        // 假设BUCKET_COUNT是哈希桶总数（需提前定义）
-        for (int bucket_idx = 0; bucket_idx < BUCKET_COUNT; bucket_idx++) {
-            struct connection_entry *prev = NULL;
-            struct connection_entry *curr = g_conn_buckets[bucket_idx].next;
-
-            // 遍历当前桶内的所有连接
-            while (curr != NULL) {
-                // 保存下一个节点（避免删除curr后断链）
-                struct connection_entry *next = curr->next;
-
-                // 步骤3：判断是否空闲超时
-                if (now - curr->last_active_stamp >= CONN_IDLE_EXPIRE_THRESHOLD_SEC) {
-                    printf("Conn idle timeout (bucket %d): src_ip=%s, dst_ip=%s, idle=%ld sec\n",
-                           bucket_idx, curr->src_ip, curr->dst_ip, now - curr->last_active_stamp);
-
-                    // 步骤4：从链表移除
-                    if (prev != NULL) {
-                        prev->next = next;
-                    } else {
-                        g_conn_buckets[bucket_idx].next = next;
-                    }
-
-                    // 步骤5：释放连接内存（解锁后释放，避免锁持有过久）
-                    pthread_mutex_unlock(&g_conn_table_mutex);
-                    free_connection_entry(curr);
-                    pthread_mutex_lock(&g_conn_table_mutex);
-                } else {
-                    // 未超时，更新prev
-                    prev = curr;
-                }
-
-                curr = next;
-            }
-        }
-
-        pthread_mutex_unlock(&g_conn_table_mutex); // 解锁
+/**
+ * @brief 备用函数：遍历单个哈希桶，清理所有valid=0的connection_entry
+ * @param bucket_idx 哈希桶索引
+ * @return 清理的条目数量
+ */
+static int connection_bucket_clean_invalid(uint32_t bucket_idx)
+{
+    if (bucket_idx >= CONN_BUCKET_COUNT || g_conn_buckets == NULL) {
+        return 0;
     }
 
-    // 【可选】优雅退出逻辑（若需要）
-    // pthread_exit(NULL);
-    return NULL;
+    int cleaned_count = 0;
+    struct connection_entry *prev = NULL;
+    struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
+
+    pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
+    while (curr != NULL) {
+        if (curr->valid == 0) {
+            struct connection_entry *to_delete = curr;
+
+            // 调整链表指针（保证连贯性）
+            if (prev == NULL) {
+                g_conn_buckets[bucket_idx].head = curr->next;
+            } else {
+                prev->next = curr->next;
+            }
+
+            // 移动当前指针
+            curr = curr->next;
+
+            // 释放资源（解锁后操作）
+            pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
+            free_connection_entry(to_delete);
+            pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
+
+            cleaned_count++;
+        } else {
+            prev = curr;
+            curr = curr->next;
+        }
+    }
+    pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
+
+    return cleaned_count;
+}
+
+/**
+ * @brief 备用函数：遍历所有哈希桶，清理所有valid=0的connection_entry
+ * @return 总清理条目数量
+ */
+int connection_global_clean_invalid(void)
+{
+    int total_cleaned = 0;
+    if (g_conn_buckets == NULL) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
+        total_cleaned += connection_bucket_clean_invalid(i);
+    }
+    return total_cleaned;
+}
+
+/**
+ * @brief 全局资源老化线程入口函数
+ * @param arg 线程参数（传入空闲阈值，单位：秒）
+ * @return NULL
+ */
+void *connection_aging_thread(void *arg)
+{
+    if (arg == NULL || g_conn_buckets == NULL) {
+        pthread_exit(NULL);
+    }
+
+    uint32_t idle_threshold = *(uint32_t *)arg;
+    const uint32_t check_interval = 60; // 检查周期：60秒（可配置）
+
+    while (1) {
+        // 1. 方式1：直接清理空闲条目（推荐）
+        connection_global_clean_idle(idle_threshold);
+
+        // 2. 方式2：先标记空闲条目为invalid，再清理（备用逻辑）
+        // for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
+        //     connection_bucket_mark_idle_as_invalid(i, idle_threshold);
+        // }
+        // connection_global_clean_invalid();
+
+        // 休眠指定周期
+        sleep(check_interval);
+    }
+
+    pthread_exit(NULL);
+}
+
+/**
+ * @brief 初始化老化线程（示例调用）
+ * @param idle_threshold 空闲阈值（秒）
+ * @return 线程ID（失败返回-1）
+ */
+pthread_t connection_aging_thread_start(uint32_t idle_threshold)
+{
+    pthread_t tid;
+    if (g_conn_buckets == NULL) {
+        return (pthread_t)-1;
+    }
+
+    int ret = pthread_create(&tid, NULL, connection_aging_thread, &idle_threshold);
+    if (ret != 0) {
+        return (pthread_t)-1;
+    }
+    return tid;
 }
