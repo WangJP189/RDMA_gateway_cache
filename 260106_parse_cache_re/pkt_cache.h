@@ -118,7 +118,7 @@ typedef enum {
     RETRANS_NO_VALID_PSN_RANGE = -2,      // 无有效PSN范围
     RETRANS_NO_CACHED_PACKETS = -3,       // 未缓存任何数据包
     RETRANS_NO_NEED = -4,                 // 无需处理重传（start_psn >= epsn）
-    RETRANS_DATA_ALLOC_FAIL = -5,         // 内存分配失败
+    RETRANS_DATA_ALLOC_FAIL = -5,         // connection_cache_array数据分配失败
 } retransmit_process_result;
 
 // ==================== FlowTable接口声明 ====================
@@ -210,7 +210,7 @@ int cache_rdma_packet(struct connection_cache_array* conn, uint32_t psn, const u
 int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn);
 
 // 定时老化处理函数：根据毫秒级时间戳清理过期的数据包
-int age_expired_packets(struct connection_cache_array* conn, uint64_t current_timestamp_ms);
+void age_expired_packets(struct connection_cache_array* conn);
 
 
 
@@ -257,8 +257,8 @@ int psn_greater_equal(uint32_t a, uint32_t b);
 // 批量清理指定PSN范围内的数据包
 int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, uint32_t end);
 
-// 二分法查找最大过期PSN（兼容回绕）
-uint32_t binary_find_last_expired_psn(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn, uint64_t current_timestamp_ms);
+//二分法处理PSN老化（回绕+查找+判断+批量清理全流程）
+int binary_age_psn(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn, uint64_t current_timestamp_ms);
 
 
 
