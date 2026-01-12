@@ -330,6 +330,7 @@ static struct connection_cache_array* alloc_cache_array(int size) {
     cache->end_psn      = PSN_INVALID;
     cache->cur_psn      = 0;
     cache->last_age_stamp = 0; // 需要配合时间函数初始化
+    cache->last_active_stamp = 0;
 
     // // 3. 初始化读写锁
     // if (pthread_rwlock_init(&cache->rwlock, NULL) != 0) {
@@ -765,6 +766,7 @@ int add_to_connection_cache(struct connection_cache_array* conn_cache, uint32_t 
         printf("[ERROR] 数据包缓存失败 (PSN: %u, 错误码: %d)\n", psn, ret);
         return ret;
     }
+    conn_cache->last_active_stamp = get_current_timestamp_ms(); // 更新最后活跃时间戳
 
     // 4. 打印缓存成功日志
     printf("[INFO] 数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n",
@@ -1029,7 +1031,7 @@ int clean_idle_entry(uint32_t bucket_idx)
 
     while (curr != NULL) {
         // 判断是否空闲：最后活动时间 + 阈值 < 当前时间 【原有逻辑完全保留】
-        if ((curr_time - curr->last_active_stamp) > g_conn_idle_threshold) {
+        if ((curr_time - curr->cache_array->last_active_stamp) > g_conn_idle_threshold) {
             struct connection_entry *to_delete = curr;
 
             // 1. 调整链表指针（保证哈希桶链表连贯）【原有逻辑完全保留】
@@ -1112,7 +1114,7 @@ int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx)
     // 加写锁：修改entry的valid属性需独占访问
     pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
     while (curr != NULL) {
-        if ((curr_time - curr->last_active_stamp) > g_conn_idle_threshold) {
+        if ((curr_time - curr->cache_array->last_active_stamp) > g_conn_idle_threshold) {
             curr->valid = 0;
             marked_count++;
         }

@@ -94,7 +94,7 @@ struct connection_entry {
     struct connection_key           connection_key;
     struct connection_cache_array   *cache_array; 
     struct connection_entry         *next;              // 哈希冲突链表
-    uint32_t    last_active_stamp; // 最后活动时间戳（秒级）
+    // uint32_t    last_active_stamp; // 最后活动时间戳（秒级）
     int         valid;          // 连接有效性（1=有效，0=无效）
 };
 
@@ -235,7 +235,7 @@ int connection_global_clean_invalid();
 void *connection_aging_thread();
 
 // 启动全局资源老化线程
-int connection_aging_thread_start(uint32_t g_conn_idle_threshold);
+pthread_t connection_aging_thread_start(uint32_t g_conn_idle_threshold);
 
 // 停止全局资源老化线程
 int connection_aging_thread_stop(void);
