@@ -21,10 +21,10 @@
 
 // 超时定义
 #define TIME_STAMP_UNIT_MS     1          // 时间戳单位：毫秒
-#define CONN_IDLE_EXPIRE_THRESHOLD_MS  30000   // 连接老化阈值（30秒）
-#define MAX_AGE_MILLISECONDS 60    // 数据包最大老化时间（毫秒），可按需调整
+#define CONN_IDLE_EXPIRE_THRESHOLD  30000   // 连接老化阈值（30000ms）
+#define PACKET_AGE_THRESHOLD 60    // 数据包最大老化时间（毫秒）
 #define PACKET_AGE_CHECK_INTERVAL    5       // 报文老化检查间隔
-#define AGE_THREAD_SLEEP_SEC          10000       // 全局老化线程休眠间隔（10秒）
+#define AGE_THREAD_SLEEP_INTERVAL          10       // 全局老化线程休眠间隔（10秒）
 #define GLOBAL_AGE_BATCH_SIZE  100        // 全局老化分批次遍历大小
 #define CONN_AGE_PER_BUCKET_DELAY 500 // 每个桶老化后延时（微秒）
 
@@ -259,7 +259,7 @@ int psn_greater_equal(uint32_t a, uint32_t b);
 int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, uint32_t end);
 
 //二分法处理PSN老化（回绕+查找+判断+批量清理全流程）
-int binary_age_psn(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn, uint64_t current_timestamp_ms);
+void binary_age_psn(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn, uint64_t current_timestamp_ms);
 
 
 
