@@ -13,7 +13,11 @@
 #include "sr_control.h"
 
 // 全局控制变量
-static volatile sig_atomic_t g_shutdown_requested = 0;
+volatile sig_atomic_t g_shutdown_requested = 0;
+
+struct connection_bucket* g_conn_buckets = NULL;              // 哈希桶全局指针
+pthread_t g_aging_tid = 0;                                    // 老化线程ID
+uint32_t g_total_cleaned_conn = 0;                            // 累计清理连接数
 
 /**
  * 清理资源
@@ -61,18 +65,22 @@ void setup_signal_handlers() {
  * 显示主菜单
  */
 void display_menu(void) {
-    printf("\n==== RDMA 网关系统 ====\n");
+    printf("\n==== RDMA 网关系统====\n");
     printf("1. 创建流表\n");
     printf("2. 查看流表\n");
     printf("3. 启动报文接收\n");
     printf("4. 停止报文接收\n");
     
-    printf("5. 启动TCP Server\n");
-    printf("6. 连接对端TCP Server\n");
-    printf("7. 发送测试消息\n");
+    printf("--- 本端作为服务端 (接收对端请求) ---\n");
+    printf("5. 启动监听 (Setup)\n");
+    printf("6. 等待对端连接 (Accept - 阻塞) // 测试用\n");
+    
+    printf("--- 本端作为客户端 (发送SR请求) ---\n");
+    printf("7. 配置对端地址\n");
+    printf("8. 发送SR请求 (Auto Connect) // 测试用\n");
 
     printf("0. 退出程序\n");
-    printf("请选择操作 (0-7): ");
+    printf("请选择操作 (0-8): ");
 }
 
 /**
@@ -83,7 +91,7 @@ void create_flow_table() {
 
     char src_ip[16], dst_ip[16];
     uint32_t src_qp, dst_qp;
-    uint16_t src_port, dst_port; // 新增
+    //uint16_t src_port, dst_port; // 新增
     uint16_t pkey;               // 新增
     
     printf("\n------ 创建流表规则 (Flow Rule) -----\n");
@@ -94,12 +102,12 @@ void create_flow_table() {
     printf("请输入目的IP: ");
     if (scanf("%15s", dst_ip) != 1) return;
 
-    // 新增端口输入
-    printf("请输入源UDP端口 (默认0): ");
-    if (scanf("%hu", &src_port) != 1) src_port = 0;
+    // // 新增端口输入
+    // printf("请输入源UDP端口 (默认0): ");
+    // if (scanf("%hu", &src_port) != 1) src_port = 0;
 
-    printf("请输入目的UDP端口 (RoCE默认4791): ");
-    if (scanf("%hu", &dst_port) != 1) dst_port = 4791;
+    // printf("请输入目的UDP端口 (RoCE默认4791): ");
+    // if (scanf("%hu", &dst_port) != 1) dst_port = 4791;
     
     printf("请输入源QP号: ");
     if (scanf("%u", &src_qp) != 1) return;
@@ -229,37 +237,54 @@ void stop_receiver() {
 
 }
 
-/**
- * 功能5: TCP Server启动
- */
-void menu_start_server() {
-    int port = 9090; // 默认端口
-    printf("启动本地 TCP 监听端口 %d...\n", port);
-    start_tcp_server_thread(port);
-}
-
-/**
- * 功能6: TCP Client连接
- */
-void menu_connect_peer() {
+// 功能5: 启动监听 (服务端 Setup)
+void menu_server_setup() {
     char ip[32];
-    int port = 9090;
-    
-    printf("请输入对端网关 IP: ");
+    int port;
+    printf("请输入本地绑定IP (输入 0 代表 0.0.0.0): ");
     if (scanf("%31s", ip) != 1) return;
+    if (strcmp(ip, "0") == 0) strcpy(ip, "0.0.0.0");
     
-    connect_to_gateway(ip, port);
+    printf("请输入本地监听端口: ");
+    if (scanf("%d", &port) != 1) return;
+
+    tcp_server_setup(ip, port);
 }
 
-/**
- * [功能7: TCP发送消息
- */
-void menu_send_msg() {
+// 测试用
+// 功能6: 等待连接 (服务端 Accept - 阻塞)
+void menu_server_accept() {
+    // 这一步会阻塞，直到对端作为 Client 连接过来
+    // 连接成功后，建立 通道(对端->本端)
+    tcp_server_accept();
+}
+
+// 功能7: 接收消息测试 (服务端 Recv)
+void menu_server_recv_test() {
+    
+    printf("ToDo\n");
+}
+
+// 功能8: 配置对端信息 (客户端 Config)
+void menu_config_sr() {
+    char ip[32];
+    int port;
+    printf("请输入对端(SR服务端)IP: ");
+    if (scanf("%31s", ip) != 1) return;
+    printf("请输入对端(SR服务端)端口: ");
+    if (scanf("%d", &port) != 1) return;
+    
+    set_sr_target_info(ip, port);
+}
+
+// 功能9: 发送SR请求 (客户端 Send - 自动建连)
+void menu_send_sr() {
     char msg[128];
-    printf("请输入要发送的内容: ");
+    printf("请输入SR请求内容: ");
     if (scanf("%127s", msg) != 1) return;
     
-    send_tcp_message(msg);
+    // 这会自动建立 通道(本端->对端)
+    send_sr_request(msg);
 }
 
 
@@ -322,14 +347,18 @@ void menu_loop() {
                 stop_receiver();
                 break;
 
-            case 5:
-                menu_start_server();
+            case 5: 
+                menu_server_setup(); 
                 break;
             case 6:
-                menu_connect_peer();
+                menu_server_accept(); 
                 break;
-            case 7:
-                menu_send_msg();
+            
+            case 7: 
+                menu_config_sr(); 
+                break;
+            case 8: 
+                menu_send_sr(); 
                 break;
         
             default:

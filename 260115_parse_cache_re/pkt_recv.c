@@ -152,7 +152,18 @@ int create_promiscuous_socket(const char *interface_name) {
 void receive_and_parse_frames(int sockfd) {
 
     // copy 2times ToDo  AF_packet --> DPDK?
-    unsigned char buffer[2048];
+    // unsigned char buffer[2048];
+
+     // [修改] 定义缓冲区大小为 5192
+    size_t buffer_size = 5192;
+
+    // [修改] 使用 malloc 动态分配内存
+    unsigned char *buffer = (unsigned char*)malloc(buffer_size);
+    if (!buffer) {
+        perror("Buffer memory allocation failed");
+        return;
+    }
+
     struct sockaddr_ll saddr;
     socklen_t saddr_len = sizeof(saddr);
 
@@ -206,6 +217,8 @@ void receive_and_parse_frames(int sockfd) {
             // last_cleanup_time = now;
         // }
     }
+    // [修改] 退出循环后释放内存
+    free(buffer);
 }
 
 void process_rdma_packet(const unsigned char *buffer, ssize_t length) {
@@ -254,7 +267,7 @@ void process_rdma_packet(const unsigned char *buffer, ssize_t length) {
     uint16_t dst_port = ntohs(udp->dest);
 
     // ============================================================
-    // A:查流表
+    // 查流表
     // ============================================================
     struct flow_entry *flow = lookup_flow(src_ip, dst_ip, dest_qp, pkey);
     if (!flow) {
@@ -262,37 +275,34 @@ void process_rdma_packet(const unsigned char *buffer, ssize_t length) {
         printf("[WARN] 丢弃未知数据包 DstQP:%u\n", dest_qp);
         return;
     }
-    // ============================================================
-    // B:组装连接Key 
-    // ============================================================
-    struct connection_key key = create_connection_key(src_ip, dst_ip, flow->src_qp, dest_qp, pkey);
-    // ============================================================
-    // C:获取 Bucket
-    // ============================================================
-    struct connection_bucket *bucket = get_connection_bucket(key);
 
     // 5. 根据报文类型分别处理
     switch (pkt_type) {
-        case PKT_TYPE_DATA:
-            //进行数据包处理，缓存数据
+        case PKT_TYPE_DATA:{
             // process_data_packet(buffer, length, bth_offset, 
             //                    src_ip, dst_ip, src_port, dst_port,
             //                    pkey, dest_qp, psn, opcode);
+            // ============================================================
+            // 组装连接Key 
+            // ============================================================
+            struct connection_key key = create_connection_key(src_ip, dst_ip,
+                                                            flow->src_qp, dest_qp, pkey);
+            // ============================================================
+            // 获取 Bucket
+            // ============================================================
+            struct connection_bucket *bucket = get_connection_bucket(key);
             process_data_packet(buffer, length, bth_offset, bucket, key, psn);
             break;
+        }
         case PKT_TYPE_ACK:
-            //进行ACK包处理，更新缓存状态
             // process_ack_packet(buffer, length, bth_offset,
             //                   src_ip, dst_ip, src_port, dst_port,
             //                   pkey, dest_qp, psn, opcode);
-            process_ack_packet(buffer, length, bth_offset,bucket, key, psn);
             break;
         case PKT_TYPE_NACK:
-            //进行NACK包处理，重传丢失数据
             // process_nack_packet(buffer, length, bth_offset,
             //                    src_ip, dst_ip, src_port, dst_port,
             //                    pkey, dest_qp, psn, opcode);
-            process_nack_packet(buffer, length, bth_offset,bucket, key, psn);
             break;
         default:
             printf("Unknown: OPCode=0x%02x\n", opcode);
@@ -369,7 +379,7 @@ void process_data_packet(const unsigned char *buffer, ssize_t length, int bth_of
         // ============================================================
         // 获取或创建缓存
         // ============================================================
-        struct connection_cache_array *cache = get_or_create_connection_cache_array(bucket, key);
+        struct connection_cache_array *cache = get_connection_cache_array(bucket, key);
 
         if (cache) {
             // ============================================================
@@ -464,7 +474,7 @@ void process_ack_packet(const unsigned char *buffer, ssize_t length, int bth_off
 
     // [新增]
     pthread_rwlock_unlock(&bucket->rwlock); // 解锁 
-}
+};
 
 // void process_nack_packet(const unsigned char *buffer, ssize_t length,
 //                         int bth_offset,
@@ -610,69 +620,3 @@ void handle_nack_received(struct connection_bucket *bucket, struct connection_ke
     // ToDo
 
 }
-
-
-
-
-
-
-
-
-
-
-
-#ifdef STANDALONE_TEST
-
-void receive_and_parse_frames(int sockfd) {
-
-    unsigned char buffer[2048];
-    struct sockaddr_ll saddr;
-    socklen_t saddr_len = sizeof(saddr);
-
-    while(1) {
-
-        // recvfrom
-        ssize_t msg_len = recvfrom(sockfd, buffer, sizeof(buffer), 0, 
-                                  (struct sockaddr *)&saddr, &saddr_len);
-
-        if (msg_len < 0) {
-            perror("recvfrom");
-            continue;
-        }
-        if (msg_len < (ssize_t)sizeof(struct ethhdr)) {
-            printf("收到过短报文: %zd bytes\n", msg_len);
-            continue;
-        }
-        
-        //printf("收到报文: %zd bytes\n", msg_len);
-
-        // 调用完整的解析函数
-        process_rdma_packet(buffer, msg_len);
-
-    }
-}
-
-int start_packet_receiver(const char* interface_name) {
-
-    int sockfd = create_promiscuous_socket(interface_name);
-
-    if (sockfd == -1) {
-        fprintf(stderr, "套接字创建失败\n");
-        return 1;
-    }
-
-    receive_and_parse_frames(sockfd);
-
-    close(sockfd);
-
-    return 0;
-}
-
-int main(){
-
-    start_packet_receiver("ens37");
-
-    return 0;
-}
-
-#endif
