@@ -28,7 +28,6 @@ static uint32_t ip_str_to_host(const char* ip_str) {
 static uint32_t calc_flow_hash(const struct flow_key *key) {
     uint32_t hash = 0;
     hash = key->src_ip ^ key->dst_ip ^ key->dst_qp;
-    hash = hash ^ ((uint32_t)key->src_port << 16 | key->dst_port);
     hash^=key->pkey;
     return hash % TABLE_SIZE;
 }
@@ -37,8 +36,6 @@ static uint32_t calc_flow_hash(const struct flow_key *key) {
 static int flow_key_equal(const struct flow_key *k1, const struct flow_key *k2) {
     return (k1->src_ip == k2->src_ip &&
             k1->dst_ip == k2->dst_ip &&
-            k1->src_port == k2->src_port &&
-            k1->dst_port == k2->dst_port &&
             k1->dst_qp == k2->dst_qp &&
             k1->pkey == k2->pkey);
 }
@@ -116,8 +113,7 @@ void print_flow_entry(struct flow_entry *entry, const char* type) {
     inet_ntop(AF_INET, &d, dst_ip, sizeof(dst_ip));
 
     printf("[%s] Key: %s:%u -> %s:%u (DstQP:%u, PKey:%x) | Val: SrcQP=%u, Role=%d\n",
-           type, src_ip, entry->flow_key.src_port,
-           dst_ip, entry->flow_key.dst_port,
+           type, src_ip, dst_ip,
            entry->flow_key.dst_qp, entry->flow_key.pkey,
            entry->src_qp, entry->role);
 };
@@ -125,7 +121,6 @@ void print_flow_entry(struct flow_entry *entry, const char* type) {
 
 // 创建流键
 struct flow_key create_flow_key(const char *src_ip, const char *dst_ip, 
-                               uint16_t src_port, uint16_t dst_port,
                                uint32_t dst_qp, uint16_t pkey) 
 {
     struct flow_key key;
@@ -133,8 +128,6 @@ struct flow_key create_flow_key(const char *src_ip, const char *dst_ip,
     
     key.src_ip   = ip_str_to_host(src_ip);
     key.dst_ip   = ip_str_to_host(dst_ip);
-    key.src_port = src_port;
-    key.dst_port = dst_port;
     key.dst_qp   = dst_qp;
     key.pkey     = pkey;
     key.resv     = 0;
@@ -144,7 +137,6 @@ struct flow_key create_flow_key(const char *src_ip, const char *dst_ip,
 
 // 添加条目到双向流表
 int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str, 
-                   uint16_t src_port, uint16_t dst_port,
                    uint32_t src_qp, uint32_t dst_qp, 
                    uint16_t pkey)
 {
@@ -152,7 +144,7 @@ int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str,
     // 线路视角：包从 A 发往 B
     // 匹配键：Src=A, Dst=B, DstQP=QP_B
     // 目标值：SrcQP=QP_A, Role=src_gateway
-    struct flow_key fwd_key = create_flow_key(src_ip_str, dst_ip_str, src_port, dst_port, dst_qp, pkey);
+    struct flow_key fwd_key = create_flow_key(src_ip_str, dst_ip_str, dst_qp, pkey);
     if (insert_flow_entry(g_flow_table_forward, fwd_key, src_qp, src_gateway) != 0) {
         printf("[ERROR] 正向流表插入失败\n");
         return -1;
@@ -162,8 +154,8 @@ int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str,
     // 线路视角：包从 B 发往 A
     // 匹配键：Src=B, Dst=A, DstQP=QP_A
     // 目标值：SrcQP=QP_B, Role=dst_gateway
-    // struct flow_key rev_key = create_flow_key(dst_ip_str, src_ip_str, dst_port, src_port, src_qp, pkey);
-    struct flow_key rev_key = create_flow_key(dst_ip_str, src_ip_str, src_port, dst_port, src_qp, pkey);
+    // struct flow_key rev_key = create_flow_key(dst_ip_str, src_ip_str, src_qp, pkey);
+    struct flow_key rev_key = create_flow_key(dst_ip_str, src_ip_str, src_qp, pkey);
     if (insert_flow_entry(g_flow_table_reverse, rev_key, dst_qp, dst_gateway) != 0) {
         printf("[ERROR] 反向流表插入失败\n");
         return -1;
@@ -175,11 +167,10 @@ int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str,
 
 //查找流表项
 struct flow_entry* lookup_flow(const char *pkt_src_ip, const char *pkt_dst_ip,
-                                     uint16_t pkt_src_port, uint16_t pkt_dst_port,
                                      uint32_t pkt_dst_qp, uint16_t pkt_pkey)
 {
     // 构造查询键
-    struct flow_key key = create_flow_key(pkt_src_ip, pkt_dst_ip, pkt_src_port, pkt_dst_port, pkt_dst_qp, pkt_pkey);
+    struct flow_key key = create_flow_key(pkt_src_ip, pkt_dst_ip, pkt_dst_qp, pkt_pkey);
     uint32_t hash = calc_flow_hash(&key);
 
     // 1. 先查 Forward 表
@@ -242,8 +233,6 @@ void remove_flow_entry(struct connection_key key) {
     memset(&fwd_key, 0, sizeof(fwd_key));
     fwd_key.src_ip   = key.src_ip;
     fwd_key.dst_ip   = key.dst_ip;
-    fwd_key.src_port = key.src_port;
-    fwd_key.dst_port = key.dst_port;
     fwd_key.dst_qp   = key.dst_qp;
     fwd_key.pkey     = key.pkey;
     fwd_key.resv     = 0;
@@ -254,8 +243,6 @@ void remove_flow_entry(struct connection_key key) {
     memset(&rev_key, 0, sizeof(rev_key));
     rev_key.src_ip   = key.dst_ip;
     rev_key.dst_ip   = key.src_ip;
-    rev_key.src_port = key.dst_port;
-    rev_key.dst_port = key.src_port;
     rev_key.dst_qp   = key.src_qp;
     rev_key.pkey     = key.pkey;
     rev_key.resv     = 0;
@@ -287,7 +274,6 @@ struct connection_bucket connection_table[TABLE_SIZE];
 static uint32_t calc_conn_hash(const struct connection_key *key) {
     uint32_t hash = 0;
     hash = key->src_ip ^ key->dst_ip;
-    hash ^= (key->src_port | (key->dst_port << 16));
     hash ^= (key->src_qp ^ key->dst_qp);
     hash ^= key->pkey;
     return hash % TABLE_SIZE;
@@ -297,8 +283,6 @@ static uint32_t calc_conn_hash(const struct connection_key *key) {
 static int conn_key_equal(const struct connection_key *k1, const struct connection_key *k2) {
     return (k1->src_ip == k2->src_ip &&
             k1->dst_ip == k2->dst_ip &&
-            k1->src_port == k2->src_port &&
-            k1->dst_port == k2->dst_port &&
             k1->src_qp == k2->src_qp &&
             k1->dst_qp == k2->dst_qp &&
             k1->pkey == k2->pkey);
@@ -398,15 +382,12 @@ struct connection_bucket* get_connection_bucket(struct connection_key key) {
 
 // 创建连接键
 struct connection_key create_connection_key(const char *src_ip, const char *dst_ip, 
-                                            uint16_t src_port, uint16_t dst_port, 
                                             uint32_t src_qp, uint32_t dst_qp, uint16_t pkey) {
     struct connection_key key;
     // memset(&key, 0, sizeof(key));
 
     key.src_ip   = ip_str_to_host(src_ip);
     key.dst_ip   = ip_str_to_host(dst_ip);
-    key.src_port = src_port;
-    key.dst_port = dst_port;
     key.src_qp   = src_qp;
     key.dst_qp   = dst_qp;
     key.pkey     = pkey;
@@ -1211,7 +1192,7 @@ int connection_aging_thread_stop(void)
  *        5. 重置所有全局变量，防止野指针
  * @note 线程安全：本函数调用后，老化线程无法再启动，需重新初始化全局资源
  */
-int connection_aging_global_resource_release(void)
+int connection_aging_global_resource_release()
 {
     int ret = 0;
     printf("[INFO] Start release global connection aging thread all resources...\n");

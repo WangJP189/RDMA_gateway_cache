@@ -41,8 +41,8 @@ extern struct connection_bucket *g_conn_buckets;
 struct flow_key {
     uint32_t    src_ip;         // 源IP
     uint32_t    dst_ip;         // 目的IP
-    uint16_t    src_port;       // 源端口
-    uint16_t    dst_port;       // 目的端口
+    // uint16_t    src_port;       // 源端口
+    // uint16_t    dst_port;       // 目的端口
     uint32_t    dst_qp;         // 目的QP
     uint16_t    pkey;           // 分区键
     uint16_t    resv;           // 字节对齐保留
@@ -69,8 +69,8 @@ struct flow_entry {
 struct connection_key {
     uint32_t    src_ip;         // 源IP
     uint32_t    dst_ip;         // 目的IP
-    uint16_t    src_port;       // 源端口
-    uint16_t    dst_port;       // 目的端口
+    // uint16_t    src_port;       // 源端口
+    // uint16_t    dst_port;       // 目的端口
     uint32_t    src_qp;         // 源QP
     uint32_t    dst_qp;         // 目的QP
     uint16_t    pkey;           // 分区键
@@ -129,18 +129,15 @@ extern struct flow_entry*       g_flow_table_reverse[TABLE_SIZE];
 
 // 创建流键
 struct flow_key create_flow_key(const char *src_ip, const char *dst_ip, 
-                                uint16_t src_port, uint16_t dst_port,
                                 uint32_t dst_qp, uint16_t pkey);
 
 // 添加条目到双向流表                             
 int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str, 
-                      uint16_t src_port, uint16_t dst_port,
                       uint32_t src_qp, uint32_t dst_qp, 
                       uint16_t pkey);
                  
 // 查找流表
 struct flow_entry* lookup_flow(const char *pkt_src_ip, const char *pkt_dst_ip,
-                                     uint16_t pkt_src_port, uint16_t pkt_dst_port,
                                      uint32_t pkt_dst_qp, uint16_t pkt_pkey);
 
 // 销毁双向流表
@@ -164,7 +161,6 @@ struct connection_bucket* get_connection_bucket(struct connection_key key);
 
 // 创建连接键
 struct connection_key create_connection_key(const char *src_ip, const char *dst_ip, 
-                                            uint16_t src_port, uint16_t dst_port, 
                                             uint32_t src_qp, uint32_t dst_qp, uint16_t pkey);
 /**
  * @brief 查找或创建连接表条目
@@ -241,7 +237,8 @@ int connection_aging_thread_start(uint32_t g_conn_idle_threshold);
 // 停止全局资源老化线程
 int connection_aging_thread_stop(void);
 
-
+// 释放全局资源老化线程相关资源
+int connection_aging_global_resource_release();
 
 
 

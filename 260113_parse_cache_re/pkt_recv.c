@@ -265,8 +265,7 @@ void process_rdma_packet(const unsigned char *buffer, ssize_t length) {
     // ============================================================
     // B:组装连接Key 
     // ============================================================
-    struct connection_key key = create_connection_key(src_ip, dst_ip, src_port, dst_port,
-                                                    flow->src_qp, dest_qp, pkey);
+    struct connection_key key = create_connection_key(src_ip, dst_ip, flow->src_qp, dest_qp, pkey);
     // ============================================================
     // C:获取 Bucket
     // ============================================================
@@ -513,10 +512,92 @@ int parse_aeth_header(const unsigned char *aeth_start,
     return 0;
 }
 
+/**
+ * @brief 处理收到的ACK报文，匹配对应连接并清理已确认的数据包(PSN ≤ epsn)
+ * @param bucket 哈希桶指针，指定要遍历的桶
+ * @param key 待匹配的连接四元组key(src_ip/dst_ip/src_qp/dst_qp/pkey)
+ * @param epsn ACK报文中携带的最大确认PSN，清理该值及之前的所有报文
+ * @note 1. 哈希桶加【读锁】，仅遍历查找不修改链表，支持并发读，性能最优
+ * @note 2. 连接匹配规则：connection_key的src_ip/dst_ip/src_qp/dst_qp/pkey全字段严格匹配
+ * @note 3. 健壮性校验：空指针/无效连接/空缓存数组 全过滤，无崩溃风险
+ * @note 4. PSN仅保留24位有效位，统一掩码处理，避免高位数据干扰
+ * @note 5. 遍历完成后必解锁，无锁泄漏风险
+ */
 void handle_ack_received(struct connection_bucket *bucket, struct connection_key key, uint32_t epsn) {
+    // 1. 入参合法性校验：哈希桶为空直接返回
+    if (bucket == NULL) {
+        printf("[ERROR] handle_ack_received: 哈希桶指针为空，无法处理ACK\n");
+        return;
+    }
 
-    // ToDo
+    // 2. 统一处理PSN：仅保留24位有效位，过滤高位无效数据，和clean_acked_packets逻辑对齐
+    uint32_t ack_msn = epsn;
+    struct connection_entry *curr = bucket->head;
+    int find_conn_flag = 0;
 
+    // 3. 哈希桶加读锁：遍历冲突链表属于读操作，读锁并发安全，性能最优
+    pthread_rwlock_rdlock(&bucket->rwlock);
+
+    // 4. 遍历当前哈希桶的冲突链表，匹配目标连接
+    while (curr != NULL) {
+        // 4.1 过滤无效连接：连接标记为无效，直接跳过
+        if (curr->valid != 1) {
+            curr = curr->next;
+            continue;
+        }
+
+        // 4.2 核心：严格匹配连接key的所有字段，完全一致才视为同一个连接
+        struct connection_key *curr_key = &curr->connection_key;
+        if (curr_key->src_ip  == key.src_ip  &&
+            curr_key->dst_ip  == key.dst_ip  &&
+            curr_key->src_qp  == key.src_qp  &&
+            curr_key->dst_qp  == key.dst_qp  &&
+            curr_key->pkey    == key.pkey) 
+        {
+            find_conn_flag = 1;
+            
+            // 4.3 过滤空缓存数组：连接有效但缓存未初始化，打印警告并跳过
+            if (curr->cache_array == NULL) {
+                printf("[WARN] handle_ack_received: 匹配到连接[src_ip=0x%08X,dst_ip=0x%08X], 但缓存数组为空，跳过ACK清理\n",
+                       key.src_ip, key.dst_ip);
+                curr = curr->next;
+                break;
+            }
+
+            // 4.4 找到目标连接，调用核心清理函数，处理ACK确认的报文
+            printf("[INFO] handle_ack_received: 匹配到目标连接，开始清理ACK确认报文 | ACK MSN=0x%06X\n", ack_msn);
+            int clean_ret = clean_acked_packets(curr->cache_array, ack_msn);
+            
+            // 4.5 根据清理结果打印分级日志，复用原错误码做结果判断
+            switch (clean_ret) {
+                case RETRANS_NO_VALID_PSN_RANGE:
+                    printf("[ACK RECV] 该连接无有效PSN范围，无需清理报文\n");
+                    break;
+                case RETRANS_NO_CACHED_PACKETS:
+                    printf("[ACK RECV] 该连接无缓存数据包，无需清理报文\n");
+                    break;
+                default:
+                    if (clean_ret > 0) {
+                        printf("[ACK RECV] ✅ ACK清理完成，本次释放已确认报文=%d个\n", clean_ret);
+                    }
+                    break;
+            }
+            
+            // 一个key在哈希桶中唯一对应一个连接，匹配到后直接退出遍历，提升效率
+            break;
+        }
+
+        curr = curr->next;
+    }
+
+    // 5. 未匹配到对应连接的日志打印
+    if (find_conn_flag == 0) {
+        printf("[DEBUG] handle_ack_received: 哈希桶中未匹配到指定连接[src_ip=0x%08X,dst_ip=0x%08X], 跳过ACK清理\n",
+               key.src_ip, key.dst_ip);
+    }
+
+    // 6. 解锁哈希桶：无论是否匹配到连接，必须解锁，杜绝锁泄漏
+    pthread_rwlock_unlock(&bucket->rwlock);
 }
 
 void handle_nack_received(struct connection_bucket *bucket, struct connection_key key, uint32_t epsn) {
