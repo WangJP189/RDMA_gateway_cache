@@ -103,7 +103,7 @@ int main() {
     srand((unsigned int)time(NULL));
 
     // 配置参数
-    const int total_pkts = 10;    // 总数据包数量
+    const int total_pkts = 100;    // 总数据包数量
     const int lost_count = 2;      // 丢包数量
     uint32_t sent_psns[total_pkts];// 发送的PSN列表
     int lost_psns[lost_count];     // 丢包的PSN列表
