@@ -221,7 +221,7 @@ void receive_and_parse_frames(int sockfd)
     {
 
         // recvfrom
-        ssize_t msg_len = recvfrom(sockfd, buffer, sizeof(buffer), 0,
+        ssize_t msg_len = recvfrom(sockfd, buffer, sizeof(buffer_size), 0,
                                    (struct sockaddr *)&saddr, &saddr_len);
 
         if (msg_len < 0)
@@ -331,7 +331,7 @@ void process_rdma_packet(const unsigned char *buffer, ssize_t length)
     // ============================================================
     // 组装连接Key
     // ============================================================
-    struct connection_key key = create_connection_key(src_ip, dst_ip,
+    struct connection_key key = create_connection_key_u32(src_ip, dst_ip,
                                                       flow->src_qp, dest_qp, pkey);
     // ============================================================
     // 获取 Bucket
@@ -608,7 +608,7 @@ void handle_ack_received(const unsigned char *buffer, ssize_t length,
     // 1. 入参合法性校验
     // ZPY
     // 组装连接反向Key
-    struct connection_key reverse_key = create_connection_key(key.dst_ip, key.src_ip,
+    struct connection_key reverse_key = create_connection_key_u32(key.dst_ip, key.src_ip,
                                                               key.dst_qp, key.src_qp,
                                                               key.pkey);
     // 获取反向Bucket
@@ -1207,7 +1207,7 @@ void handle_gateway_msg(gateway_control_msg *gw_control_msg, gateway_data_msg *g
     // 控制信息构造时源目的方向已经调换，直接查找即可获得正确方向的缓冲区指针
     // 补充cache的连接级锁
     // 组装连接Key
-    struct connection_key key = create_connection_key(gw_control_msg->src_ip, gw_control_msg->dest_ip,
+    struct connection_key key = create_connection_key_u32(gw_control_msg->src_ip, gw_control_msg->dest_ip,
                                                       gw_control_msg->src_port, gw_control_msg->dest_port,
                                                       gw_control_msg->pkey);
     // 获取Bucket
@@ -1526,7 +1526,7 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
 {
     // 入参合法性校验
     // 组装连接反向Key
-    struct connection_key reverse_key = create_connection_key(key.dst_ip, key.src_ip,
+    struct connection_key reverse_key = create_connection_key_u32(key.dst_ip, key.src_ip,
                                                               key.dst_qp, key.src_qp,
                                                               key.pkey);
     // 获取反向Bucket

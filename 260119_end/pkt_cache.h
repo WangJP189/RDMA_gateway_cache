@@ -183,6 +183,11 @@ struct connection_bucket* get_connection_bucket(struct connection_key key);
 // 创建连接键
 struct connection_key create_connection_key(const char *src_ip, const char *dst_ip, 
                                             uint32_t src_qp, uint32_t dst_qp, uint16_t pkey);
+
+// 新增 create_connection_key_u32 声明（uint32_t 类型IP入参）
+struct connection_key create_connection_key_u32(uint32_t src_ip, uint32_t dst_ip, 
+                                                uint32_t src_qp, uint32_t dst_qp, uint16_t pkey);
+                                                
 /**
  * @brief 查找或创建连接表条目
  * @return 连接缓存数组指针

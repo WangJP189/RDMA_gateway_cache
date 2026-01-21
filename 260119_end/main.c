@@ -409,7 +409,7 @@ void menu_loop() {
 
     setup_signal_handlers();
     
-    while (running && !g_shutdown_requested) {
+    while (g_running && !g_shutdown_requested) {
 
         display_menu();
 
@@ -437,7 +437,7 @@ void menu_loop() {
         switch (choice) {
             case 0:
                 printf("感谢使用，再见！\n");
-                running = 0;
+                g_running = 0;
                 break;
                 
             case 1:

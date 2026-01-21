@@ -419,6 +419,28 @@ struct connection_key create_connection_key(const char *src_ip, const char *dst_
     return key;
 }
 
+
+// 新增 create_connection_key_u32 实现（uint32_t 类型IP入参）
+struct connection_key create_connection_key_u32(uint32_t src_ip, uint32_t dst_ip, 
+                                                uint32_t src_qp, uint32_t dst_qp, uint16_t pkey) {
+    struct connection_key key;
+    // memset(&key, 0, sizeof(key));  
+
+    key.src_ip   = src_ip;
+    key.dst_ip   = dst_ip;
+    // key.src_port = src_port;  
+    // key.dst_port = dst_port;
+    key.src_qp   = src_qp;
+    key.dst_qp   = dst_qp;
+    key.pkey     = pkey;
+    key.resv1    = 0;  
+    key.resv2    = 0;
+    key.resv3    = 0;
+
+    return key;
+}
+
+
 // [修改后] 查找或创建连接条目，并打印缓存信息
 struct connection_cache_array* get_connection_cache_array(struct connection_bucket *bucket, struct connection_key key) {
     
