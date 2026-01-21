@@ -681,10 +681,6 @@ int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
  */
 void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
                     uint32_t end_psn, uint64_t current_timestamp_ms) {
-    // 1. 空范围检查
-    if (start_psn == PSN_INVALID || end_psn == PSN_INVALID) {
-        return;
-    }
     // 范围无有效PSN（环形语境下无数据）
     if (start_psn == ((end_psn + 1) & PSN_MASK)) {
         return;

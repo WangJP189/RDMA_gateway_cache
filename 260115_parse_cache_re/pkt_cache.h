@@ -32,7 +32,7 @@
 //全局哈希桶定义
 #define CONN_BUCKET_COUNT 1024  // 哈希桶总数
 extern struct connection_bucket *g_conn_buckets;
-extern volatile sig_atomic_t g_shutdown_requested; // 全局线程控制标记
+extern volatile sig_atomic_t g_running; // 全局线程控制标记
 extern uint32_t g_total_cleaned_conn; // 全局累计清理连接数
 extern pthread_t g_aging_tid; // 全局老化线程ID
 
