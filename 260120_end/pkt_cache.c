@@ -1373,31 +1373,3 @@ int connection_aging_global_resource_release(void) {
     return ret;
 }
 
-/**
- * @brief 备用函数：遍历单个哈希桶，将空闲条目标记为valid=0
- * @param bucket_idx 哈希桶索引
- * @return 标记的条目数量
- */
-int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx) {
-    if (bucket_idx >= CONN_BUCKET_COUNT || g_conn_buckets == NULL) {
-        return 0;
-    }
-
-    int marked_count = 0;
-    struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
-    uint32_t curr_time = time(NULL);
-
-    // 加写锁：修改entry的valid属性需独占访问
-    pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
-    while (curr != NULL) {
-        if ((curr_time - curr->cache_array->last_active_stamp) >
-            CONN_IDLE_EXPIRE_THRESHOLD) {
-            curr->valid = 0;
-            marked_count++;
-        }
-        curr = curr->next;
-    }
-    pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
-
-    return marked_count;
-}
