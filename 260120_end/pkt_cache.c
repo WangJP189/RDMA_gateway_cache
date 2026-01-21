@@ -760,6 +760,40 @@ void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
     }
 }
 
+// 辅助函数：重新查找当前连接中有效的最小PSN（修正失效的start_psn）
+uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
+    if (!conn || !conn->ring_buf) {
+        return PSN_INVALID;
+    }
+
+    uint32_t min_psn = PSN_INVALID;
+    // 遍历整个环形缓冲区，查找所有有效数据块
+    for (int i = 0; i < conn->array_length; i++) {
+        if (conn->ring_buf[i] == 0) {
+            continue; // 空位置跳过
+        }
+
+        struct mem_block_header *hdr =
+            (struct mem_block_header *)(uintptr_t)conn->ring_buf[i];
+        if (!hdr) {
+            continue;
+        }
+
+        uint32_t curr_psn = hdr->psn;
+        // 第一次找到有效PSN，直接赋值
+        if (min_psn == PSN_INVALID) {
+            min_psn = curr_psn;
+        } else {
+            // 环形语境下比较，找到更小的PSN
+            if (psn_less_than(curr_psn, min_psn)) {
+                min_psn = curr_psn;
+            }
+        }
+    }
+
+    return min_psn;
+}
+
 //====================缓存数据包相关函数=====================
 
 // 将数据包存入连接缓存结构体
@@ -856,11 +890,25 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     // 更新连接的PSN参数（仅处理PSN物理回绕场景）
     // 处理start_psn：初始状态 或 物理回绕后更小的PSN
     if (conn->start_psn == PSN_INVALID) {
-        // 初始状态，直接赋值
+        // 初始状态，直接赋值（此时psn对应索引一定有数据，因为刚缓存）
         conn->start_psn = psn;
-    } else if (psn_less_than(psn, conn->start_psn)) {
-        // 仅当PSN不回绕&&psn<start_psn，才更新start_psn
-        conn->start_psn = psn;
+    } else {
+        // 仅当新PSN更小，且对应的索引有数据时，才更新start_psn
+        if (psn_less_than(psn, conn->start_psn)) {
+            uint32_t new_psn_idx = psn % RING_BUFFER_SIZE;
+            // 校验新PSN对应索引有有效数据（刚缓存的包一定有，这里做防御性校验）
+            if (conn->ring_buf[new_psn_idx] != 0) {
+                struct mem_block_header *new_hdr =
+                    (struct mem_block_header *)(uintptr_t)
+                        conn->ring_buf[new_psn_idx];
+                if (new_hdr->psn == psn) { // 确保PSN匹配，防止串包
+                    conn->start_psn = psn;
+                    printf(
+                        "[CACHE] 更新start_psn为0x%06X（更小且有有效数据）\n",
+                        psn);
+                }
+            }
+        }
     }
 
     // 处理end_psn：初始状态 或 物理回绕后更大的PSN
@@ -961,34 +1009,43 @@ void age_expired_packets(struct connection_cache_array *conn) {
 
     uint32_t start_psn = conn->start_psn;
     uint32_t ring_idx = start_psn % RING_BUFFER_SIZE;
+    struct mem_block_header *pkt_header = NULL;
 
-    // 关键修复：校验ring_buf[ring_idx]是否为空（无数据）
+    // 校验1：ring_buf对应索引无数据 → 重置PSN参数并退出
     if (conn->ring_buf[ring_idx] == 0) {
         printf("[WARN] 老化处理：start_psn=0x%06X 对应ring_buf索引=%u "
-               "无数据，跳过老化\n",
+               "无数据，重置PSN参数\n",
                start_psn, ring_idx);
+        conn->start_psn = PSN_INVALID;
+        conn->end_psn = PSN_INVALID;
+        conn->cur_psn = 0;
         return;
     }
 
-    // 强转后再次校验（防止野指针）
-    struct mem_block_header *pkt_header =
-        (struct mem_block_header *)(uintptr_t)conn->ring_buf[ring_idx];
+    // 强转后校验2：内存块为空 → 重置PSN参数并退出
+    pkt_header = (struct mem_block_header *)(uintptr_t)conn->ring_buf[ring_idx];
     if (pkt_header == NULL) {
-        printf("[WARN] 老化处理：start_psn=0x%06X 对应内存块为空，跳过老化\n",
-               start_psn);
+        printf(
+            "[WARN] 老化处理：start_psn=0x%06X 对应内存块为空，重置PSN参数\n",
+            start_psn);
+        conn->start_psn = PSN_INVALID;
+        conn->end_psn = PSN_INVALID;
+        conn->cur_psn = 0;
         return;
     }
 
-    // 严谨性校验：PSN一致性检查
+    // 校验3：PSN一致性不匹配 → 重置PSN参数并退出
     if (pkt_header->psn != start_psn) {
         printf("[WARN] 老化处理：start_psn=0x%06X 与内存块PSN=0x%06X "
-               "不一致，跳过老化\n",
+               "不一致，重置PSN参数\n",
                start_psn, pkt_header->psn);
+        conn->start_psn = PSN_INVALID;
+        conn->end_psn = PSN_INVALID;
+        conn->cur_psn = 0;
         return;
     }
 
-    // 修复宏定义单位问题：统一为毫秒级比较
-    // 先确保PACKET_AGE_CHECK_INTERVAL是毫秒级（5秒=5000ms）
+    // 校验4：未达到老化阈值 → 跳过
     if ((cur_stamp - pkt_header->recv_stamp) < PACKET_AGE_CHECK_INTERVAL) {
         printf(
             "[DEBUG] 老化处理：start_psn=0x%06X 未达到老化阈值，当前时间=%lu "
@@ -998,6 +1055,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
         return;
     }
 
+    // 触发老化清理
     printf("[INFO] 老化处理：start_psn=0x%06X 数据包已超时（当前=%lu "
            "ms/缓存=%lu ms），开始执行数据包老化清理\n",
            start_psn, cur_stamp, pkt_header->recv_stamp);
@@ -1342,65 +1400,4 @@ int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx) {
     pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
 
     return marked_count;
-}
-
-/**
- * @brief 备用函数：遍历单个哈希桶，清理所有valid=0的connection_entry
- * @param bucket_idx 哈希桶索引
- * @return 清理的条目数量
- */
-static int connection_bucket_clean_invalid(uint32_t bucket_idx) {
-    if (bucket_idx >= CONN_BUCKET_COUNT || g_conn_buckets == NULL) {
-        return 0;
-    }
-
-    int cleaned_count = 0;
-    struct connection_entry *prev = NULL;
-    struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
-
-    pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
-    while (curr != NULL) {
-        if (curr->valid == 0) {
-            struct connection_entry *to_delete = curr;
-
-            // 调整链表指针（保证连贯性）
-            if (prev == NULL) {
-                g_conn_buckets[bucket_idx].head = curr->next;
-            } else {
-                prev->next = curr->next;
-            }
-
-            // 移动当前指针
-            curr = curr->next;
-
-            // 释放资源（解锁后操作）
-            pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
-            free_connection_entry(to_delete);
-            pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
-
-            cleaned_count++;
-        } else {
-            prev = curr;
-            curr = curr->next;
-        }
-    }
-    pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
-
-    return cleaned_count;
-}
-
-/**
- * @brief 备用函数：遍历所有哈希桶，清理所有valid=0的connection_entry
- * @return 总清理条目数量
- */
-int connection_global_clean_invalid() {
-    int total_cleaned = 0;
-    if (g_conn_buckets == NULL) {
-        return 0;
-    }
-
-    for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
-        total_cleaned += connection_bucket_clean_invalid(i);
-    }
-    return total_cleaned;
 }

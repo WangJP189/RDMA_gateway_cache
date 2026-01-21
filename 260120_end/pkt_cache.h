@@ -11,9 +11,9 @@
 // #include <bits/pthreadtypes.h>
 
 // 大小定义
-#define RING_BUFFER_SIZE 10240 // 环形数组大小（存储内存首地址）
-#define TABLE_SIZE 2048        // 表大小
-#define MEM_BLOCK_SIZE 5120    // 固定5KB内存块大小
+#define RING_BUFFER_SIZE 102400 // 环形数组大小（存储内存首地址）
+#define TABLE_SIZE 2048         // 表大小
+#define MEM_BLOCK_SIZE 5120     // 固定5KB内存块大小
 
 // PSN定义，解决end_psn<start_psn的问题
 #define PSN_MASK 0xFFFFFF       // 24位PSN掩码（0~16777215）
@@ -23,15 +23,16 @@
 
 // 超时定义
 #define TIME_STAMP_UNIT_MS 1             // 时间戳单位：毫秒
-#define CONN_IDLE_EXPIRE_THRESHOLD 30000 // 连接老化阈值（30000ms）
-#define PACKET_AGE_THRESHOLD 60          // 数据包最大老化时间（毫秒）
-#define PACKET_AGE_CHECK_INTERVAL 5      // 报文老化检查间隔
-#define AGE_THREAD_SLEEP_INTERVAL 10     // 全局老化线程休眠间隔（10秒）
-#define GLOBAL_AGE_BATCH_SIZE 100        // 全局老化分批次遍历大小
-#define CONN_AGE_PER_BUCKET_DELAY 500    // 每个桶老化后延时（微秒）
+#define CONN_IDLE_EXPIRE_THRESHOLD 30000 // 连接老化阈值（毫秒）
+#define PACKET_AGE_THRESHOLD 5           // 数据包最大老化时间（毫秒）
+#define PACKET_AGE_CHECK_INTERVAL 5      // 报文老化检查间隔（毫秒）
+#define AGE_THREAD_SLEEP_INTERVAL 10000  // 全局老化线程休眠间隔（毫秒）
+#define CONN_AGE_PER_BUCKET_DELAY 500 // 每个桶老化后延时（微秒）
 
 // 全局哈希桶定义
-#define CONN_BUCKET_COUNT 1024 // 哈希桶总数
+#define CONN_BUCKET_COUNT 1024    // 哈希桶总数
+#define GLOBAL_AGE_BATCH_SIZE 100 // 全局老化分批次遍历大小（无单位）
+
 extern struct connection_bucket *g_conn_buckets;
 extern volatile sig_atomic_t g_running; // 全局线程控制标记
 extern uint32_t g_total_cleaned_conn;   // 全局累计清理连接数
@@ -279,5 +280,8 @@ int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
 // 二分法处理PSN老化（回绕+查找+判断+批量清理全流程）
 void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
                     uint32_t end_psn, uint64_t current_timestamp_ms);
+
+// 查找连接缓存中的最小有效PSN
+uint32_t find_valid_min_psn(struct connection_cache_array *conn);
 
 #endif

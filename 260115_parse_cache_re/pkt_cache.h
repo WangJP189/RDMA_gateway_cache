@@ -10,7 +10,7 @@
 // #include <bits/pthreadtypes.h>
 
 //大小定义
-#define     RING_BUFFER_SIZE    10240      // 环形数组大小（存储内存首地址）
+#define     RING_BUFFER_SIZE    102400      // 环形数组大小（存储内存首地址）
 #define     TABLE_SIZE          2048        // 表大小
 #define MEM_BLOCK_SIZE 5120        // 固定5KB内存块大小
 
@@ -23,7 +23,7 @@
 // 超时定义
 #define TIME_STAMP_UNIT_MS     1          // 时间戳单位：毫秒
 #define CONN_IDLE_EXPIRE_THRESHOLD  30000   // 连接老化阈值（30000ms）
-#define PACKET_AGE_THRESHOLD 60    // 数据包最大老化时间（毫秒）
+#define PACKET_AGE_THRESHOLD 10    // 数据包最大老化时间（毫秒）
 #define PACKET_AGE_CHECK_INTERVAL    5       // 报文老化检查间隔
 #define AGE_THREAD_SLEEP_INTERVAL          10       // 全局老化线程休眠间隔（10秒）
 #define GLOBAL_AGE_BATCH_SIZE  100        // 全局老化分批次遍历大小
