@@ -690,7 +690,7 @@ int is_packet_lost(struct connection_cache_array *conn, uint32_t psn) {
     uint32_t psn_masked = psn & PSN_MASK;
     int ring_index = psn_masked % RING_BUFFER_SIZE;
     // 判断标准：缓存数组中对应位置为空或者当前数缓存报文的psn和真实psn不相等，则视为丢包
-    if (conn->ring_buf[ring_index] == NULL) {
+    if (conn->ring_buf[ring_index] == 0) {
         return 1; // 丢包
     } else {
         // 存在缓存数据，需要判断PSN是否匹配
@@ -703,7 +703,7 @@ int is_packet_lost(struct connection_cache_array *conn, uint32_t psn) {
             // PSN不匹配，视为丢包
             // 释放对应内存块,并将缓存位置设为NULL
             free(mem_block);
-            conn->ring_buf[ring_index] = NULL;
+            conn->ring_buf[ring_index] = 0;
             return 1;
         }
         return 0; // 未丢包
@@ -1089,7 +1089,7 @@ void retransmit_latest_one_packet(struct connection_cache_array *conn,
                                    interface_name, header->psn, src_qp);
             printf("[GBN_RETRANSMIT] 重传PSN=%u | 环形数组索引=%d | "
                    "内存块地址=0x%lx\n",
-                   psn, ring_index, packet_data);
+                   psn, ring_index, (uintptr_t)packet_data);
             break; // 只重传第1个缓存报文
         }
     }
@@ -1137,7 +1137,7 @@ int dst_gateway_gbn_retransmit(struct connection_cache_array *conn,
             retransmit_count++;
             printf("[GBN_RETRANSMIT] 重传PSN=%u | 环形数组索引=%d | "
                    "内存块地址=0x%lx\n",
-                   psn, ring_index, packet_data);
+                   psn, ring_index, (uintptr_t)packet_data);
         }
     }
     if (loss_packet_found) {
@@ -1247,7 +1247,7 @@ void handle_sr_requests() {
     // 根据实际情况设置接口名称
     char src_sr_interface_name[IF_NAMESIZE];
     memcpy(src_sr_interface_name, g_src_sr_interface_name, IF_NAMESIZE);
-    int client_fd;
+    int client_fd = -1;
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     size_t buffer_size =
@@ -1580,7 +1580,7 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
     // RDMA的NAK报文中的PSN才表示下一个期待的PSN，因为该PSN未被接收处理
     // 基于网关角色进行不同的操作
     if (reverse_role == dst_gateway) {
-        printf("[NACK] DESTINATION_GATEWAY收到NACK: src_ip=%s, dst_ip=%s, "
+        printf("[NACK] DESTINATION_GATEWAY收到NACK: src_ip=%u, dst_ip=%u, "
                "dest_qp=%u, nack_epsn=%u\n",
                key.src_ip, key.dst_ip, key.dst_qp, nack_epsn);
         // interface_name应为目的网关对应的接口
@@ -1603,16 +1603,16 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
         if (is_packet_lost(cache_array, nack_epsn)) {
             // 不存在，发起SR重传请求
             // 目的网关没有nack_epsn对应的数据包，发起SR重传请求给源网关
-            printf("[SR_REQUEST] 目的网关发起SR重传请求给源网关: src_ip=%s, "
-                   "dst_ip=%s, qp=%u\n",
+            printf("[SR_REQUEST] 目的网关发起SR重传请求给源网关: src_ip=%u, "
+                   "dst_ip=%u, qp=%u\n",
                    key.dst_ip, key.src_ip, key.src_qp);
             // 原始顺序，源目的需要交换
             send_sr_request_to_src_gateway(key, cache_array);
         } else {
             // 存在，进行GBN重传
             // 目的网关有nack_epsn对应的数据包，进行GBN重传
-            printf("[GBN_RETRANSMIT] 目的网关进行GBN重传: src_ip=%s, "
-                   "dst_ip=%s, qp=%u\n",
+            printf("[GBN_RETRANSMIT] 目的网关进行GBN重传: src_ip=%u, "
+                   "dst_ip=%u, qp=%u\n",
                    key.src_ip, key.dst_ip, key.dst_qp);
             int retransmit_count = dst_gateway_gbn_retransmit(
                 cache_array, dst_gbn_interface_name, nack_epsn, key.src_qp);
@@ -1626,7 +1626,7 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
             }
         }
     } else { // 源网关
-        printf("[NACK] SOURCE_GATEWAY收到NACK: src_ip=%s, dst_ip=%s, "
+        printf("[NACK] SOURCE_GATEWAY收到NACK: src_ip=%u, dst_ip=%u, "
                "dest_qp=%u, nack_epsn=%u\n",
                key.src_ip, key.dst_ip, key.dst_qp, nack_epsn);
 

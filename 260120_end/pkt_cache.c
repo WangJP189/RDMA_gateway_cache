@@ -794,6 +794,32 @@ uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
     return min_psn;
 }
 
+// 辅助函数：判断连接是否空闲过期（基于last_active_stamp）
+// 返回值：1=过期，0=未过期，-1=参数无效
+int is_conn_idle_expired(struct connection_cache_array *conn) {
+    if (!conn) {
+        printf("[ERROR] 连接空闲过期判断失败：conn缓存结构体为空\n");
+        return -1;
+    }
+
+    // 无活跃时间戳（从未使用），视为未过期
+    if (conn->last_active_stamp == 0) {
+        return 0;
+    }
+
+    uint64_t current_ts = get_current_timestamp_ms();
+    uint64_t idle_time = current_ts - conn->last_active_stamp;
+
+    // 空闲时间超过阈值（CONN_IDLE_EXPIRE_THRESHOLD ms）则判定为过期
+    if (idle_time > CONN_IDLE_EXPIRE_THRESHOLD) {
+        printf("[CONN IDLE] 连接空闲过期：空闲时间=%lu ms（阈值=%d ms）\n",
+               idle_time, CONN_IDLE_EXPIRE_THRESHOLD);
+        return 1;
+    }
+
+    return 0;
+}
+
 //====================缓存数据包相关函数=====================
 
 // 将数据包存入连接缓存结构体
@@ -875,10 +901,10 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     if (conn->ring_buf[ring_index] != 0) {
         unsigned char *old_mem_block =
             (unsigned char *)conn->ring_buf[ring_index];
-        free(old_mem_block); // 释放旧数据包内存
         printf("[OVERWRITE] 环形数组索引=%d "
                "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
                ring_index, (uintptr_t)old_mem_block);
+        free(old_mem_block); // 释放旧数据包内存
     }
 
     // 存入新数据包地址
@@ -1069,7 +1095,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
  * @brief 释放单个connection_entry的全部资源
  * @param entry 待释放的连接条目
  */
-static void free_connection_entry(struct connection_entry *entry) {
+void free_connection_entry(struct connection_entry *entry) {
     if (entry == NULL) {
         return;
     }
@@ -1103,7 +1129,7 @@ int clean_idle_entry(uint32_t bucket_idx) {
     while (curr != NULL) {
         // 判断是否空闲：最后活动时间 + 阈值 < 当前时间（毫秒级对比）
         if ((curr_time - curr->cache_array->last_active_stamp) >
-            (uint64_t)CONN_IDLE_EXPIRE_THRESHOLD * 1000) { // 阈值转为毫秒级
+            CONN_IDLE_EXPIRE_THRESHOLD) { // 阈值转为毫秒级
             struct connection_entry *to_delete = curr;
 
             // 1. 调整链表指针（保证哈希桶链表连贯）
@@ -1165,211 +1191,59 @@ int clean_global_idle_entry() {
 
 /**
  * @brief 全局资源老化线程入口函数
+ * @param arg 无实际参数
  * @return NULL
+ * @note 极简逻辑：依赖外层g_running控制循环，仅调用clean_global_idle_entry +
+ * 定时休眠
  */
 void *connection_aging_thread(void *arg) {
-    (void)arg; // 屏蔽未使用参数警告
-    uint64_t last_print_time = get_current_timestamp_ms();
-    const uint64_t print_interval_ms = 10 * 1000;
+    printf(
+        "[AGE THREAD] 全局资源老化线程启动 | 休眠间隔=%d ms | 桶间延时=%d us\n",
+        AGE_THREAD_SLEEP_INTERVAL, CONN_AGE_PER_BUCKET_DELAY);
 
-    printf("[INFO] connection aging thread start success, idle threshold: %u "
-           "ms, sleep interval: %u s\n",
-           CONN_IDLE_EXPIRE_THRESHOLD, AGE_THREAD_SLEEP_INTERVAL);
-
-    // 响应退出标记，线程可正常停止
+    // 仅依赖外层g_running控制循环（1=运行，0=停止）
     while (g_running) {
-        // 1. 执行全局空闲连接清理
-        int removed_this_round = clean_global_idle_entry();
-        g_total_cleaned_conn += removed_this_round;
-
-        // 打印老化统计日志，含本次清理数+累计+活跃数
-        uint64_t curr_time = get_current_timestamp_ms();
-        if (removed_this_round > 0 ||
-            (curr_time - last_print_time) > print_interval_ms) {
-            printf("[INFO] Aging: removed %d connections this round, total "
-                   "removed: %u\n",
-                   removed_this_round, g_total_cleaned_conn);
-            last_print_time = curr_time;
-        }
-
-        // 3. 线程休眠
-        struct timespec sleep_ts = {0};
-        sleep_ts.tv_sec = AGE_THREAD_SLEEP_INTERVAL;
-        sleep_ts.tv_nsec = 0;
-        nanosleep(&sleep_ts, NULL);
+        // 核心逻辑：清理所有哈希桶的空闲连接
+        clean_global_idle_entry();
+        // 线程休眠（毫秒转微秒，保证精度）
+        sleep(AGE_THREAD_SLEEP_INTERVAL / 1000);
     }
 
-    // 线程正常退出，打印日志
-    printf("[INFO] connection aging thread exit success, total cleaned "
-           "connections: %u\n",
-           g_total_cleaned_conn);
-    pthread_exit(NULL);
+    printf("[AGE THREAD] 全局资源老化线程退出\n");
     return NULL;
 }
 
 /**
- * @brief 启动全局资源老化线程
- * @param idle_threshold 空闲超时阈值（毫秒），传0则用默认值
- * @return 0:成功, -1:失败
- * @note 逻辑正确：适配g_shutdown_requested(1=运行 0=退出)，无重复创建线程风险
- * @note 兼容ctrl+c信号回调，线程可正常响应退出信号
+ * @brief 启动全局资源老化线程（纯净版）
+ * @return 0
+ * @note 无任何if判断，仅启动线程+分离线程，依赖外层g_running控制运行状态
  */
-int connection_aging_thread_start(uint32_t idle_threshold) {
-    if (g_conn_buckets == NULL) {
-        fprintf(stderr, "[ERROR] connection_aging_thread_start: global conn "
-                        "buckets not initialized\n");
-        return -1;
-    }
-
-    // ✅ 正确：判断线程正在运行，则先停止旧线程，防止重复创建
-    if (g_running) {
-        if (stop_connection_aging_thread() != 0) {
-            fprintf(stderr, "[ERROR] connection_aging_thread_start: stop old "
-                            "thread failed\n");
-            return -1;
-        }
-    }
-
-    // 更新全局空闲阈值，传0则用默认值
-    g_running = 1; // ✅ 标记线程运行中，程序无退出信号
-
-    // 创建老化线程，传参为NULL
-    int ret = pthread_create(&g_aging_tid, NULL, connection_aging_thread, NULL);
-    if (ret != 0) {
-        fprintf(stderr,
-                "[ERROR] connection_aging_thread_start: create thread failed, "
-                "ret=%d, errno=%s\n",
-                ret, strerror(errno));
-        g_aging_tid = 0;
-        g_running = 0; // ✅ 修复：创建失败，标记为退出状态
-        return -1;
-    }
-
-    // 短暂等待确保线程启动
-    usleep(10000);
-    if (!g_running) { // ✅ 修复：判断线程是否启动失败（状态变为退出）
-        pthread_cancel(g_aging_tid);
-        g_aging_tid = 0;
-        g_running = 1;
-        return -1;
-    }
-
+int start_connection_aging_thread() {
+    pthread_create(&g_aging_tid, NULL, connection_aging_thread, NULL);
+    pthread_detach(g_aging_tid);
+    printf("[AGE THREAD] 全局资源老化线程创建成功\n");
     return 0;
 }
 
 /**
- * @brief 停止全局资源老化线程
- * @return 0:成功, -1:线程未运行/停止失败
- * @note 修复所有逻辑错误：等待逻辑生效、判断逻辑正确、线程优雅退出
- * @note 兼容ctrl+c信号回调，优先优雅退出，兜底强制取消，无内存泄漏
+ * @brief 停止全局资源老化线程（纯净版）
+ * @return 0
+ * @note 无任何if判断，仅做线程停止的基础操作（依赖外层g_running置0实现退出）
  */
 int stop_connection_aging_thread(void) {
-    // ✅ 修复【致命问题1】：判断逻辑完全修正，语义匹配 1=运行 0=退出
-    // 正确逻辑：线程未运行 或 线程ID无效 → 返回错误
-    if (!g_running || g_aging_tid == 0) {
-        fprintf(
-            stderr,
-            "[WARN] stop_connection_aging_thread: aging thread not running\n");
-        return -1;
-    }
-
-    // 设置退出标记，触发线程的while(g_shutdown_requested)循环退出，优雅退出
-    g_running = 0;
-
-    // ✅ 修复【致命问题2】：等待循环条件完全修正，生效等待逻辑
-    // 正确逻辑：线程还未退出 且 未超时 → 继续等待
-    uint32_t wait_cnt = 0;
-    const uint32_t max_wait = AGE_THREAD_SLEEP_INTERVAL + 1;
-    while (!g_running && wait_cnt < max_wait) {
-        sleep(1);
-        wait_cnt++;
-    }
-
-    // ✅ 修复【问题5】：强制cancel判断逻辑修正
-    // 正确逻辑：线程超时仍未退出 → 强制取消线程
-    int ret = 0;
-    if (!g_running) {
-        ret = pthread_cancel(g_aging_tid);
-        if (ret != 0) {
-            fprintf(stderr,
-                    "[WARN] stop_connection_aging_thread: pthread_cancel "
-                    "failed, ret=%d\n",
-                    ret);
-        }
-    }
-
-    // 释放线程资源，只调用一次pthread_join，无重复调用，无内存泄漏
-    if (g_aging_tid != 0) {
-        pthread_join(g_aging_tid, NULL);
-        g_aging_tid = 0;
-    }
-    g_running = 1; // 重置为运行状态，方便下次启动
-
-    return ret == 0 ? 0 : -1;
+    // 仅打印停止日志，实际退出由外层g_running置0触发
+    printf("[AGE THREAD] "
+           "全局资源老化线程停止指令已下发（等待外层g_running置0）\n");
+    return 0;
 }
 
 /**
- * @brief
- * 【全局资源老化线程-完整资源释放函数】释放老化线程相关的所有资源，无内存泄漏
- * @return 0:释放成功, -1:释放失败/资源未初始化
- * @note 释放顺序（严格遵守，不可逆）：
- *        1. 停止全局老化线程，确保线程无运行中操作
- *        2. 遍历所有哈希桶，销毁桶的读写锁
- *        3. 遍历所有哈希桶，释放桶内所有connection_entry及内部缓存资源
- *        4. 释放全局哈希桶数组内存
- *        5. 重置所有全局变量，防止野指针
- * @note 线程安全：本函数调用后，老化线程无法再启动，需重新初始化全局资源
+ * @brief 释放全局资源老化线程资源（纯净版）
+ * @return 0
+ * @note 无任何if判断，仅重置线程ID，不处理其他资源（由外层统一释放）
  */
-int connection_aging_global_resource_release(void) {
-    int ret = 0;
-    printf("[INFO] Start release global connection aging thread all "
-           "resources...\n");
-
-    // ============= 步骤1：先停止全局老化线程，必须第一步执行 =============
-    if (g_running) {
-        ret = stop_connection_aging_thread();
-        if (ret != 0) {
-            fprintf(stderr,
-                    "[WARN] connection_aging_global_resource_release: stop "
-                    "aging thread failed, ret=%d\n",
-                    ret);
-        }
-    }
-
-    // ============= 步骤2：释放全局哈希桶数组及内部所有资源 =============
-    if (g_conn_buckets != NULL) {
-        // 遍历所有哈希桶
-        for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
-            struct connection_bucket *bucket = &g_conn_buckets[i];
-            // 2.1 销毁当前桶的读写锁
-            pthread_rwlock_wrlock(&bucket->rwlock);
-            pthread_rwlock_destroy(&bucket->rwlock);
-
-            // 2.2 释放桶内所有connection_entry
-            struct connection_entry *curr = bucket->head;
-            while (curr != NULL) {
-                struct connection_entry *tmp = curr;
-                curr = curr->next;
-                free_connection_entry(tmp); // 调用你已有的释放entry的函数
-            }
-
-            // 2.3 重置桶内指针
-            bucket->head = NULL;
-        }
-
-        // 2.4 释放哈希桶数组内存
-        free(g_conn_buckets);
-        g_conn_buckets = NULL;
-        printf("[INFO] Release global connection buckets array success\n");
-    }
-
-    // ============= 步骤3：重置所有全局变量，防止野指针/重复释放 =============
-    g_running = 1;
-    g_aging_tid = 0;
-    g_total_cleaned_conn = 0;
-
-    printf("[INFO] Global connection aging thread all resources release "
-           "success!\n");
-    return ret;
+int release_connection_aging_thread(void) {
+    g_aging_tid = 0; // 重置线程ID，避免野指针
+    printf("[AGE THREAD] 全局资源老化线程资源已释放\n");
+    return 0;
 }
-

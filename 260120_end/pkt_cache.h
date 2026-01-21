@@ -239,7 +239,7 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn);
 void age_expired_packets(struct connection_cache_array *conn);
 
 // 释放单个连接条目及其资源（全局资源老化功能调用）
-static void free_connection_entry(struct connection_entry *entry);
+void free_connection_entry(struct connection_entry *entry);
 
 // 清理单个哈希桶中的空闲连接条目（全局资源老化功能调用）
 int clean_idle_entry(uint32_t bucket_idx);
@@ -247,21 +247,18 @@ int clean_idle_entry(uint32_t bucket_idx);
 // 清理全局空闲连接条目（全局资源老化线程调用）
 int clean_global_idle_entry();
 
-// 标记空闲连接为无效（全局资源老化线程调用）
-int connection_bucket_mark_idle_as_invalid(uint32_t bucket_idx);
-// 清理单个哈希桶valid=0的连接条目（全局资源老化线程调用）
-static int connection_bucket_clean_invalid(uint32_t bucket_idx);
-// 清理全局valid=0的连接条目（全局资源老化线程调用）
-int connection_global_clean_invalid();
 
 // 全局资源老化线程入口函数
 void *connection_aging_thread();
 
 // 启动全局资源老化线程
-int connection_aging_thread_start();
+int start_connection_aging_thread();
 
 // 停止全局资源老化线程
 int stop_connection_aging_thread(void);
+
+// 释放全局资源老化线程资源
+int release_connection_aging_thread(void);
 
 //======辅助函数=====
 // 获取当前系统的毫秒级时间戳
@@ -283,5 +280,8 @@ void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
 
 // 查找连接缓存中的最小有效PSN
 uint32_t find_valid_min_psn(struct connection_cache_array *conn);
+
+// 判断连接是否空闲超时
+int is_conn_idle_expired(struct connection_cache_array *conn);
 
 #endif
