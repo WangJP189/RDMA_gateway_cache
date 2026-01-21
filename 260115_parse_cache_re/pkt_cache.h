@@ -266,6 +266,7 @@ int batch_clean_psn_range(struct connection_cache_array* conn, uint32_t start, u
 //二分法处理PSN老化（回绕+查找+判断+批量清理全流程）
 void binary_age_psn(struct connection_cache_array* conn, uint32_t start_psn, uint32_t end_psn, uint64_t current_timestamp_ms);
 
-
+// 查找连接缓存中的最小有效PSN
+uint32_t find_valid_min_psn(struct connection_cache_array *conn);
 
 #endif

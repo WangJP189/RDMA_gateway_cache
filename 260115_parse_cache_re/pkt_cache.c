@@ -725,6 +725,39 @@ void binary_age_psn(struct connection_cache_array* conn,
     }
 }
 
+// 辅助函数：重新查找当前连接中有效的最小PSN（修正失效的start_psn）
+uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
+    if (!conn || !conn->ring_buf) {
+        return PSN_INVALID;
+    }
+
+    uint32_t min_psn = PSN_INVALID;
+    // 遍历整个环形缓冲区，查找所有有效数据块
+    for (int i = 0; i < conn->array_length; i++) {
+        if (conn->ring_buf[i] == 0) {
+            continue; // 空位置跳过
+        }
+
+        struct mem_block_header *hdr =
+            (struct mem_block_header *)(uintptr_t)conn->ring_buf[i];
+        if (!hdr) {
+            continue;
+        }
+
+        uint32_t curr_psn = hdr->psn;
+        // 第一次找到有效PSN，直接赋值
+        if (min_psn == PSN_INVALID) {
+            min_psn = curr_psn;
+        } else {
+            // 环形语境下比较，找到更小的PSN
+            if (psn_less_than(curr_psn, min_psn)) {
+                min_psn = curr_psn;
+            }
+        }
+    }
+
+    return min_psn;
+}
 
 //====================缓存数据包相关函数=====================
 
@@ -895,13 +928,15 @@ int clean_acked_packets(struct connection_cache_array* conn, uint32_t ack_msn) {
     return cleaned_count;
 }
 
-
 /**
  * @brief 独立完整的连接级数据包老化函数（无返回值，所有老化逻辑全内聚）
  * @param conn 连接缓存结构体
- * @note 1. 老化触发规则：若start_psn的数据包recv_stamp超时 → 执行老化；否则跳过，无定时检查逻辑
- * @note 2. 所有老化相关日志全部内聚在 binary_age_psn 函数中，本函数仅做「触发判断+调用执行」
- * @note 3. 上层调用仅需一行age_expired_packets(conn)，无任何其他老化相关代码/打印
+ * @note 1. 老化触发规则：若start_psn的数据包recv_stamp超时 →
+ * 执行老化；否则跳过，无定时检查逻辑
+ * @note 2. 所有老化相关日志全部内聚在 binary_age_psn
+ * 函数中，本函数仅做「触发判断+调用执行」
+ * @note 3.
+ * 上层调用仅需一行age_expired_packets(conn)，无任何其他老化相关代码/打印
  * @note 4. 自动兼容PSN回绕、全量老化、部分老化、无过期等所有场景，无冗余判断
  */
 void age_expired_packets(struct connection_cache_array *conn) {
@@ -929,34 +964,43 @@ void age_expired_packets(struct connection_cache_array *conn) {
 
     uint32_t start_psn = conn->start_psn;
     uint32_t ring_idx = start_psn % RING_BUFFER_SIZE;
+    struct mem_block_header *pkt_header = NULL;
 
-    // 关键修复：校验ring_buf[ring_idx]是否为空（无数据）
+    // 校验1：ring_buf对应索引无数据 → 重置PSN参数并退出
     if (conn->ring_buf[ring_idx] == 0) {
         printf("[WARN] 老化处理：start_psn=0x%06X 对应ring_buf索引=%u "
-               "无数据，跳过老化\n",
+               "无数据，重置PSN参数\n",
                start_psn, ring_idx);
+        conn->start_psn = PSN_INVALID;
+        conn->end_psn = PSN_INVALID;
+        conn->cur_psn = 0;
         return;
     }
 
-    // 强转后再次校验（防止野指针）
-    struct mem_block_header *pkt_header =
-        (struct mem_block_header *)(uintptr_t)conn->ring_buf[ring_idx];
+    // 强转后校验2：内存块为空 → 重置PSN参数并退出
+    pkt_header = (struct mem_block_header *)(uintptr_t)conn->ring_buf[ring_idx];
     if (pkt_header == NULL) {
-        printf("[WARN] 老化处理：start_psn=0x%06X 对应内存块为空，跳过老化\n",
-               start_psn);
+        printf(
+            "[WARN] 老化处理：start_psn=0x%06X 对应内存块为空，重置PSN参数\n",
+            start_psn);
+        conn->start_psn = PSN_INVALID;
+        conn->end_psn = PSN_INVALID;
+        conn->cur_psn = 0;
         return;
     }
 
-    // 严谨性校验：PSN一致性检查
+    // 校验3：PSN一致性不匹配 → 重置PSN参数并退出
     if (pkt_header->psn != start_psn) {
         printf("[WARN] 老化处理：start_psn=0x%06X 与内存块PSN=0x%06X "
-               "不一致，跳过老化\n",
+               "不一致，重置PSN参数\n",
                start_psn, pkt_header->psn);
+        conn->start_psn = PSN_INVALID;
+        conn->end_psn = PSN_INVALID;
+        conn->cur_psn = 0;
         return;
     }
 
-    // 修复宏定义单位问题：统一为毫秒级比较
-    // 先确保PACKET_AGE_CHECK_INTERVAL是毫秒级（5秒=5000ms）
+    // 校验4：未达到老化阈值 → 跳过
     if ((cur_stamp - pkt_header->recv_stamp) < PACKET_AGE_CHECK_INTERVAL) {
         printf(
             "[DEBUG] 老化处理：start_psn=0x%06X 未达到老化阈值，当前时间=%lu "
@@ -966,6 +1010,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
         return;
     }
 
+    // 触发老化清理
     printf("[INFO] 老化处理：start_psn=0x%06X 数据包已超时（当前=%lu "
            "ms/缓存=%lu ms），开始执行数据包老化清理\n",
            start_psn, cur_stamp, pkt_header->recv_stamp);
