@@ -24,14 +24,14 @@
 // 超时定义
 #define TIME_STAMP_UNIT_MS 1             // 时间戳单位：毫秒
 #define CONN_IDLE_EXPIRE_THRESHOLD 30000 // 连接老化阈值（毫秒）
-#define PACKET_AGE_THRESHOLD 5           // 数据包最大老化时间（毫秒）
+#define PACKET_AGE_THRESHOLD 60           // 数据包最大老化时间（毫秒）
 #define PACKET_AGE_CHECK_INTERVAL 5      // 报文老化检查间隔（毫秒）
 #define AGE_THREAD_SLEEP_INTERVAL 10000  // 全局老化线程休眠间隔（毫秒）
 #define CONN_AGE_PER_BUCKET_DELAY 500 // 每个桶老化后延时（微秒）
 
 // 全局哈希桶定义
 #define CONN_BUCKET_COUNT 1024    // 哈希桶总数
-#define GLOBAL_AGE_BATCH_SIZE 100 // 全局老化分批次遍历大小（无单位）
+#define GLOBAL_AGE_BATCH_SIZE 100 // 全局老化分批次遍历大小
 
 extern struct connection_bucket *g_conn_buckets;
 extern volatile sig_atomic_t g_running; // 全局线程控制标记

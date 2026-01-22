@@ -1102,7 +1102,7 @@ int clean_global_idle_entry() {
     return total_cleaned;
 }
 
-//==================全局资源老化功能（未完善）==================
+//==================全局资源老化线程==================
 
 // 全局资源老化线程函数
 void *connection_aging_thread(void *arg) {
@@ -1125,14 +1125,14 @@ void *connection_aging_thread(void *arg) {
 // 启动全局资源老化线程
 void start_connection_aging_thread() {
     pthread_create(&g_aging_tid, NULL, connection_aging_thread, NULL);
-    pthread_detach(g_aging_tid);
     printf("[AGE THREAD] 全局资源老化线程创建成功\n");
     return;
 }
 
 // 停止全局资源老化线程
 void stop_connection_aging_thread(void) {
-    // 仅打印停止日志，实际退出由外层g_running置0触发
+
+    pthread_join(g_aging_tid, NULL);
     printf("[AGE THREAD] "
            "全局资源老化线程停止指令已下发（等待外层g_running置0）\n");
     return;
