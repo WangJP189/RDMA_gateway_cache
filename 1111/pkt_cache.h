@@ -24,15 +24,15 @@
 // 超时定义
 #define TIME_STAMP_UNIT_MS 1             // 时间戳单位：毫秒
 #define CONN_IDLE_EXPIRE_THRESHOLD 30000 // 连接老化阈值（毫秒）
-#define PACKET_AGE_THRESHOLD 5           // 数据包最大老化时间（毫秒）
+#define PACKET_AGE_THRESHOLD 100         // 数据包最大老化时间（毫秒）
 #define PACKET_AGE_CHECK_INTERVAL 5      // 报文老化检查间隔（毫秒）
 #define AGE_THREAD_SLEEP_INTERVAL 10000  // 全局老化线程休眠间隔（毫秒）
 #define CONN_AGE_PER_BUCKET_DELAY 500    // 每个桶老化后延时（微秒）
 
 // 全局哈希桶定义
-#define CONN_BUCKET_COUNT 1024    // 哈希桶总数
-#define GLOBAL_AGE_BATCH_SIZE 100 // 全局老化分批次遍历大小（无单位）
+#define CONN_BUCKET_COUNT 1024 // 哈希桶总数
 
+// 全局变量声明
 extern struct connection_bucket *g_conn_buckets;
 extern volatile sig_atomic_t g_running; // 全局线程控制标记
 extern uint32_t g_total_cleaned_conn;   // 全局累计清理连接数
@@ -46,29 +46,18 @@ extern pthread_t g_aging_tid;           // 全局老化线程ID
 struct flow_key {
     uint32_t src_ip; // 源IP
     uint32_t dst_ip; // 目的IP
-    // uint16_t    src_port;       // 源端口
-    // uint16_t    dst_port;       // 目的端口
     uint32_t dst_qp; // 目的QP
     uint16_t pkey;   // 分区键
     uint16_t resv1;  // 字节对齐保留
     uint16_t resv2;  // 字节对齐保留
     uint16_t resv3;  // 字节对齐保留
-}; // UINT32/UINT16/UINT64等网络通讯时要用网络序，本机存储的时候要转换成本机序
+};
 
 enum gateway_role {
 
     src_gateway = 0,
     dst_gateway = 1
 };
-
-// ZPY
-// 重传类型枚举
-// typedef enum {
-//     RETRANSMIT_NONE = 0, // 未设置
-//     RETRANSMIT_SR = 1,   // SR重传
-//     RETRANSMIT_GBN = 2   // GBN重传
-// } retransmit_type;
-// ZPY
 
 // 流条目
 struct flow_entry {
@@ -84,8 +73,6 @@ struct flow_entry {
 struct connection_key {
     uint32_t src_ip; // 源IP
     uint32_t dst_ip; // 目的IP
-    // uint16_t    src_port;       // 源端口
-    // uint16_t    dst_port;       // 目的端口
     uint32_t src_qp; // 源QP
     uint32_t dst_qp; // 目的QP
     uint16_t pkey;   // 分区键
@@ -102,19 +89,14 @@ struct connection_cache_array {
     uint32_t end_psn;
     uint32_t cur_psn;
     uint64_t last_active_stamp; // 连接最后活动时间（收/发包）
-    // ZPY
-    // retransmit_type retransmit_type; // 重传类型
-    // ZPY
-    // pthread_rwlock_t    rwlock;             // 连接级读写锁
-}; // ring_buf需动态malloc，防止stack溢出
+};
 
 // 连接条目
 struct connection_entry {
     struct connection_key connection_key;
     struct connection_cache_array *cache_array;
     struct connection_entry *next; // 哈希冲突链表
-    // uint32_t    last_active_stamp; // 最后活动时间戳（秒级）
-    int valid; // 连接有效性（1=有效，0=无效）
+    int valid;                     // 连接有效性（1=有效，0=无效）
 };
 
 // 内存块头部控制信息（嵌入在5KB内存块的开头）
@@ -160,7 +142,7 @@ struct flow_entry *lookup_flow(const char *pkt_src_ip, const char *pkt_dst_ip,
                                uint32_t pkt_dst_qp, uint16_t pkt_pkey);
 
 // 销毁双向流表
-void destroy_flow_tables();
+void destroy_flow_tables(void);
 
 // 根据连接键删除对应的双向流条目
 void remove_flow_entry(struct connection_key key);
@@ -217,7 +199,7 @@ create_connection_cache(struct connection_bucket *bucket,
 void remove_connection_entry(struct connection_key key);
 
 // 销毁连接表
-void destroy_connection_table();
+void destroy_connection_table(void);
 
 // 释放连接缓存数组及其内存块
 void free_cache_array(struct connection_cache_array *cache);
@@ -246,19 +228,13 @@ void free_connection_entry(struct connection_entry *entry);
 int clean_idle_entry(uint32_t bucket_idx);
 
 // 清理全局空闲连接条目（全局资源老化线程调用）
-int clean_global_idle_entry();
+int clean_global_idle_entry(void);
 
-// 全局资源老化线程入口函数
-void *connection_aging_thread();
-
-// 启动全局资源老化线程
-void start_connection_aging_thread();
-
-// 停止全局资源老化线程
-void stop_connection_aging_thread();
-
-// 释放全局资源老化线程资源
-void release_connection_aging_thread();
+// 全局资源老化线程
+void *age_thread_proc();
+void start_age_thread(void);
+void stop_age_thread(void);
+void cleanup_age_resources(void);
 
 //======辅助函数=====
 // 获取当前系统的毫秒级时间戳

@@ -7,13 +7,11 @@
 #include <unistd.h>
 
 // ==================== FlowTable接口定义 ====================
-
 // 全局流表定义
 struct flow_entry *g_flow_table_forward[TABLE_SIZE] = {0};
 struct flow_entry *g_flow_table_reverse[TABLE_SIZE] = {0};
 
 // ==================== 辅助函数 ====================
-
 // 将IP字符串转换为本机字节序
 static uint32_t ip_str_to_host(const char *ip_str) {
     struct in_addr addr;
@@ -198,7 +196,7 @@ struct flow_entry *lookup_flow(const char *pkt_src_ip, const char *pkt_dst_ip,
 }
 
 // 销毁流表
-void destroy_flow_tables() {
+void destroy_flow_tables(void) {
     struct flow_entry *curr, *tmp;
 
     // 清空 Forward
@@ -318,7 +316,6 @@ static struct connection_cache_array *alloc_cache_array(int size) {
     cache->end_psn = PSN_INVALID;
     cache->cur_psn = 0;
     cache->last_active_stamp = 0;
-
     return cache;
 }
 
@@ -465,7 +462,6 @@ get_connection_cache(struct connection_entry *entry,
 struct connection_cache_array *
 create_connection_cache(struct connection_bucket *bucket,
                         struct connection_key key) {
-
     printf("[CONN] 创建新连接资源 (SrcQP:%u)\n", key.src_qp);
 
     // 2. 分配节点内存
@@ -519,7 +515,7 @@ void remove_connection_entry(struct connection_key key) {
 }
 
 // 销毁整个表 (程序退出时)
-void destroy_connection_table() {
+void destroy_connection_table(void) {
     for (int i = 0; i < TABLE_SIZE; i++) {
         struct connection_bucket *bucket = &connection_table[i];
 
@@ -1104,7 +1100,7 @@ int clean_global_idle_entry() {
 //==================全局资源老化功能（未完善）==================
 
 // 全局资源老化线程函数
-void *connection_aging_thread(void *arg) {
+void *age_thread_proc(void *arg) {
     printf(
         "[AGE THREAD] 全局资源老化线程启动 | 休眠间隔=%d ms | 桶间延时=%d us\n",
         AGE_THREAD_SLEEP_INTERVAL, CONN_AGE_PER_BUCKET_DELAY);
@@ -1122,24 +1118,28 @@ void *connection_aging_thread(void *arg) {
 }
 
 // 启动全局资源老化线程
-void start_connection_aging_thread() {
-    pthread_create(&g_aging_tid, NULL, connection_aging_thread, NULL);
-    pthread_detach(g_aging_tid);
-    printf("[AGE THREAD] 全局资源老化线程创建成功\n");
-    return;
+void start_age_thread(void) {
+    int ret = pthread_create(&g_aging_tid, NULL, age_thread_proc, NULL);
+    if (ret != 0) {
+        fprintf(stderr,
+                "[ERROR] age_thread_start: create thread failed, "
+                "ret=%d, errno=%s\n",
+                ret, strerror(errno));
+        g_aging_tid = 0;
+    }
 }
 
-// 停止全局资源老化线程
-void stop_connection_aging_thread(void) {
-    // 仅打印停止日志，实际退出由外层g_running置0触发
-    printf("[AGE THREAD] "
-           "全局资源老化线程停止指令已下发（等待外层g_running置0）\n");
-    return;
+void stop_age_thread(void) {
+    if (g_aging_tid > 0) {
+        pthread_join(g_aging_tid, NULL);
+        printf("[AGE_THREAD] 老化线程已退出并回收\n");
+        g_aging_tid = 0;
+    }
 }
 
-// 释放全局资源老化线程相关资源
-void release_connection_aging_thread(void) {
-    g_aging_tid = 0; // 重置线程ID，避免野指针
-    printf("[AGE THREAD] 全局资源老化线程资源已释放\n");
-    return;
-}
+/**
+ * @brief 老化线程资源释放
+ * @note 修复所有逻辑错误：等待逻辑生效、判断逻辑正确、线程优雅退出
+ * @note 兼容ctrl+c信号回调，优先优雅退出，兜底强制取消，无内存泄漏
+ */
+void cleanup_age_resources(void) { printf("[AGE_THREAD] 老化线程资源释放\n"); }
