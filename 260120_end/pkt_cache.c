@@ -29,7 +29,6 @@ static uint32_t ip_str_to_host(const char *ip_str) {
 static uint32_t calc_flow_hash(const struct flow_key *key) {
     uint32_t hash = 0;
     hash = key->src_ip ^ key->dst_ip ^ key->dst_qp;
-    // hash = hash ^ ((uint32_t)key->src_port << 16 | key->dst_port);
     hash ^= key->pkey;
     return hash % TABLE_SIZE;
 }
@@ -126,8 +125,6 @@ struct flow_key create_flow_key(const char *src_ip, const char *dst_ip,
 
     key.src_ip = ip_str_to_host(src_ip);
     key.dst_ip = ip_str_to_host(dst_ip);
-    // key.src_port = src_port;
-    // key.dst_port = dst_port;
     key.dst_qp = dst_qp;
     key.pkey = pkey;
     key.resv1 = 0;
@@ -237,8 +234,6 @@ void remove_flow_entry(struct connection_key key) {
     memset(&fwd_key, 0, sizeof(fwd_key));
     fwd_key.src_ip = key.src_ip;
     fwd_key.dst_ip = key.dst_ip;
-    // fwd_key.src_port = key.src_port;
-    // fwd_key.dst_port = key.dst_port;
     fwd_key.dst_qp = key.dst_qp;
     fwd_key.pkey = key.pkey;
     fwd_key.resv1 = 0;
@@ -251,8 +246,6 @@ void remove_flow_entry(struct connection_key key) {
     memset(&rev_key, 0, sizeof(rev_key));
     rev_key.src_ip = key.dst_ip;
     rev_key.dst_ip = key.src_ip;
-    // rev_key.src_port = key.dst_port;
-    // rev_key.dst_port = key.src_port;
     rev_key.dst_qp = key.src_qp;
     rev_key.pkey = key.pkey;
     rev_key.resv1 = 0;
@@ -284,7 +277,6 @@ struct connection_bucket connection_table[TABLE_SIZE];
 static uint32_t calc_conn_hash(const struct connection_key *key) {
     uint32_t hash = 0;
     hash = key->src_ip ^ key->dst_ip;
-    // hash ^= (key->src_port | (key->dst_port << 16));
     hash ^= (key->src_qp ^ key->dst_qp);
     hash ^= key->pkey;
     return hash % TABLE_SIZE;
@@ -294,8 +286,6 @@ static uint32_t calc_conn_hash(const struct connection_key *key) {
 static int conn_key_equal(const struct connection_key *k1,
                           const struct connection_key *k2) {
     return (k1->src_ip == k2->src_ip && k1->dst_ip == k2->dst_ip &&
-            // k1->src_port == k2->src_port &&
-            // k1->dst_port == k2->dst_port &&
             k1->src_qp == k2->src_qp && k1->dst_qp == k2->dst_qp &&
             k1->pkey == k2->pkey);
 }
@@ -328,17 +318,6 @@ static struct connection_cache_array *alloc_cache_array(int size) {
     cache->end_psn = PSN_INVALID;
     cache->cur_psn = 0;
     cache->last_active_stamp = 0;
-    // ZPY
-    // cache->retransmit_type = RETRANSMIT_NONE; // 初始化重传类型
-    // ZPY
-
-    // // 3. 初始化读写锁
-    // if (pthread_rwlock_init(&cache->rwlock, NULL) != 0) {
-    //     perror("[ERROR] 读写锁初始化失败");
-    //     free(cache->ring_buf);
-    //     free(cache);
-    //     return NULL;
-    // }
 
     return cache;
 }
@@ -402,12 +381,9 @@ struct connection_key create_connection_key(const char *src_ip,
                                             const char *dst_ip, uint32_t src_qp,
                                             uint32_t dst_qp, uint16_t pkey) {
     struct connection_key key;
-    // memset(&key, 0, sizeof(key));
 
     key.src_ip = ip_str_to_host(src_ip);
     key.dst_ip = ip_str_to_host(dst_ip);
-    // key.src_port = src_port;
-    // key.dst_port = dst_port;
     key.src_qp = src_qp;
     key.dst_qp = dst_qp;
     key.pkey = pkey;
@@ -489,11 +465,6 @@ get_connection_cache(struct connection_entry *entry,
 struct connection_cache_array *
 create_connection_cache(struct connection_bucket *bucket,
                         struct connection_key key) {
-    // // 1. 安全检查：双重检查 (Double-Check)
-    // struct connection_cache_array *existing =
-    // get_connection_cache(bucket->head, key); if (existing) {
-    //     return existing;
-    // }
 
     printf("[CONN] 创建新连接资源 (SrcQP:%u)\n", key.src_qp);
 
@@ -829,6 +800,11 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
                packet_len, MEM_BLOCK_SIZE - sizeof(struct mem_block_header));
         return RETRANS_INVALID_PARAM;
     }
+    // 校验4：连接缓存结构体为空
+    if (conn_cache->ring_buf == NULL || conn_cache->array_length == 0) {
+        printf("[ERROR] 数据包缓存失败：conn_cache->ring_buf无效\n");
+        return RETRANS_INVALID_PARAM;
+    }
 
     // 3. 调用核心缓存函数处理数据包
     int ret = cache_rdma_packet(conn_cache, psn, packet_data, packet_len);
@@ -836,8 +812,6 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
         printf("[ERROR] 数据包缓存失败 (PSN: %u, 错误码: %d)\n", psn, ret);
         return ret;
     }
-    conn_cache->last_active_stamp =
-        get_current_timestamp_ms(); // 更新最后活跃时间戳
 
     // 4. 打印缓存成功日志
     printf("[INFO] 数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n", psn,
@@ -915,6 +889,7 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     }
 
     conn->cur_psn = psn;
+    conn->last_active_stamp = get_current_timestamp_ms(); // 更新最后活跃时间戳
 
     printf("[UPDATE] 连接PSN参数：start_psn=%u, end_psn=%u, cur_psn=%u\n",
            conn->start_psn, conn->end_psn, conn->cur_psn);
@@ -992,11 +967,6 @@ void age_expired_packets(struct connection_cache_array *conn) {
         return;
     }
 
-    // 范围无有效PSN（环形语境下无数据）
-    if (conn->start_psn == ((conn->end_psn + 1) & PSN_MASK)) {
-        return;
-    }
-
     // 校验1：start_psn的ring_buf对应索引无数据，说明start_psn失效 ->
     // 重新查找有效最小PSN
     uint32_t start_psn = conn->start_psn;
@@ -1006,7 +976,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
                "无数据，重置PSN参数\n",
                start_psn, ring_idx);
         conn->start_psn = find_valid_min_psn(conn);
-        // return;
+        return;
     }
 
     // 校验2：start_psn的ring_buf对应索引数据块为空指针,说明start_psn失效 ->
@@ -1018,7 +988,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
             "[WARN] 老化处理：start_psn=0x%06X 对应内存块为空，重置PSN参数\n",
             start_psn);
         conn->start_psn = find_valid_min_psn(conn);
-        // return;
+        return;
     }
 
     // 校验3：start_psn与内存块PSN不匹配，发生覆盖 → 重新查找有效最小PSN
@@ -1027,7 +997,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
                "不一致，重置PSN参数\n",
                start_psn, pkt_header->psn);
         conn->start_psn = find_valid_min_psn(conn);
-        // return;
+        return;
     }
 
     // 校验4：未达到老化阈值 → 跳过
@@ -1050,10 +1020,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
     binary_age_psn(conn, original_start, original_end, cur_stamp);
 }
 
-/**
- * @brief 释放单个connection_entry的全部资源
- * @param entry 待释放的连接条目
- */
+// 释放单个connection_entry及其内部资源
 void free_connection_entry(struct connection_entry *entry) {
     if (entry == NULL) {
         return;
@@ -1069,54 +1036,47 @@ void free_connection_entry(struct connection_entry *entry) {
     free(entry);
 }
 
-/**
- * @brief 遍历单个哈希桶，清理空闲的connection_entry（保证链表连贯）
- * @param bucket_idx 哈希桶索引
- * @return 清理的条目数量
- * @note 优化点：哈希桶级锁全程只加1次、解1次，无频繁加解锁的上下文切换开销
- * @note 核心修复：资源释放操作纳入桶级写锁保护，消除并发访问窗口
- */
+// 清理指定哈希桶中的空闲连接条目
 int clean_idle_entry(uint32_t bucket_idx) {
     int cleaned_count = 0;
     struct connection_entry *prev = NULL;
     struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
-    uint32_t curr_time = time(NULL); // 当前时间戳（秒级）
+    uint64_t current_ms = get_current_timestamp_ms(); // 统一用毫秒级时间戳
 
-    // 对一个hash桶：哈希桶级写锁只加1次，覆盖摘链+释放全流程
+    // 加桶级写锁（覆盖全流程）
     pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
 
-    while (curr != NULL) {
-        // 判断是否空闲：最后活动时间 + 阈值 < 当前时间（毫秒级对比）
-        if ((curr_time - curr->cache_array->last_active_stamp) >
-            CONN_IDLE_EXPIRE_THRESHOLD) { // 阈值转为毫秒级
+    while (curr) {
+        // 复用辅助函数判断连接是否空闲过期
+        int is_expired = is_conn_idle_expired(curr->cache_array);
+        if (is_expired == 1) { // 1表示过期，-1为异常（跳过）
             struct connection_entry *to_delete = curr;
+            uint64_t idle_time =
+                current_ms - curr->cache_array->last_active_stamp;
 
-            // 1. 调整链表指针（保证哈希桶链表连贯）
-            if (prev == NULL) {
-                // 待删除节点是桶的头节点，更新桶的头指针
-                g_conn_buckets[bucket_idx].head = curr->next;
-            } else {
-                // 待删除节点是中间/尾节点，更新前驱节点的next指针
+            // 调整链表指针
+            if (prev) {
                 prev->next = curr->next;
+            } else {
+                g_conn_buckets[bucket_idx].head = curr->next;
             }
 
-            // 2. 移动当前指针继续遍历，避免链表断裂
+            // 移动遍历指针
             curr = curr->next;
 
-            // 3. 核心修复：在锁内释放资源，消除并发访问窗口
+            // 释放过期连接资源
             printf("[CLEAN IDLE] 释放空闲连接条目：SrcQP=%u, 空闲时长=%lu ms\n",
-                   to_delete->connection_key.src_qp,
-                   curr_time - to_delete->cache_array->last_active_stamp);
+                   to_delete->connection_key.src_qp, idle_time);
             free_connection_entry(to_delete);
             cleaned_count++;
         } else {
-            // 非空闲节点，继续遍历下一个节点
+            // 非过期节点，继续遍历
             prev = curr;
             curr = curr->next;
         }
     }
 
-    // 对一个hash桶：哈希桶级写锁只解1次，所有操作完成后解锁
+    // 解锁
     pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
 
     printf("[CLEAN IDLE] 哈希桶%u清理完成，共释放%d个空闲连接条目\n",
@@ -1124,13 +1084,7 @@ int clean_idle_entry(uint32_t bucket_idx) {
     return cleaned_count;
 }
 
-/**
- * @brief 遍历所有哈希桶，清理空闲的connection_entry
- * @return 总清理条目数量
- * @note 遍历并清理完【单个哈希桶】后，立即微延时一次，再遍历下一个桶
- * @note
- * 彻底解决原逻辑"一次性遍历所有桶耗时过长"的问题，打散遍历压力，让出CPU资源
- */
+// 清理所有哈希桶中的空闲连接条目
 int clean_global_idle_entry() {
     int total_cleaned = 0;
     if (g_conn_buckets == NULL) {
@@ -1148,13 +1102,7 @@ int clean_global_idle_entry() {
 
 //==================全局资源老化功能（未完善）==================
 
-/**
- * @brief 全局资源老化线程入口函数
- * @param arg 无实际参数
- * @return NULL
- * @note 极简逻辑：依赖外层g_running控制循环，仅调用clean_global_idle_entry +
- * 定时休眠
- */
+// 全局资源老化线程函数
 void *connection_aging_thread(void *arg) {
     printf(
         "[AGE THREAD] 全局资源老化线程启动 | 休眠间隔=%d ms | 桶间延时=%d us\n",
@@ -1164,45 +1112,33 @@ void *connection_aging_thread(void *arg) {
     while (g_running) {
         // 核心逻辑：清理所有哈希桶的空闲连接
         clean_global_idle_entry();
-        // 线程休眠（毫秒转微秒，保证精度）
+        // 线程休眠
         sleep(AGE_THREAD_SLEEP_INTERVAL / 1000);
     }
 
     printf("[AGE THREAD] 全局资源老化线程退出\n");
-    return NULL;
+    return;
 }
 
-/**
- * @brief 启动全局资源老化线程（纯净版）
- * @return 0
- * @note 无任何if判断，仅启动线程+分离线程，依赖外层g_running控制运行状态
- */
-int start_connection_aging_thread() {
+// 启动全局资源老化线程
+void start_connection_aging_thread() {
     pthread_create(&g_aging_tid, NULL, connection_aging_thread, NULL);
     pthread_detach(g_aging_tid);
     printf("[AGE THREAD] 全局资源老化线程创建成功\n");
-    return 0;
+    return;
 }
 
-/**
- * @brief 停止全局资源老化线程（纯净版）
- * @return 0
- * @note 无任何if判断，仅做线程停止的基础操作（依赖外层g_running置0实现退出）
- */
-int stop_connection_aging_thread(void) {
+// 停止全局资源老化线程
+void stop_connection_aging_thread(void) {
     // 仅打印停止日志，实际退出由外层g_running置0触发
     printf("[AGE THREAD] "
            "全局资源老化线程停止指令已下发（等待外层g_running置0）\n");
-    return 0;
+    return;
 }
 
-/**
- * @brief 释放全局资源老化线程资源（纯净版）
- * @return 0
- * @note 无任何if判断，仅重置线程ID，不处理其他资源（由外层统一释放）
- */
-int release_connection_aging_thread(void) {
+// 释放全局资源老化线程相关资源
+void release_connection_aging_thread(void) {
     g_aging_tid = 0; // 重置线程ID，避免野指针
     printf("[AGE THREAD] 全局资源老化线程资源已释放\n");
-    return 0;
+    return;
 }

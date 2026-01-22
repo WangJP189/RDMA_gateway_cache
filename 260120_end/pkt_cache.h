@@ -253,13 +253,13 @@ int clean_global_idle_entry();
 void *connection_aging_thread();
 
 // 启动全局资源老化线程
-int start_connection_aging_thread();
+void start_connection_aging_thread();
 
 // 停止全局资源老化线程
-int stop_connection_aging_thread(void);
+void stop_connection_aging_thread();
 
 // 释放全局资源老化线程资源
-int release_connection_aging_thread(void);
+void release_connection_aging_thread();
 
 //======辅助函数=====
 // 获取当前系统的毫秒级时间戳
