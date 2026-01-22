@@ -793,11 +793,13 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
         return RETRANS_INVALID_PARAM;
     }
     // 校验3：数据包长度超过内存块最大可用容量
-    if (packet_len > MEM_BLOCK_SIZE - sizeof(struct mem_block_header)) {
+    int max_allowed_len =
+        MEM_BLOCK_SIZE - sizeof(struct mem_block_header);
+    if (packet_len > max_allowed_len) {
         printf("[ERROR] "
                "数据包缓存失败：packet_len数据包长度超限，输入长度=%d"
                "，最大允许长度=%d\n",
-               packet_len, MEM_BLOCK_SIZE - sizeof(struct mem_block_header));
+               packet_len, max_allowed_len);
         return RETRANS_INVALID_PARAM;
     }
     // 校验4：连接缓存结构体为空
@@ -1117,7 +1119,7 @@ void *connection_aging_thread(void *arg) {
     }
 
     printf("[AGE THREAD] 全局资源老化线程退出\n");
-    return;
+    return NULL;
 }
 
 // 启动全局资源老化线程
