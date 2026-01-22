@@ -11,7 +11,7 @@
 // #include <bits/pthreadtypes.h>
 
 // 大小定义
-#define RING_BUFFER_SIZE 102400 // 环形数组大小（存储内存首地址）
+#define RING_BUFFER_SIZE 10240 // 环形数组大小（存储内存首地址）
 #define TABLE_SIZE 2048         // 表大小
 #define MEM_BLOCK_SIZE 5120     // 固定5KB内存块大小
 
@@ -101,7 +101,6 @@ struct connection_cache_array {
     uint32_t start_psn;
     uint32_t end_psn;
     uint32_t cur_psn;
-    // uint64_t            last_age_stamp;     // 上次老化时间记录
     uint64_t last_active_stamp; // 连接最后活动时间（收/发包）
     // ZPY
     // retransmit_type retransmit_type; // 重传类型
@@ -139,6 +138,8 @@ typedef enum {
     RETRANS_NO_CACHED_PACKETS = -3,  // 未缓存任何数据包
     RETRANS_NO_NEED = -4,            // 无需处理重传（start_psn >= epsn）
     RETRANS_DATA_ALLOC_FAIL = -5,    // connection_cache_array数据分配失败
+    RETRANS_NO_PACKET = -6,          // 指定ring_buffer位置无数据包
+    RETRANS_PACkET_PSN_MISMATCH = -7 // 指定ring_buffer位置数据包PSN不匹配
 } retransmit_process_result;
 
 // ==================== FlowTable接口声明 ====================

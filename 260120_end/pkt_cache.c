@@ -591,9 +591,7 @@ uint64_t get_current_timestamp_ms(void) {
 
 // 辅助函数：判断2个24位PSN的循环大小（考虑溢出场景）
 // 环形语境下判断a是否小于b（仅针对24位PSN，核心解决物理回绕后的大小判断）
-// 场景：仅当PSN从0xFFFFFF回绕到0x000000时，正确判断大小
 int psn_less_than(uint32_t a, uint32_t b) {
-    // 核心逻辑：
     // 1. 差值>半周期 → a在环形中位于b的“后方”（物理回绕后），即a < b
     // 2. 差值≤半周期 → a在环形中位于b的“前方”（无回绕），即a > b
     uint32_t ring_diff = (a - b) & PSN_MASK;
@@ -615,16 +613,18 @@ int is_psn_expired(struct connection_cache_array *conn, uint32_t psn,
 
     // 空指针/PSN不匹配 → 视为已过期（无有效数据）
     if (conn->ring_buf[cache_index] == 0)
-        return 2;
+        return RETRANS_NO_PACKET;
     unsigned char *mem_block = (unsigned char *)conn->ring_buf[cache_index];
     struct mem_block_header *header = (struct mem_block_header *)mem_block;
+
+    // PSN不匹配，发生覆盖情况
     if (header->psn != psn)
-        return 1;
+        return RETRANS_PACkET_PSN_MISMATCH;
 
     // 计算存活时间，判断是否过期
+    // 数据包有效并且未过期返回0，过期返回1
     uint64_t survival_time = current_ts - header->recv_stamp;
     return (survival_time > PACKET_AGE_THRESHOLD) ? 1 : 0;
-    // 数据包有效并且未过期返回0
 }
 
 // 批量清理指定PSN区间的数据包（单段遍历优化版，兼容回绕）
@@ -665,23 +665,9 @@ int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
     return cleaned_count;
 }
 
-/**
- * @brief 二分法处理PSN老化（回绕，查找+判断+批量清理全流程）
- * @param conn 连接缓存结构体
- * @param start_psn 缓存起始PSN
- * @param end_psn 缓存结束PSN（最大PSN）
- * @param current_timestamp_ms 当前毫秒级时间戳
- */
+// 二分法老化处理指定PSN区间的数据包
 void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
                     uint32_t end_psn, uint64_t current_timestamp_ms) {
-    // 1. 空范围检查
-    if (start_psn == PSN_INVALID || end_psn == PSN_INVALID) {
-        return;
-    }
-    // 范围无有效PSN（环形语境下无数据）
-    if (start_psn == ((end_psn + 1) & PSN_MASK)) {
-        return;
-    }
 
     printf("[AGE-BINARY] 二分老化处理：PSN缓存范围=[0x%06X~0x%06X]\n",
            start_psn, end_psn);
@@ -693,7 +679,7 @@ void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
         printf("[AGE-BINARY] 判定：全量PSN过期，清理整个区间[0x%06X~0x%06X]\n",
                start_psn, end_psn);
         clean_count = batch_clean_psn_range(conn, start_psn, end_psn);
-        // 全量过期后，直接重置PSN核心参数（把原来主函数的重置逻辑迁移到这里，职责内聚）
+        // 全量过期后，直接重置PSN核心参数
         conn->start_psn = PSN_INVALID;
         conn->end_psn = PSN_INVALID;
         conn->cur_psn = 0;
@@ -762,9 +748,6 @@ void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
 
 // 辅助函数：重新查找当前连接中有效的最小PSN（修正失效的start_psn）
 uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
-    if (!conn || !conn->ring_buf) {
-        return PSN_INVALID;
-    }
 
     uint32_t min_psn = PSN_INVALID;
     // 遍历整个环形缓冲区，查找所有有效数据块
@@ -795,7 +778,7 @@ uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
 }
 
 // 辅助函数：判断连接是否空闲过期（基于last_active_stamp）
-// 返回值：1=过期，0=未过期，-1=参数无效
+// 返回值：1=过期，0=未过期
 int is_conn_idle_expired(struct connection_cache_array *conn) {
     if (!conn) {
         printf("[ERROR] 连接空闲过期判断失败：conn缓存结构体为空\n");
@@ -807,8 +790,8 @@ int is_conn_idle_expired(struct connection_cache_array *conn) {
         return 0;
     }
 
-    uint64_t current_ts = get_current_timestamp_ms();
-    uint64_t idle_time = current_ts - conn->last_active_stamp;
+    uint64_t current_ms = get_current_timestamp_ms();
+    uint64_t idle_time = current_ms - conn->last_active_stamp;
 
     // 空闲时间超过阈值（CONN_IDLE_EXPIRE_THRESHOLD ms）则判定为过期
     if (idle_time > CONN_IDLE_EXPIRE_THRESHOLD) {
@@ -826,8 +809,6 @@ int is_conn_idle_expired(struct connection_cache_array *conn) {
 int add_to_connection_cache(struct connection_cache_array *conn_cache,
                             uint32_t psn, const unsigned char *packet_data,
                             int packet_len) {
-    // 1. 缓存参数有效性校验 -
-    // 独立拆分逐行校验，精准定位错误，匹配指定枚举错误码
     // 校验1：待缓存的数据包指针为空
     if (!packet_data) {
         printf("[ERROR] 数据包缓存失败：packet_data输入数据为空指针\n");
@@ -841,17 +822,13 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
         return RETRANS_INVALID_PARAM;
     }
     // 校验3：数据包长度超过内存块最大可用容量
-    uint32_t max_valid_len = MEM_BLOCK_SIZE - sizeof(struct mem_block_header);
-    if (packet_len > max_valid_len) {
+    if (packet_len > MEM_BLOCK_SIZE - sizeof(struct mem_block_header)) {
         printf("[ERROR] "
-               "数据包缓存失败：packet_len数据包长度超限，输入长度=%"
-               "d，最大允许长度=%d\n",
-               packet_len, max_valid_len);
+               "数据包缓存失败：packet_len数据包长度超限，输入长度=%d"
+               "，最大允许长度=%d\n",
+               packet_len, MEM_BLOCK_SIZE - sizeof(struct mem_block_header));
         return RETRANS_INVALID_PARAM;
     }
-
-    // // 2. 调用老化函数
-    // age_expired_packets(conn_cache);
 
     // 3. 调用核心缓存函数处理数据包
     int ret = cache_rdma_packet(conn_cache, psn, packet_data, packet_len);
@@ -872,14 +849,6 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
 int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
                       const unsigned char *data, int data_len) {
 
-    // 检查数据长度是否超过内存块可用空间（5KB - 头部控制信息大小）
-    int max_data_len = MEM_BLOCK_SIZE - sizeof(struct mem_block_header);
-    if (data_len > max_data_len) {
-        printf("[ERROR] 缓存数据包失败：数据长度超过上限（请求=%d, 上限=%d）\n",
-               data_len, max_data_len);
-        return RETRANS_DATA_ALLOC_FAIL;
-    }
-
     // 分配5KB内存块
     unsigned char *mem_block = (unsigned char *)malloc(MEM_BLOCK_SIZE);
     if (!mem_block) {
@@ -897,7 +866,7 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     // 计算PSN对应的环形数组索引（取模实现环形逻辑）
     int ring_index = psn % RING_BUFFER_SIZE;
 
-    // 处理环形数组冲突（覆盖旧数据包，释放旧内存）
+    // 异常：处理环形数组覆盖冲突（覆盖旧数据包，释放旧内存）
     if (conn->ring_buf[ring_index] != 0) {
         unsigned char *old_mem_block =
             (unsigned char *)conn->ring_buf[ring_index];
@@ -913,10 +882,10 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
            "数据长度=%d | 时间戳=%lu ms\n",
            psn, ring_index, (uintptr_t)mem_block, data_len, header->recv_stamp);
 
-    // 更新连接的PSN参数（仅处理PSN物理回绕场景）
+    // 更新连接的PSN参数
     // 处理start_psn：初始状态 或 物理回绕后更小的PSN
     if (conn->start_psn == PSN_INVALID) {
-        // 初始状态，直接赋值（此时psn对应索引一定有数据，因为刚缓存）
+        // 初始状态，直接赋值
         conn->start_psn = psn;
     } else {
         // 仅当新PSN更小，且对应的索引有数据时，才更新start_psn
@@ -999,19 +968,9 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
     return cleaned_count;
 }
 
-/**
- * @brief 独立完整的连接级数据包老化函数（无返回值，所有老化逻辑全内聚）
- * @param conn 连接缓存结构体
- * @note 1. 老化触发规则：若start_psn的数据包recv_stamp超时 →
- * 执行老化；否则跳过，无定时检查逻辑
- * @note 2. 所有老化相关日志全部内聚在 binary_age_psn
- * 函数中，本函数仅做「触发判断+调用执行」
- * @note 3.
- * 上层调用仅需一行age_expired_packets(conn)，无任何其他老化相关代码/打印
- * @note 4. 自动兼容PSN回绕、全量老化、部分老化、无过期等所有场景，无冗余判断
- */
+// 老化处理函数：检查并清理过期数据包
 void age_expired_packets(struct connection_cache_array *conn) {
-    // 第一步：基础空指针校验（必须放在最前面）
+    // 第一步：基础空指针校验,确保conn和ring_buf有效
     if (conn == NULL) {
         printf("[ERROR] 老化处理：conn缓存结构体为空\n");
         return;
@@ -1033,42 +992,42 @@ void age_expired_packets(struct connection_cache_array *conn) {
         return;
     }
 
+    // 范围无有效PSN（环形语境下无数据）
+    if (conn->start_psn == ((conn->end_psn + 1) & PSN_MASK)) {
+        return;
+    }
+
+    // 校验1：start_psn的ring_buf对应索引无数据，说明start_psn失效 ->
+    // 重新查找有效最小PSN
     uint32_t start_psn = conn->start_psn;
     uint32_t ring_idx = start_psn % RING_BUFFER_SIZE;
-    struct mem_block_header *pkt_header = NULL;
-
-    // 校验1：ring_buf对应索引无数据 → 重置PSN参数并退出
     if (conn->ring_buf[ring_idx] == 0) {
         printf("[WARN] 老化处理：start_psn=0x%06X 对应ring_buf索引=%u "
                "无数据，重置PSN参数\n",
                start_psn, ring_idx);
-        conn->start_psn = PSN_INVALID;
-        conn->end_psn = PSN_INVALID;
-        conn->cur_psn = 0;
-        return;
+        conn->start_psn = find_valid_min_psn(conn);
+        // return;
     }
 
-    // 强转后校验2：内存块为空 → 重置PSN参数并退出
-    pkt_header = (struct mem_block_header *)(uintptr_t)conn->ring_buf[ring_idx];
+    // 校验2：start_psn的ring_buf对应索引数据块为空指针,说明start_psn失效 ->
+    // 重新查找有效最小PSN
+    struct mem_block_header *pkt_header =
+        (struct mem_block_header *)(uintptr_t)conn->ring_buf[ring_idx];
     if (pkt_header == NULL) {
         printf(
             "[WARN] 老化处理：start_psn=0x%06X 对应内存块为空，重置PSN参数\n",
             start_psn);
-        conn->start_psn = PSN_INVALID;
-        conn->end_psn = PSN_INVALID;
-        conn->cur_psn = 0;
-        return;
+        conn->start_psn = find_valid_min_psn(conn);
+        // return;
     }
 
-    // 校验3：PSN一致性不匹配 → 重置PSN参数并退出
+    // 校验3：start_psn与内存块PSN不匹配，发生覆盖 → 重新查找有效最小PSN
     if (pkt_header->psn != start_psn) {
         printf("[WARN] 老化处理：start_psn=0x%06X 与内存块PSN=0x%06X "
                "不一致，重置PSN参数\n",
                start_psn, pkt_header->psn);
-        conn->start_psn = PSN_INVALID;
-        conn->end_psn = PSN_INVALID;
-        conn->cur_psn = 0;
-        return;
+        conn->start_psn = find_valid_min_psn(conn);
+        // return;
     }
 
     // 校验4：未达到老化阈值 → 跳过

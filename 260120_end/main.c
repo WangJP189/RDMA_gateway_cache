@@ -421,7 +421,7 @@ void menu_set_gateway_interfaces() {
 // ZPY
 // 简单的资源老化线程启动
 void menu_start_aging_thread() {
-    connection_aging_thread_start(0);
+    start_connection_aging_thread();
     return;
 }
 
