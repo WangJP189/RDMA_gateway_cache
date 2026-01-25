@@ -751,7 +751,7 @@ int is_conn_idle_expired(struct connection_cache_array *cache_array) {
     // 容错1：缓存结构体为空，返回异常
     if (cache_array == NULL) {
         printf("[ERROR] 判定连接过期失败：cache_array为空指针\n");
-        return -1;
+        return RETRANS_INVALID_PARAM;
     }
 
     uint64_t current_ms = get_current_timestamp_ms();      // 当前毫秒时间戳
@@ -1043,6 +1043,61 @@ void free_connection_entry(struct connection_entry *entry) {
     free(entry);
 }
 
+// 打印当前所有连接的状态信息
+void print_all_connections_status() {
+    if (g_conn_buckets == NULL) {
+        printf("[CONN STATUS] 连接桶数组未初始化，无连接信息\n");
+        return;
+    }
+
+    uint64_t current_ms = get_current_timestamp_ms();
+    printf("\n====================================\n");
+    printf("[CONN STATUS] 当前所有连接状态（时间戳：%lu ms）\n", current_ms);
+    printf("====================================\n");
+
+    int total_conn = 0; // 统计总连接数
+    for (uint32_t bucket_idx = 0; bucket_idx < TABLE_SIZE;
+         bucket_idx++) {
+        // 加桶级读锁，避免遍历过程中链表被修改
+        pthread_rwlock_rdlock(&g_conn_buckets[bucket_idx].rwlock);
+
+        struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
+        int bucket_conn = 0; // 统计当前桶的连接数
+
+        while (curr) {
+            bucket_conn++;
+            total_conn++;
+            struct connection_cache_array *cache = curr->cache_array;
+
+            // 计算空闲时长
+            uint64_t idle_time = 0;
+            if (cache != NULL && current_ms >= cache->last_active_stamp) {
+                idle_time = current_ms - cache->last_active_stamp;
+            }
+
+            // 打印连接核心信息
+            printf("[CONN STATUS] 桶%u | 连接%u | SrcQP:%u DstQP:%u | ",
+                   bucket_idx, bucket_conn, curr->connection_key.src_qp,
+                   curr->connection_key.dst_qp);
+            if (cache != NULL) {
+                printf("last_active_stamp=%lu ms | 空闲时长=%lu ms | ",
+                       cache->last_active_stamp, idle_time);
+                printf("PSN范围:[%u~%u]\n", cache->start_psn, cache->end_psn);
+            } else {
+                printf("缓存结构体为空\n");
+            }
+
+            curr = curr->next;
+        }
+
+        pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
+    }
+
+    printf("====================================\n");
+    printf("[CONN STATUS] 总连接数：%d\n", total_conn);
+    printf("====================================\n\n");
+}
+
 // 清理指定哈希桶中的空闲连接条目
 int clean_idle_entry(uint32_t bucket_idx) {
 
@@ -1106,7 +1161,7 @@ int clean_global_idle_entry() {
         return 0;
     }
 
-    for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
+    for (uint32_t i = 0; i < TABLE_SIZE; i++) {
         // 清理当前桶的空闲连接
         total_cleaned += clean_idle_entry(i);
 
@@ -1118,6 +1173,10 @@ int clean_global_idle_entry() {
     }else {
         printf("[CLEAN GLOBAL IDLE] 全局空闲连接清理完成，无连接被释放\n");
     }
+
+    // 核心新增：清理完成后打印所有连接状态
+    print_all_connections_status();
+
     return total_cleaned;
 }
 
@@ -1126,7 +1185,7 @@ int clean_global_idle_entry() {
 // 全局资源老化线程函数
 void *age_thread_proc(void *arg) {
     printf(
-        "[AGE THREAD] 全局资源老化线程启动 | 休眠间隔=%d ms | 桶间延时=%d us\n",
+        "[AGE THREAD] 全局资源老化线程启动 | 休眠间隔=%d s | 桶间延时=%d us\n",
         AGE_THREAD_SLEEP_INTERVAL, CONN_AGE_PER_BUCKET_DELAY);
 
     // 仅依赖外层g_running控制循环（1=运行，0=停止）
@@ -1134,7 +1193,7 @@ void *age_thread_proc(void *arg) {
         // 核心逻辑：清理所有哈希桶的空闲连接
         clean_global_idle_entry();
         // 线程休眠
-        sleep(AGE_THREAD_SLEEP_INTERVAL / 1000);
+        sleep(AGE_THREAD_SLEEP_INTERVAL);
     }
 
     printf("[AGE THREAD] 全局资源老化线程退出\n");

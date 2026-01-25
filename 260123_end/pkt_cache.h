@@ -26,8 +26,8 @@
 #define CONN_IDLE_EXPIRE_THRESHOLD 30000 // 连接老化阈值（毫秒）
 #define PACKET_AGE_THRESHOLD 100         // 数据包最大老化时间（毫秒）
 #define PACKET_AGE_CHECK_INTERVAL 5      // 报文老化检查间隔（毫秒）
-#define AGE_THREAD_SLEEP_INTERVAL 10000  // 全局老化线程休眠间隔（毫秒）
-#define CONN_AGE_PER_BUCKET_DELAY 50    // 每个桶老化后延时（微秒）
+#define AGE_THREAD_SLEEP_INTERVAL 10     // 全局老化线程休眠间隔（秒）
+#define CONN_AGE_PER_BUCKET_DELAY 50     // 每个桶老化后延时（微秒）
 
 // 全局哈希桶定义
 #define CONN_BUCKET_COUNT 1024 // 哈希桶总数
@@ -229,6 +229,9 @@ int clean_idle_entry(uint32_t bucket_idx);
 
 // 清理全局空闲连接条目（全局资源老化线程调用）
 int clean_global_idle_entry(void);
+
+// 打印当前所有连接的状态信息
+void print_all_connections_status();
 
 // 全局资源老化线程
 void *age_thread_proc(void *arg);
