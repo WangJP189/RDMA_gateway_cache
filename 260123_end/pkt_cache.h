@@ -23,7 +23,7 @@
 
 // 超时定义
 #define TIME_STAMP_UNIT_MS 1             // 时间戳单位：毫秒
-#define CONN_IDLE_EXPIRE_THRESHOLD 3000 // 连接老化阈值（毫秒）
+#define CONN_IDLE_EXPIRE_THRESHOLD 30000 // 连接老化阈值（毫秒）
 #define PACKET_AGE_THRESHOLD 100         // 数据包最大老化时间（毫秒）
 #define PACKET_AGE_CHECK_INTERVAL 5      // 报文老化检查间隔（毫秒）
 #define AGE_THREAD_SLEEP_INTERVAL 10000  // 全局老化线程休眠间隔（毫秒）

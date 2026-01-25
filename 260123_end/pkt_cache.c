@@ -315,7 +315,7 @@ static struct connection_cache_array *alloc_cache_array(int size) {
     cache->start_psn = PSN_INVALID;
     cache->end_psn = PSN_INVALID;
     cache->cur_psn = 0;
-    cache->last_active_stamp = 0;
+    cache->last_active_stamp = get_current_timestamp_ms();
     return cache;
 }
 
@@ -363,6 +363,7 @@ int init_connection_table(void) {
             return -1;
         }
     }
+    g_conn_buckets = connection_table; // 全局指针指向连接表
     printf("[INIT] 连接表初始化完成 (桶级读写锁模式)\n");
     return 0;
 }
@@ -746,27 +747,36 @@ uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
 
 // 辅助函数：判断连接是否空闲过期（基于last_active_stamp）
 // 返回值：1=过期，0=未过期
-int is_conn_idle_expired(struct connection_cache_array *conn) {
-    if (!conn) {
-        printf("[ERROR] 连接空闲过期判断失败：conn缓存结构体为空\n");
+int is_conn_idle_expired(struct connection_cache_array *cache_array) {
+    // 容错1：缓存结构体为空，返回异常
+    if (cache_array == NULL) {
+        printf("[ERROR] 判定连接过期失败：cache_array为空指针\n");
         return -1;
     }
 
-    // 无活跃时间戳（从未使用），视为未过期
-    if (conn->last_active_stamp == 0) {
+    uint64_t current_ms = get_current_timestamp_ms();      // 当前毫秒时间戳
+    uint64_t last_active = cache_array->last_active_stamp; // 连接最后活跃时间
+    uint64_t idle_time = 0;
+
+    // 容错2：处理时间戳回拨（当前时间 < 最后活跃时间）
+    if (current_ms < last_active) {
+        printf("[WARN] 系统时间回拨：current_ms=%lu < "
+               "last_active=%lu，判定为未过期\n",
+               current_ms, last_active);
         return 0;
     }
 
-    uint64_t current_ms = get_current_timestamp_ms();
-    uint64_t idle_time = current_ms - conn->last_active_stamp;
+    // 计算实际空闲时长（毫秒）
+    idle_time = current_ms - last_active;
 
-    // 空闲时间超过阈值（CONN_IDLE_EXPIRE_THRESHOLD ms）则判定为过期
-    if (idle_time > CONN_IDLE_EXPIRE_THRESHOLD) {
-        printf("[CONN IDLE] 连接空闲过期：空闲时间=%lu ms（阈值=%d ms）\n",
+    // 核心判定逻辑：空闲时长 ≥ 连接老化阈值（30000ms）→ 过期
+    if (idle_time >= CONN_IDLE_EXPIRE_THRESHOLD) {
+        printf("[DEBUG] 连接空闲时长=%lu ms ≥ 阈值=%d ms，判定为过期\n",
                idle_time, CONN_IDLE_EXPIRE_THRESHOLD);
         return 1;
     }
 
+    // 未过期
     return 0;
 }
 
@@ -1035,10 +1045,16 @@ void free_connection_entry(struct connection_entry *entry) {
 
 // 清理指定哈希桶中的空闲连接条目
 int clean_idle_entry(uint32_t bucket_idx) {
+
+    // 哈希桶数组为空，直接返回
+    if (g_conn_buckets == NULL) {
+        printf("[ERROR] 哈希桶%u无效，清理跳过\n", bucket_idx);
+        return 0;
+    }
+
     int cleaned_count = 0;
     struct connection_entry *prev = NULL;
     struct connection_entry *curr = g_conn_buckets[bucket_idx].head;
-    uint64_t current_ms = get_current_timestamp_ms(); // 统一用毫秒级时间戳
 
     // 加桶级写锁（覆盖全流程）
     pthread_rwlock_wrlock(&g_conn_buckets[bucket_idx].rwlock);
@@ -1048,8 +1064,6 @@ int clean_idle_entry(uint32_t bucket_idx) {
         int is_expired = is_conn_idle_expired(curr->cache_array);
         if (is_expired == 1) { // 1表示过期，-1为异常（跳过）
             struct connection_entry *to_delete = curr;
-            uint64_t idle_time =
-                current_ms - curr->cache_array->last_active_stamp;
 
             // 调整链表指针
             if (prev) {
@@ -1062,8 +1076,6 @@ int clean_idle_entry(uint32_t bucket_idx) {
             curr = curr->next;
 
             // 释放过期连接资源
-            printf("[CLEAN IDLE] 释放空闲连接条目：SrcQP=%u, 空闲时长=%lu ms\n",
-                   to_delete->connection_key.src_qp, idle_time);
             free_connection_entry(to_delete);
             cleaned_count++;
         } else {
@@ -1076,8 +1088,12 @@ int clean_idle_entry(uint32_t bucket_idx) {
     // 解锁
     pthread_rwlock_unlock(&g_conn_buckets[bucket_idx].rwlock);
 
-    printf("[CLEAN IDLE] 哈希桶%u清理完成，共释放%d个空闲连接条目\n",
-           bucket_idx, cleaned_count);
+    // 仅当当前桶清理到连接时打印日志，无清理则不输出
+    if (cleaned_count > 0) {
+        printf("[CLEAN IDLE] 哈希桶%u清理完成，共释放%d个空闲连接条目\n",
+               bucket_idx, cleaned_count);
+    }
+
     return cleaned_count;
 }
 
@@ -1086,17 +1102,21 @@ int clean_global_idle_entry() {
     printf("[CLEAN GLOBAL IDLE] 开始清理所有哈希桶的空闲连接条目\n");
     int total_cleaned = 0;
     if (g_conn_buckets == NULL) {
-        printf("[ERROR] 全局空闲连接清理失败：连接桶数组未初始化\n");
+        // printf("[ERROR] 全局空闲连接清理失败：连接桶数组未初始化\n");
         return 0;
     }
 
     for (uint32_t i = 0; i < CONN_BUCKET_COUNT; i++) {
         // 清理当前桶的空闲连接
         total_cleaned += clean_idle_entry(i);
-        printf("[CLEAN GLOBAL IDLE] 已处理哈希桶 %u/%u\n", i + 1,
-               CONN_BUCKET_COUNT);
 
         usleep(CONN_AGE_PER_BUCKET_DELAY);
+    }
+    if (total_cleaned > 0) {
+        printf("[CLEAN GLOBAL IDLE] 全局空闲连接清理完成，共释放%d个连接条目\n",
+               total_cleaned);
+    }else {
+        printf("[CLEAN GLOBAL IDLE] 全局空闲连接清理完成，无连接被释放\n");
     }
     return total_cleaned;
 }
