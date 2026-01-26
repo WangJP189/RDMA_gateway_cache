@@ -1,10 +1,12 @@
 #ifndef DATA_STRUCTURES_H
 #define DATA_STRUCTURES_H
 
-#include "config.h"
+#include <dpdk/rte_mbuf.h>
 #include <pthread.h>
-#include <rte_mbuf.h>
 #include <stdbool.h>
+#include <stdint.h>
+
+#include "config.h"
 
 enum gateway_role { SRC_GATEWAY = 0, DST_GATEWAY = 1, UNKNOWN_GATEWAY };
 
