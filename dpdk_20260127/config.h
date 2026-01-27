@@ -70,4 +70,21 @@
 #define RETRANSMIT_INTERVAL 100     // 100ms重传检查
 #define THREAD_CHECK_INTERVAL 30000 // 30秒
 
+// 报文缓存使用
+//  PSN定义，解决end_psn<start_psn的问题
+#define PSN_MASK 0xFFFFFF       // 24位PSN掩码（0~16777215）
+#define PSN_HALF_CYCLE 0x800000 // 24位PSN的半周期（判断回绕的阈值）
+#define PSN_MAX_VALUE PSN_MASK  // PSN最大值（2^24-1）
+#define PSN_INVALID 0x1000000   // 无效PSN（大于最大值，表示未初始化）
+
+#define MEM_BLOCK_SIZE 5120 // 固定5KB内存块大小
+
+// 超时定义
+#define TIME_STAMP_UNIT_MS 1             // 时间戳单位：毫秒
+#define CONN_IDLE_EXPIRE_THRESHOLD 30000 // 连接老化阈值（毫秒）
+#define PACKET_AGE_THRESHOLD 100         // 数据包最大老化时间（毫秒）
+#define PACKET_AGE_CHECK_INTERVAL 5      // 报文老化检查间隔（毫秒）
+#define AGE_THREAD_SLEEP_INTERVAL 10     // 全局老化线程休眠间隔（秒）
+#define CONN_AGE_PER_BUCKET_DELAY 50     // 每个桶老化后延时（微秒）
+
 #endif // CONFIG_H

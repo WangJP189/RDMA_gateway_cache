@@ -2,7 +2,7 @@
 #define UTILS_H
 
 #include "packet_defs.h"
-#include <rte_mbuf.h>
+#include <dpdk/rte_mbuf.h>
 #include <stdbool.h>
 #include <stdint.h>
 

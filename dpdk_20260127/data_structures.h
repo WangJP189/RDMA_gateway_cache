@@ -65,7 +65,7 @@ struct cache_entry_v4 {
     struct pkt_cache *mbuf_array[MAX_PSN_ARRAY];
     uint32_t start_psn;
     uint32_t end_psn;
-    cur_psn;
+    uint32_t cur_psn;
     uint64_t timestamp;
     uint32_t packet_count;
     bool receiver_not_ready;
@@ -98,5 +98,17 @@ struct delay_task_info {
     uint32_t psn;
     uint32_t nak_code;
 };
+
+// 定义重传处理结果的枚举类型
+typedef enum {
+    RETRANS_SUCCESS = 0,             // 处理成功
+    RETRANS_INVALID_PARAM = -1,      // 参数无效
+    RETRANS_NO_VALID_PSN_RANGE = -2, // 无有效PSN范围
+    RETRANS_NO_CACHED_PACKETS = -3,  // 未缓存任何数据包
+    RETRANS_NO_NEED = -4,            // 无需处理重传（start_psn >= epsn）
+    RETRANS_DATA_ALLOC_FAIL = -5,    // connection_cache_array数据分配失败
+    RETRANS_NO_PACKET = -6,          // 指定ring_buffer位置无数据包
+    RETRANS_PACkET_PSN_MISMATCH = -7 // 指定ring_buffer位置数据包PSN不匹配
+} packet_status_t;
 
 #endif // DATA_STRUCTURES_H

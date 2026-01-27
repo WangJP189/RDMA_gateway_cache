@@ -1,9 +1,9 @@
 #ifndef PACKET_DEFS_H
 #define PACKET_DEFS_H
 
-#include <rte_ether.h>
-#include <rte_ip.h>
-#include <rte_udp.h>
+#include <dpdk/rte_ether.h>
+#include <dpdk/rte_ip.h>
+#include <dpdk/rte_udp.h>
 
 // RoCEv2 BTH 结构
 struct ib_bth {
