@@ -618,8 +618,11 @@ int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
         uint32_t idx = current_psn % RING_BUFFER_SIZE;
 
         // 空指针跳过（已清理/无数据）
-        if (conn->ring_buf[idx] == 0)
+        if (conn->ring_buf[idx] == 0){
+            printf("[EXPIRED BATCH] PSN=%u | 无数据，跳过\n", current_psn);
             continue;
+        }
+
 
         // 释放内存块并置空
         free((unsigned char *)conn->ring_buf[idx]);
