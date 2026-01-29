@@ -178,69 +178,32 @@ int cache_tbl_v4_insert_data(struct cache_hash_v4 *ht,
 
 // 销毁连接表
 void destroy_cache_table(void) {
-    if (!g_data.cache_tbl_v4) {
+    struct cache_hash_v4 *ht = (struct cache_hash_v4 *)g_data.cache_tbl_v4;
+    if (ht == NULL) {
         return;
     }
 
-    printf("Destroying connection table (count: %u)...\n",
-           g_data.cache_tbl_v4->count);
-
-    // 遍历所有桶，释放所有连接条目
-    for (uint32_t i = 0; i < g_data.cache_tbl_v4->num_buckets; i++) {
-        if (g_data.cache_tbl_v4->bucket_locks) {
-            pthread_spin_lock(&g_data.cache_tbl_v4->bucket_locks[i]);
-        }
-
-        struct cache_entry_v4 *entry = g_data.cache_tbl_v4->buckets[i];
-        while (entry) {
-            struct cache_entry_v4 *next = entry->next;
-
-            pthread_spin_lock(&entry->lock);
-
-            // 清理定时器（如果存在）
-            if (entry->rnr_timer_fd >= 0) {
-                // 注意：这里不能直接关闭，因为定时器可能由定时器系统管理
-                // 标记为无效，由定时器系统清理
-                entry->rnr_timer_fd = -1;
-            }
-
-            // 释放所有缓存的报文
-            for (int j = 0; j < MAX_PSN_ARRAY; j++) {
-                if (entry->mbuf_array[j]) {
-                    destroy_pkt_cache(entry->mbuf_array[j]);
-                    entry->mbuf_array[j] = NULL;
-                }
-            }
-
-            pthread_spin_unlock(&entry->lock);
-            pthread_spin_destroy(&entry->lock);
-            rte_free(entry);
-            entry = next;
-        }
-
-        g_data.cache_tbl_v4->buckets[i] = NULL;
-
-        if (g_data.cache_tbl_v4->bucket_locks) {
-            pthread_spin_unlock(&g_data.cache_tbl_v4->bucket_locks[i]);
-            pthread_spin_destroy(&g_data.cache_tbl_v4->bucket_locks[i]);
-        }
+    // 第一步：遍历所有桶，调用批量清理函数（复用导师delete_cache_entry_v4销毁所有条目）
+    for (uint32_t i = 0; i < ht->num_buckets; i++) {
+        clean_cache_bucket(i); // 内部已完成条目销毁、链表置空、count更新
     }
 
-    // 释放桶数组和锁数组
-    if (g_data.cache_tbl_v4->buckets) {
-        rte_free(g_data.cache_tbl_v4->buckets);
-        g_data.cache_tbl_v4->buckets = NULL;
+    // 第二步：销毁桶级自旋锁（导师函数未处理桶级锁，需单独销毁）
+    if (ht->bucket_locks != NULL) {
+        for (uint32_t i = 0; i < ht->num_buckets; i++) {
+            pthread_spin_destroy(&ht->bucket_locks[i]);
+        }
+        rte_free(ht->bucket_locks);
+        ht->bucket_locks = NULL;
     }
 
-    if (g_data.cache_tbl_v4->bucket_locks) {
-        rte_free(g_data.cache_tbl_v4->bucket_locks);
-        g_data.cache_tbl_v4->bucket_locks = NULL;
+    // 第三步：释放桶数组 + 连接表本身（DPDK规范：rte_free，置空指针）
+    if (ht->buckets != NULL) {
+        rte_free(ht->buckets);
+        ht->buckets = NULL;
     }
-
-    rte_free(g_data.cache_tbl_v4);
-    g_data.cache_tbl_v4 = NULL;
-
-    printf("Connection table destroyed\n");
+    rte_free(ht);
+    g_data.cache_tbl_v4 = NULL; // 全局指针置空，核心：避免后续野指针访问
 }
 
 // 根据key查找连接条目
@@ -677,91 +640,49 @@ void age_expired_packets(struct cache_entry_v4 *entry) {
     entry->start_psn = (last_expired_psn + 1) & PSN_MASK;
 }
 
-static void age_expired_packets(struct cache_entry_v4 *entry) {
-    if (entry->start_psn == PSN_INVALID || entry->end_psn == PSN_INVALID) {
-        printf("[AGE-PERIODIC] 老化处理：无有效PSN范围，无需清理数据包\n");
-        return;
-    }
+// 下面这个三是老师写的三三数据包老化主函数，之后看一下
 
-    uint64_t aging_threshold =
-        SESSION_AGING_INTERVAL * rte_get_timer_hz() / 1000;
-    uint32_t idx = entry->start_psn % MAX_PSN_ARRAY;
-    if (entry->mbuf_array[idx]->recv_stamp < aging_threshold) {
-        return;
-    }
+// static void age_expired_packets(struct cache_entry_v4 *entry) {
+//     if (entry->start_psn == PSN_INVALID || entry->end_psn == PSN_INVALID) {
+//         printf("[AGE-PERIODIC] 老化处理：无有效PSN范围，无需清理数据包\n");
+//         return;
+//     }
 
-    uint32_t aged = aging_check_binary(entry, entry->start_psn, entry->end_psn,
-                                       aging_threshold);
-    if (aged > 0) {
-        printf("Connection aging: removed %u old packets\n", aged);
-    }
-}
+//     uint64_t aging_threshold =
+//         SESSION_AGING_INTERVAL * rte_get_timer_hz() / 1000;
+//     uint32_t idx = entry->start_psn % MAX_PSN_ARRAY;
+//     if (entry->mbuf_array[idx]->recv_stamp < aging_threshold) {
+//         return;
+//     }
+
+//     uint32_t aged = aging_check_binary(entry, entry->start_psn, entry->end_psn,
+//                                        aging_threshold);
+//     if (aged > 0) {
+//         printf("Connection aging: removed %u old packets\n", aged);
+//     }
+// }
 
 // ============全局老化线程相关==================
 
 // 清理指定桶的所有连接条目（供老化线程调用）
 int clean_cache_bucket(uint32_t bucket_idx) {
-    // 基础校验：全局连接表/桶索引有效性
-    if (g_data.cache_tbl_v4 == NULL ||
-        bucket_idx >= g_data.cache_tbl_v4->num_buckets) {
+    // 基础校验：全局表有效 + 桶索引合法 + 桶数组非空
+    struct cache_hash_v4 *ht = (struct cache_hash_v4 *)g_data.cache_tbl_v4;
+    if (ht == NULL || bucket_idx >= ht->num_buckets || ht->buckets == NULL) {
         return 0;
     }
 
     int cleaned_count = 0;
-    struct cache_entry_v4 *prev = NULL;
-    struct cache_entry_v4 *curr = g_data.cache_tbl_v4->buckets[bucket_idx];
-
-    // 桶级加自旋锁：保护整个桶的链表遍历/修改（兼容锁数组为空的边界情况）
-    if (g_data.cache_tbl_v4->bucket_locks != NULL) {
-        pthread_spin_lock(&g_data.cache_tbl_v4->bucket_locks[bucket_idx]);
-    }
-
-    // 遍历桶内所有连接条目（与旧版链表遍历逻辑完全一致）
-    while (curr != NULL) {
-        struct cache_entry_v4 *to_delete = curr; // 标记待删除条目
-        // 先移动遍历指针，避免删除后指针丢失（旧版经典写法，防止链表断裂）
-        curr = curr->next;
-
-        // 条目级加自旋锁：保护单个条目的资源释放操作
-        pthread_spin_lock(&to_delete->lock);
-
-        // 清理定时器：按导师逻辑标记为无效，由定时器系统统一清理（补充delay_nak_timer_fd）
-        if (to_delete->rnr_timer_fd >= 0) {
-            to_delete->rnr_timer_fd = -1;
-        }
-        if (to_delete->delay_nak_timer_fd >= 0) {
-            to_delete->delay_nak_timer_fd = -1;
-        }
-
-        // 释放条目内所有缓存的报文：复用现有destroy_pkt_cache，置空指针
-        for (int j = 0; j < MAX_PSN_ARRAY; j++) {
-            if (to_delete->mbuf_array[j] != NULL) {
-                destroy_pkt_cache(to_delete->mbuf_array[j]);
-                to_delete->mbuf_array[j] = NULL;
-            }
-        }
-
-        // 释放条目资源：解锁→销毁条目自旋锁→DPDK内存释放
-        pthread_spin_unlock(&to_delete->lock);
-        pthread_spin_destroy(&to_delete->lock);
-        rte_free(to_delete);
-
-        // 调整链表指针：与旧版clean_idle_entry逻辑一致
-        if (prev == NULL) {
-            // 待删除是头节点，更新桶的头指针
-            g_data.cache_tbl_v4->buckets[bucket_idx] = curr;
+    // 循环调用导师函数：直到桶内无条目（删除后桶头会更新，需循环判断）
+    while (ht->buckets[bucket_idx] != NULL) {
+        // 取桶头条目的key，调用导师函数删除（核心：用自身key实现伪单删的批量效果）
+        struct cache_key_v4 *entry_key = &ht->buckets[bucket_idx]->key;
+        if (delete_cache_entry_v4(ht, entry_key) == OK) {
+            cleaned_count++;
         } else {
-            // 待删除是中间/尾节点，更新前驱的next指针
-            prev->next = curr;
+            // 单个删除失败（无条目/异常），直接退出循环
+            break;
         }
-
-        cleaned_count++; // 累加清理数量
-        prev = NULL;     // 已删除节点，前驱置空（下一个节点重新开始）
-    }
-
-    // 桶级解锁：兼容锁数组为空的边界情况
-    if (g_data.cache_tbl_v4->bucket_locks != NULL) {
-        pthread_spin_unlock(&g_data.cache_tbl_v4->bucket_locks[bucket_idx]);
     }
 
     return cleaned_count;

@@ -23,7 +23,14 @@ static int insert_packet_to_cache_v4(struct cache_entry_v4 *entry,
 
 
 
+// 报文老化操作
 
+// 连接老化检查（递归二分法批量老化）
+uint32_t aging_check_binary(struct cache_entry_v4 *entry,
+                                   uint32_t start_psn, uint32_t end_psn,
+                                   uint64_t aging_threshold);
+
+void age_expired_packets(struct cache_entry_v4 *entry);                                   
 
 
 
@@ -51,6 +58,10 @@ int is_psn_expired(struct cache_entry_v4 *entry, uint32_t psn,
 
 // ================全局资源老化函数========================
 
+// 清理指定桶的所有连接条目（供老化线程调用）
+int clean_cache_bucket(uint32_t bucket_idx);
 
+// 清理所有桶的连接条目（供老化线程调用）
+int clean_all_cache_buckets(void);
 
 #endif // CONNECTION_TABLE_H

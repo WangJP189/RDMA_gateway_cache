@@ -780,6 +780,22 @@ int is_conn_idle_expired(struct connection_cache_array *cache_array) {
     return 0;
 }
 
+// 辅助函数：判断psn是否在[start, end]的环形区间内（24位PSN回绕兼容）
+// 返回1表示在区间内，0表示不在
+static int psn_in_ring_range(uint32_t psn, uint32_t start, uint32_t end) {
+    psn &= PSN_MASK;
+    start &= PSN_MASK;
+    end &= PSN_MASK;
+
+    if (psn_less_than(start, end)) {
+        // 无回绕区间：start < end → psn >= start 且 psn <= end
+        return !psn_less_than(psn, start) && psn_less_than(psn, end + 1);
+    } else {
+        // 回绕区间：start > end → psn >= start 或 psn <= end
+        return !psn_less_than(psn, start) || psn_less_than(psn, end + 1);
+    }
+}
+
 //====================缓存数据包相关函数=====================
 
 // 将数据包存入连接缓存结构体
@@ -917,25 +933,39 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
         return RETRANS_NO_VALID_PSN_RANGE;
     }
 
-    // 仅保留ack_msn的24位有效部分，避免高位干扰，统一做掩码处理
-    uint32_t temp_end = ack_msn & PSN_MASK;
+    // 步骤1：统一掩码处理，仅保留24位有效位（核心修复点1）
+    uint32_t target_ack_msn = ack_msn;
     uint32_t current_start = conn->start_psn;
     uint32_t current_end = conn->end_psn;
     int cleaned_count = 0;
 
+    // 步骤2：校验ACK的MSN是否需要清理（核心修复点2）
+    // 场景1：ack_msn < current_start（非回绕）→ 无需要清理的包
+    // 场景2：ack_msn 不在[current_start, current_end]环形区间内 →
+    // 无需要清理的包
+    if (psn_less_than(target_ack_msn, current_start) ||
+        !psn_in_ring_range(target_ack_msn, current_start, current_end)) {
+        printf(
+            "[ACK CLEAN] ACK MSN=%u 无需要清理的报文 | 当前PSN范围=[%u~%u]\n",
+            target_ack_msn, current_start, current_end);
+        return 0;
+    }
+
+    // 步骤3：打印合法的清理区间日志（核心修复点3）
     printf("[ACK CLEAN] 开始清理已确认报文：ACK MSN=%u | 原始PSN范围=[%u~%u] | "
            "清理区间=[%u~%u]\n",
-           temp_end, current_start, current_end, current_start, temp_end);
+           target_ack_msn, current_start, current_end, current_start,
+           target_ack_msn);
 
-    // 批量清理指定PSN区间的数据包
-    cleaned_count = batch_clean_psn_range(conn, current_start, temp_end);
+    // 步骤4：调用兼容回绕的批量清理函数
+    cleaned_count = batch_clean_psn_range(conn, current_start, target_ack_msn);
 
-    // 计算新的起始PSN，处理回绕+仅保留24位有效位
-    uint32_t new_start = (temp_end + 1) & PSN_MASK;
+    // 步骤5：计算新的起始PSN，处理回绕+仅保留24位有效位
+    uint32_t new_start = (target_ack_msn + 1) & PSN_MASK;
     printf("[ACK CLEAN] 清理完成：释放已确认报文=%d个 | 新start_psn=%u\n",
            cleaned_count, new_start);
 
-    // 判断是否所有包都被清理（环形语境下new_start大于current_end代表无剩余包）
+    // 步骤6：判断是否所有包都被清理（环形语境）
     if (psn_greater_than(new_start, current_end)) {
         // 无剩余有效包，重置PSN核心参数
         conn->start_psn = PSN_INVALID;
@@ -943,7 +973,7 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
         conn->cur_psn = 0;
         printf("[ACK CLEAN] 所有报文已被清理，重置PSN参数\n");
     } else {
-        // 有剩余有效包，仅更新start_psn，end_psn保持不变
+        // 有剩余有效包，仅更新start_psn（24位掩码后赋值）
         conn->start_psn = new_start;
     }
 

@@ -263,4 +263,7 @@ uint32_t find_valid_min_psn(struct connection_cache_array *conn);
 // 判断连接是否空闲超时
 int is_conn_idle_expired(struct connection_cache_array *conn);
 
+// 辅助函数：判断psn是否在[start, end]的环形区间内（24位PSN回绕兼容）
+static int psn_in_ring_range(uint32_t psn, uint32_t start, uint32_t end);
+
 #endif

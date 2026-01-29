@@ -376,18 +376,7 @@ int parse_aeth_header(const unsigned char *aeth_start, uint8_t *syndrome,
     return 0;
 }
 
-/**
- * @brief 处理收到的ACK报文，匹配对应连接并清理已确认的数据包(PSN ≤ epsn)
- * @param bucket 哈希桶指针，指定要遍历的桶
- * @param key 待匹配的连接四元组key(src_ip/dst_ip/src_qp/dst_qp/pkey)
- * @param epsn ACK报文中携带的最大确认PSN，清理该值及之前的所有报文
- * @note 1. 哈希桶加【读锁】，仅遍历查找不修改链表，支持并发读，性能最优
- * @note 2.
- * 连接匹配规则：connection_key的src_ip/dst_ip/src_qp/dst_qp/pkey全字段严格匹配
- * @note 3. 健壮性校验：空指针/无效连接/空缓存数组 全过滤，无崩溃风险
- * @note 4. PSN仅保留24位有效位，统一掩码处理，避免高位数据干扰
- * @note 5. 遍历完成后必解锁，无锁泄漏风险
- */
+// 遍历缓存，处理ACK确认的报文
 void handle_ack_received(const unsigned char *buffer, ssize_t length,
                          struct connection_bucket *bucket,
                          struct connection_key key, uint32_t epsn,
