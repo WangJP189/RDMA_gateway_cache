@@ -627,7 +627,7 @@ int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
         cleaned_count++;
 
         // 日志输出（简化回绕段标识，保持可读性）
-        printf("[EXPIRED BATCH] PSN=%u | 批量清理过期数据包\n", current_psn);
+        printf("[EXPIRED BATCH] PSN=%u | 批量清理数据包\n", current_psn);
     }
 
     return cleaned_count;
@@ -782,7 +782,7 @@ int is_conn_idle_expired(struct connection_cache_array *cache_array) {
 
 // 辅助函数：判断psn是否在[start, end]的环形区间内（24位PSN回绕兼容）
 // 返回1表示在区间内，0表示不在
-static int psn_in_ring_range(uint32_t psn, uint32_t start, uint32_t end) {
+int psn_in_ring_range(uint32_t psn, uint32_t start, uint32_t end) {
     psn &= PSN_MASK;
     start &= PSN_MASK;
     end &= PSN_MASK;
@@ -933,8 +933,7 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
         return RETRANS_NO_VALID_PSN_RANGE;
     }
 
-    // 步骤1：统一掩码处理，仅保留24位有效位（核心修复点1）
-    uint32_t target_ack_msn = ack_msn;
+    uint32_t target_ack_msn = ack_msn & PSN_MASK; // 仅保留24位有效位;
     uint32_t current_start = conn->start_psn;
     uint32_t current_end = conn->end_psn;
     int cleaned_count = 0;
