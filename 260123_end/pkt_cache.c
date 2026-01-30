@@ -562,6 +562,9 @@ uint64_t get_current_timestamp_ms(void) {
 int psn_less_than(uint32_t a, uint32_t b) {
     // 1. 差值>半周期 → a在环形中位于b的“后方”（物理回绕后），即a < b
     // 2. 差值≤半周期 → a在环形中位于b的“前方”（无回绕），即a > b
+    a = a & PSN_MASK;
+    b = b & PSN_MASK;
+
     uint32_t ring_diff = (a - b) & PSN_MASK;
 
     return ring_diff > PSN_HALF_CYCLE;
@@ -786,17 +789,14 @@ int is_conn_idle_expired(struct connection_cache_array *cache_array) {
 // 辅助函数：判断psn是否在[start, end]的环形区间内（24位PSN回绕兼容）
 // 返回1表示在区间内，0表示不在
 int psn_in_ring_range(uint32_t psn, uint32_t start, uint32_t end) {
-    psn &= PSN_MASK;
-    start &= PSN_MASK;
-    end &= PSN_MASK;
 
-    if (psn_less_than(start, end)) {
-        // 无回绕区间：start < end → psn >= start 且 psn <= end
-        return !psn_less_than(psn, start) && psn_less_than(psn, end + 1);
-    } else {
-        // 回绕区间：start > end → psn >= start 或 psn <= end
-        return !psn_less_than(psn, start) || psn_less_than(psn, end + 1);
+    // 环形语境下：psn < start  OR  psn > end → 不在[start, end]区间内
+    if (psn_less_than(psn, start) || psn_greater_than(psn, end)) {
+        return 0; // 不在区间内
     }
+
+    // 非上述情况 → psn在[start, end]环形区间内
+    return 1; // 在区间内
 }
 
 //====================缓存数据包相关函数=====================
@@ -963,8 +963,7 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
     }
 
     // 原有校验：ACK MSN小于start_psn 或 不在环形区间内 → 无需清理
-    if (psn_less_than(target_ack_msn, current_start) ||
-        !psn_in_ring_range(target_ack_msn, current_start, current_end)) {
+    if (!psn_in_ring_range(target_ack_msn, current_start, current_end)) {
         printf(
             "[ACK CLEAN] ACK MSN=%u 无需要清理的报文 | 当前PSN范围=[%u~%u]\n",
             target_ack_msn, current_start, current_end);
