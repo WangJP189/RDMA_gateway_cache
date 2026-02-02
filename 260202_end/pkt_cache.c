@@ -557,21 +557,35 @@ uint64_t get_current_timestamp_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-// 辅助函数：判断2个24位PSN的循环大小（考虑溢出场景）
-// 环形语境下判断a是否小于b（仅针对24位PSN，核心解决物理回绕后的大小判断）
+// 环形语境下判断a是否小于b（仅24位PSN，独立逻辑，无外部依赖）
+// 返回1：a < b；返回0：a ≥ b（a==b 或 a > b）
 int psn_less_than(uint32_t a, uint32_t b) {
-    // 1. 差值>半周期 → a在环形中位于b的“后方”（物理回绕后），即a < b
-    // 2. 差值≤半周期 → a在环形中位于b的“前方”（无回绕），即a > b
-    uint32_t ring_diff = (a - b) & PSN_MASK;
+    uint32_t a_24 = a & PSN_MASK;
+    uint32_t b_24 = b & PSN_MASK;
 
-    return ring_diff > PSN_HALF_CYCLE;
+    // 步骤2：等值直接返回0
+    if (a_24 == b_24) {
+        return 0;
+    }
+
+    uint32_t forward_steps = (b_24 - a_24) & PSN_MASK;
+
+    return (forward_steps <= PSN_HALF_CYCLE) ? 1 : 0;
 }
 
-// 环形语境下判断a是否大于b（仅针对24位PSN）
+// 环形语境下判断a是否大于b（仅24位PSN，独立逻辑，无外部依赖）
+// 返回1：a > b；返回0：a ≤ b（a==b 或 a < b）
 int psn_greater_than(uint32_t a, uint32_t b) {
-    if (a == b)
+    uint32_t a_24 = a & PSN_MASK;
+    uint32_t b_24 = b & PSN_MASK;
+
+    if (a_24 == b_24) {
         return 0;
-    return !psn_less_than(a, b);
+    }
+
+    uint32_t forward_steps = (b_24 - a_24) & PSN_MASK;
+
+    return (forward_steps > PSN_HALF_CYCLE) ? 1 : 0;
 }
 
 // 判断单个PSN是否过期
