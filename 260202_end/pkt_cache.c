@@ -1040,7 +1040,18 @@ void age_expired_packets(struct connection_cache_array *conn) {
         printf("[WARN] 老化处理：start_psn=0x%06X 与内存块PSN=0x%06X "
                "不一致，重置PSN参数\n",
                start_psn, pkt_header->psn);
+        if (conn->ring_buf[ring_idx] != 0) {
+            // 释放被覆盖的无效内存块，解决内存泄漏
+            free((void *)(uintptr_t)conn->ring_buf[ring_idx]);
+            printf("[RELEASE] 已释放索引=%u 对应的失效内存块\n", ring_idx);
+            // 清空环形缓冲区指针，清除脏数据
+            conn->ring_buf[ring_idx] = 0;
+        }
+
+        // 重新查找有效最小PSN，更新缓存参数
         conn->start_psn = find_valid_min_psn(conn);
+        printf("[RESET] 已重置start_psn为最新有效最小值: 0x%06X\n",
+               conn->start_psn);
         return;
     }
 
