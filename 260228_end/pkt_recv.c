@@ -4,6 +4,7 @@
 // ZPY
 
 #include "pkt_recv.h"
+#include "simulate.h"
 
 #include <stdlib.h> // free()
 #include <string.h> // memset()
@@ -173,6 +174,13 @@ void receive_and_parse_frames(int sockfd) {
             }
             continue;
         }
+
+        // 新增：报文接收成功，统计接收报文
+        if (g_perf_monitoring) {
+            record_packet(&g_perf_stats,
+                          msg_len); // msg_len是实际接收的报文长度
+        }
+
         process_rdma_packet(buffer, msg_len);
     }
     free(buffer);
@@ -494,7 +502,11 @@ int is_packet_lost(struct connection_cache_array *conn, uint32_t psn) {
     uint32_t psn_masked = psn & PSN_MASK;
     int ring_index = psn_masked % RING_BUFFER_SIZE;
     // 判断标准：缓存数组中对应位置为空或者当前数缓存报文的psn和真实psn不相等，则视为丢包
-    if (conn->ring_buf[ring_index] == NULL) {
+    if (conn->ring_buf[ring_index] == 0) {
+        // 新增：统计丢包
+        if (g_perf_monitoring) {
+            record_drop_packet(&g_perf_stats);
+        }
         return 1; // 丢包
     } else {
         // 存在缓存数据，需要判断PSN是否匹配
@@ -505,9 +517,13 @@ int is_packet_lost(struct connection_cache_array *conn, uint32_t psn) {
         // 检查头部PSN是否匹配
         if ((header->psn & PSN_MASK) != psn_masked) {
             // PSN不匹配，视为丢包
+            // 新增：统计丢包
+            if (g_perf_monitoring) {
+                record_drop_packet(&g_perf_stats);
+            }
             // 释放对应内存块,并将缓存位置设为NULL
             free(mem_block);
-            conn->ring_buf[ring_index] = NULL;
+            conn->ring_buf[ring_index] = 0;
             return 1;
         }
         return 0; // 未丢包
@@ -539,7 +555,7 @@ lost_segment *calculate_bitmap_loss(struct connection_cache_array *conn,
     // 遍历所有PSN
     for (uint32_t i = 0; i < count; i++) {
         uint32_t current_psn = (start_psn + i) & PSN_MASK;
-        uint32_t ring_index = current_psn % RING_BUFFER_SIZE;
+        // uint32_t ring_index = current_psn % RING_BUFFER_SIZE;
         if (is_packet_lost(conn, current_psn)) {
             if (seg_count >= MAX_LOST_SEGMENTS) {
                 // 避免越界写导致堆损坏
@@ -796,6 +812,10 @@ void retransmit_rdma_packet(const unsigned char *packet_data, int length,
         fprintf(stderr, "sendto failed: %s\n", strerror(errno));
         close_retransmit_sockfd(); // 关闭socket，重置全局变量
     } else {
+        // 新增：重传成功，统计重传报文
+        if (g_perf_monitoring) {
+            record_retransmit_packet(&g_perf_stats);
+        }
         printf("通过 %s 发送 %zd 字节 (PSN=%u, QP=%u)\n", ifname, sent, psn,
                dest_qp);
     }
@@ -930,9 +950,13 @@ void retransmit_latest_one_packet(struct connection_cache_array *conn,
             // 此处的dest_qp应为NACK报文的发送端QP（src_qp）
             retransmit_rdma_packet(rdma_packet_data, header->data_len,
                                    interface_name, header->psn, src_qp);
+            // 新增：重传触发时统计（可选，也可只在retransmit_rdma_packet中统计）
+            if (g_perf_monitoring) {
+                record_retransmit_packet(&g_perf_stats);
+            }
             printf("[GBN_RETRANSMIT] 重传PSN=%u | 环形数组索引=%d | "
                    "内存块地址=0x%lx\n",
-                   psn, ring_index, packet_data);
+                   psn, ring_index, (uintptr_t)packet_data);
             break; // 只重传第1个缓存报文
         }
     }
@@ -980,7 +1004,7 @@ int dst_gateway_gbn_retransmit(struct connection_cache_array *conn,
             retransmit_count++;
             printf("[GBN_RETRANSMIT] 重传PSN=%u | 环形数组索引=%d | "
                    "内存块地址=0x%lx\n",
-                   psn, ring_index, packet_data);
+                   psn, ring_index, (uintptr_t)packet_data);
         }
     }
     if (loss_packet_found) {

@@ -3,6 +3,7 @@
 
 #include "pkt_cache.h"
 #include "rdma_opcode.h"
+#include "simulate.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/types.h>

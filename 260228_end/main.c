@@ -10,6 +10,7 @@
 
 #include "pkt_cache.h"
 #include "pkt_recv.h"
+#include "simulate.h"
 
 // ZPY
 #include <net/if.h> // if_nametoindex()-将接口名转换为索引号
@@ -21,6 +22,11 @@ volatile sig_atomic_t g_running = 1;             // 全局线程控制标记
 pthread_t g_aging_tid = 0;                       // 老化线程ID
 uint32_t g_total_cleaned_conn = 0;               // 累计清理连接数
 pthread_t g_receiver_thread = 0;                 // 全局接收线程ID
+
+// 性能测试全局统计
+PerfStats g_perf_stats;
+// 性能监控开关
+volatile sig_atomic_t g_perf_monitoring = 0;
 
 // ZPY
 pthread_t g_retransmit_thread = 0; // 全局重传线程ID
@@ -87,7 +93,6 @@ void display_menu(void) {
     printf("4. 停止报文接收\n");
 
     printf("--- 本端作为服务端 (接收对端请求) ---\n");
-    // ZPY
     printf("5. 启动服务端SR重传线程\n");
 
     printf("--- 本端作为客户端 (发送SR请求) ---\n");
@@ -97,10 +102,15 @@ void display_menu(void) {
     printf("8. 设置目的网关和源网关AF_PACKET接口名称\n");
 
     printf("9. 启动全局资源老化线程\n");
-    // ZPY
+
+    // 新增性能测试菜单
+    printf("--- 性能测试相关 ---\n");
+    printf("10. 启动性能监控\n");
+    printf("11. 停止性能监控并查看统计\n");
+    printf("12. 重置性能统计数据\n");
 
     printf("0. 退出程序\n");
-    printf("请选择操作 (0-11): ");
+    printf("请选择操作 (0-12): ");
 }
 
 /**
@@ -324,6 +334,41 @@ void menu_start_age_thread(void) {
 }
 
 /**
+ * 功能10: 启动性能监控
+ */
+void start_perf_test(void) {
+    if (g_perf_monitoring) {
+        printf("性能监控已在运行中！\n");
+        return;
+    }
+    reset_perf_stats(&g_perf_stats);
+    start_perf_monitor(&g_perf_stats);
+    g_perf_monitoring = 1;
+    printf("性能监控已启动...\n");
+}
+
+/**
+ * 功能11: 停止性能监控并打印统计
+ */
+void stop_perf_test(void) {
+    if (!g_perf_monitoring) {
+        printf("性能监控未运行！\n");
+        return;
+    }
+    stop_perf_monitor(&g_perf_stats);
+    g_perf_monitoring = 0;
+    print_perf_stats(&g_perf_stats);
+}
+
+/**
+ * 功能12: 重置性能统计
+ */
+void reset_perf_data(void) {
+    reset_perf_stats(&g_perf_stats);
+    printf("性能统计数据已重置！\n");
+}
+
+/**
  * 主程序循环
  */
 void menu_loop(void) {
@@ -375,6 +420,16 @@ void menu_loop(void) {
         case 9:
             menu_start_age_thread();
             break;
+            // 新增性能测试相关case
+        case 10:
+            start_perf_test();
+            break;
+        case 11:
+            stop_perf_test();
+            break;
+        case 12:
+            reset_perf_data();
+            break;
         default:
             printf("无效选择，请重新输入\n");
             break;
@@ -394,6 +449,10 @@ void menu_loop(void) {
  * 程序入口点
  */
 int main(void) {
+
+    // 初始化性能统计
+    init_perf_stats(&g_perf_stats);
+
     // [新增] 系统级初始化：最先执行
     // 必须确保在任何线程启动前，锁和表结构已经准备好
     if (init_connection_table() != 0) {

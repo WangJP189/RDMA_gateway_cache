@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <time.h>
+#include <signal.h>
 
 // 性能统计数据结构
 typedef struct {
@@ -15,6 +16,11 @@ typedef struct {
     double avg_throughput;        // 平均吞吐量 (MB/s)
     double avg_latency;           // 平均时延 (ms)
 } PerfStats;
+
+// 新增：声明全局性能统计变量（extern表示变量在其他文件定义）
+extern PerfStats g_perf_stats;
+// 新增：声明全局性能监控开关
+extern volatile sig_atomic_t g_perf_monitoring;
 
 // 初始化性能统计
 void init_perf_stats(PerfStats *stats);

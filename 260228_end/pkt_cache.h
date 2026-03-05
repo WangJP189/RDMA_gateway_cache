@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "simulate.h"
+
 // #include <bits/pthreadtypes.h>
 
 // 大小定义
@@ -250,7 +252,7 @@ uint64_t get_current_timestamp_ms(void);
 int psn_less_than(uint32_t a, uint32_t b);
 
 // PSN比较函数，处理24位PSN的回绕问题,主要判断end_psn是否需要更新
-int psn_greater_equal(uint32_t a, uint32_t b);
+int psn_greater_than(uint32_t a, uint32_t b);
 
 // 批量清理指定PSN范围内的数据包
 int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
