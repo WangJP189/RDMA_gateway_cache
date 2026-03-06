@@ -50,7 +50,5 @@ static inline uint32_t find_valid_min_psn(uintptr_t *ring_buf,
                                           uint32_t array_length,
                                           uint32_t start_psn, uint32_t end_psn);
 
-// 5. 24位PSN回绕辅助判断（通用工具，补充原有PSN比较逻辑）
-static inline bool is_psn_wrap_around(uint32_t a, uint32_t b);
 
 #endif // UTILS_H

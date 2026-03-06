@@ -80,3 +80,59 @@ static inline bool is_psn_greater(uint32_t a, uint32_t b) {
 static inline bool is_psn_less(uint32_t a, uint32_t b) {
     return ((b - a) & PSN_MASK) < PSN_HALF_CYCLE && a != b;
 }
+
+
+
+
+//-----------------WJP-----------------
+
+// 辅助函数：判断psn是否在[start, end]的环形区间内（24位PSN回绕兼容）
+// 返回1表示在区间内，0表示不在
+int psn_in_ring_range(uint32_t psn, uint32_t start, uint32_t end) {
+
+    // 环形语境下：psn < start  OR  psn > end → 不在[start, end]区间内
+    if (psn_less_than(psn, start) || psn_greater_than(psn, end)) {
+        return 0; // 不在区间内
+    }
+
+    // 非上述情况 → psn在[start, end]环形区间内
+    return 1; // 在区间内
+}
+
+// 辅助函数：获取当前系统的毫秒级时间戳
+uint64_t get_current_timestamp_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts); // 使用单调时钟，避免系统时间修改影响
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+// 辅助函数：重新查找当前连接中有效的最小PSN（修正失效的start_psn）
+uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
+
+    uint32_t min_psn = PSN_INVALID;
+    // 遍历整个环形缓冲区，查找所有有效数据块
+    for (int i = 0; i < conn->array_length; i++) {
+        if (conn->ring_buf[i] == 0) {
+            continue; // 空位置跳过
+        }
+
+        struct mem_block_header *hdr =
+            (struct mem_block_header *)(uintptr_t)conn->ring_buf[i];
+        if (!hdr) {
+            continue;
+        }
+
+        uint32_t curr_psn = hdr->psn;
+        // 第一次找到有效PSN，直接赋值
+        if (min_psn == PSN_INVALID) {
+            min_psn = curr_psn;
+        } else {
+            // 环形语境下比较，找到更小的PSN
+            if (psn_less_than(curr_psn, min_psn)) {
+                min_psn = curr_psn;
+            }
+        }
+    }
+
+    return min_psn;
+}
