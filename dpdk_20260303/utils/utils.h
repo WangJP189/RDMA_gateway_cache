@@ -37,4 +37,20 @@ static inline uint32_t cache_hash_v4_func(const struct cache_key_v4 *key);
 static inline bool is_psn_greater(uint32_t a, uint32_t b);
 static inline bool is_psn_less(uint32_t a, uint32_t b);
 
+// ========== 从pkt_cache.h迁移并适配DPDK的工具函数声明 ==========
+// 1. PSN范围判断（考虑24位回绕，通用工具）
+static inline bool psn_in_ring_range(uint32_t psn, uint32_t start,
+                                     uint32_t end);
+
+// 3. 毫秒级时间戳获取（DPDK适配，替换原始time.h实现）
+static inline uint64_t get_current_timestamp_ms(void);
+
+// 4. 查找环形数组中最小有效PSN（通用环形数组操作，无业务耦合）
+static inline uint32_t find_valid_min_psn(uintptr_t *ring_buf,
+                                          uint32_t array_length,
+                                          uint32_t start_psn, uint32_t end_psn);
+
+// 5. 24位PSN回绕辅助判断（通用工具，补充原有PSN比较逻辑）
+static inline bool is_psn_wrap_around(uint32_t a, uint32_t b);
+
 #endif // UTILS_H
