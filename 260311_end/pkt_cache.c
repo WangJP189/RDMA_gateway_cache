@@ -427,21 +427,21 @@ get_connection_cache_array(struct connection_bucket *bucket,
         is_new = 1;
     }
 
-    // 2. 打印缓存结构体详细信息
-    if (cache) {
-        printf(">>> [CACHE INFO] Status: %s | SrcQP: %u\n",
-               is_new ? "CREATED (New)" : "FOUND (Existing)", key.src_qp);
-        printf("    |-- Base Addr  : %p\n", (void *)cache);
-        printf("    |-- Array Len  : %u\n", cache->array_length);
-        printf("    |-- RingBuf Ptr: %p\n", (void *)cache->ring_buf);
-        printf("    |-- PSN Info   : Start=%u, End=%u, Cur=%u\n",
-               cache->start_psn, cache->end_psn, cache->cur_psn);
-        printf("    |-- Last Active: %lu\n", cache->last_active_stamp);
-        printf("--------------------------------------------------\n");
-    } else {
-        printf(">>> [CACHE INFO] Failed to get/create cache for SrcQP: %u\n",
-               key.src_qp);
-    }
+    // // 2. 打印缓存结构体详细信息
+    // if (cache) {
+    //     printf(">>> [CACHE INFO] Status: %s | SrcQP: %u\n",
+    //            is_new ? "CREATED (New)" : "FOUND (Existing)", key.src_qp);
+    //     printf("    |-- Base Addr  : %p\n", (void *)cache);
+    //     printf("    |-- Array Len  : %u\n", cache->array_length);
+    //     printf("    |-- RingBuf Ptr: %p\n", (void *)cache->ring_buf);
+    //     printf("    |-- PSN Info   : Start=%u, End=%u, Cur=%u\n",
+    //            cache->start_psn, cache->end_psn, cache->cur_psn);
+    //     printf("    |-- Last Active: %lu\n", cache->last_active_stamp);
+    //     printf("--------------------------------------------------\n");
+    // } else {
+    //     printf(">>> [CACHE INFO] Failed to get/create cache for SrcQP: %u\n",
+    //            key.src_qp);
+    // }
 
     return cache;
 }
@@ -641,7 +641,7 @@ int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
         cleaned_count++;
 
         // 日志输出（简化回绕段标识，保持可读性）
-        printf("[EXPIRED BATCH] PSN=%u | 批量清理过期数据包\n", current_psn);
+        // printf("[EXPIRED BATCH] PSN=%u | 批量清理过期数据包\n", current_psn);
     }
 
     return cleaned_count;
@@ -651,22 +651,22 @@ int batch_clean_psn_range(struct connection_cache_array *conn, uint32_t start,
 void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
                     uint32_t end_psn, uint64_t current_timestamp_ms) {
 
-    printf("[AGE-BINARY] 二分老化处理：PSN缓存范围=[0x%06X~0x%06X]\n",
-           start_psn, end_psn);
+    // printf("[AGE-BINARY] 二分老化处理：PSN缓存范围=[0x%06X~0x%06X]\n",
+    //        start_psn, end_psn);
     int clean_count = 0;
 
     // 分支1：全量过期
     // 核心准则：end_psn是当前区间最大PSN，只要它过期 → 整个区间所有PSN都过期
     if (is_psn_expired(conn, end_psn, current_timestamp_ms)) {
-        printf("[AGE-BINARY] 判定：全量PSN过期，清理整个区间[0x%06X~0x%06X]\n",
-               start_psn, end_psn);
+        // printf("[AGE-BINARY] 判定：全量PSN过期，清理整个区间[0x%06X~0x%06X]\n",
+        //        start_psn, end_psn);
         clean_count = batch_clean_psn_range(conn, start_psn, end_psn);
         // 全量过期后，直接重置PSN核心参数
         conn->start_psn = PSN_INVALID;
         conn->end_psn = PSN_INVALID;
         conn->cur_psn = 0;
-        printf("[AGE-BINARY] 全量老化完成，共清理=%d个数据包，已重置PSN参数\n",
-               clean_count);
+        // printf("[AGE-BINARY] 全量老化完成，共清理=%d个数据包，已重置PSN参数\n",
+        //        clean_count);
         return;
     }
 
@@ -679,7 +679,7 @@ void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
     }
     // 仅1个PSN且未过期 → 无过期数据
     if (range_size <= 1) {
-        printf("[AGE-BINARY] 判定：无过期PSN数据包\n");
+        // printf("[AGE-BINARY] 判定：无过期PSN数据包\n");
         return;
     }
 
@@ -714,17 +714,17 @@ void binary_age_psn(struct connection_cache_array *conn, uint32_t start_psn,
 
     // 部分过期：查找到最大过期PSN，批量清理
     if (last_expired_psn != PSN_INVALID) {
-        printf("[AGE-BINARY] "
-               "判定：部分PSN过期，最大过期PSN=0x%06X，执行批量清理\n",
-               last_expired_psn);
+        // printf("[AGE-BINARY] "
+        //        "判定：部分PSN过期，最大过期PSN=0x%06X，执行批量清理\n",
+        //        last_expired_psn);
         clean_count = batch_clean_psn_range(conn, start_psn, last_expired_psn);
         // 部分过期后，更新起始PSN（无需重置，仅推进start_psn）
         conn->start_psn = (last_expired_psn + 1) & PSN_MASK;
-        printf("[AGE-BINARY] "
-               "部分老化完成，共清理=%d个数据包，新start_psn=0x%06X\n",
-               clean_count, conn->start_psn);
+        // printf("[AGE-BINARY] "
+        //        "部分老化完成，共清理=%d个数据包，新start_psn=0x%06X\n",
+        //        clean_count, conn->start_psn);
     } else {
-        printf("[AGE-BINARY] 判定：无过期PSN数据包\n");
+        // printf("[AGE-BINARY] 判定：无过期PSN数据包\n");
     }
 }
 
@@ -764,7 +764,7 @@ uint32_t find_valid_min_psn(struct connection_cache_array *conn) {
 int is_conn_idle_expired(struct connection_cache_array *cache_array) {
     // 容错1：缓存结构体为空，返回异常
     if (cache_array == NULL) {
-        printf("[ERROR] 判定连接过期失败：cache_array为空指针\n");
+        // printf("[ERROR] 判定连接过期失败：cache_array为空指针\n");
         return RETRANS_INVALID_PARAM;
     }
 
@@ -774,9 +774,9 @@ int is_conn_idle_expired(struct connection_cache_array *cache_array) {
 
     // 容错2：处理时间戳回拨（当前时间 < 最后活跃时间）
     if (current_ms < last_active) {
-        printf("[WARN] 系统时间回拨：current_ms=%lu < "
-               "last_active=%lu，判定为未过期\n",
-               current_ms, last_active);
+        // printf("[WARN] 系统时间回拨：current_ms=%lu < "
+        //        "last_active=%lu，判定为未过期\n",
+        //        current_ms, last_active);
         return 0;
     }
 
@@ -785,8 +785,8 @@ int is_conn_idle_expired(struct connection_cache_array *cache_array) {
 
     // 核心判定逻辑：空闲时长 ≥ 连接老化阈值（30000ms）→ 过期
     if (idle_time >= CONN_IDLE_EXPIRE_THRESHOLD) {
-        printf("[DEBUG] 连接空闲时长=%lu ms ≥ 阈值=%d ms，判定为过期\n",
-               idle_time, CONN_IDLE_EXPIRE_THRESHOLD);
+        // printf("[DEBUG] 连接空闲时长=%lu ms ≥ 阈值=%d ms，判定为过期\n",
+        //        idle_time, CONN_IDLE_EXPIRE_THRESHOLD);
         return 1;
     }
 
@@ -835,8 +835,8 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
     }
 
     // 4. 打印缓存成功日志
-    printf("[INFO] 数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n", psn,
-           packet_len, conn_cache->start_psn, conn_cache->end_psn);
+    // printf("[INFO] 数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n", psn,
+    //        packet_len, conn_cache->start_psn, conn_cache->end_psn);
     return 0;
 }
 
@@ -865,17 +865,17 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     if (conn->ring_buf[ring_index] != 0) {
         unsigned char *old_mem_block =
             (unsigned char *)conn->ring_buf[ring_index];
-        printf("[OVERWRITE] 环形数组索引=%d "
-               "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
-               ring_index, (uintptr_t)old_mem_block);
+        // printf("[OVERWRITE] 环形数组索引=%d "
+        //        "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
+        //        ring_index, (uintptr_t)old_mem_block);
         free(old_mem_block); // 释放旧数据包内存
     }
 
     // 存入新数据包地址
     conn->ring_buf[ring_index] = (uintptr_t)mem_block;
-    printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | "
-           "数据长度=%d | 时间戳=%lu ms\n",
-           psn, ring_index, (uintptr_t)mem_block, data_len, header->recv_stamp);
+    // printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | "
+    //        "数据长度=%d | 时间戳=%lu ms\n",
+    //        psn, ring_index, (uintptr_t)mem_block, data_len, header->recv_stamp);
 
     // 更新连接的PSN参数
     // 处理start_psn：初始状态 或 物理回绕后更小的PSN
@@ -893,9 +893,9 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
                         conn->ring_buf[new_psn_idx];
                 if (new_hdr->psn == psn) { // 确保PSN匹配，防止串包
                     conn->start_psn = psn;
-                    printf(
-                        "[CACHE] 更新start_psn为0x%06X（更小且有有效数据）\n",
-                        psn);
+                    // printf(
+                    //     "[CACHE] 更新start_psn为0x%06X（更小且有有效数据）\n",
+                    //     psn);
                 }
             }
         }
@@ -912,8 +912,8 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     conn->cur_psn = psn;
     conn->last_active_stamp = get_current_timestamp_ms(); // 更新最后活跃时间戳
 
-    printf("[UPDATE] 连接PSN参数：start_psn=%u, end_psn=%u, cur_psn=%u\n",
-           conn->start_psn, conn->end_psn, conn->cur_psn);
+    // printf("[UPDATE] 连接PSN参数：start_psn=%u, end_psn=%u, cur_psn=%u\n",
+    //        conn->start_psn, conn->end_psn, conn->cur_psn);
 
     return 0;
 }
@@ -941,7 +941,7 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
 
     // 空缓存检查：无有效数据包，直接返回
     if (conn->start_psn == PSN_INVALID || conn->end_psn == PSN_INVALID) {
-        printf("[ACK CLEAN] 无有效数据包，无需清理\n");
+        // printf("[ACK CLEAN] 无有效数据包，无需清理\n");
         return RETRANS_NO_VALID_PSN_RANGE;
     }
 
@@ -956,28 +956,28 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
         // 若为非回绕区间且ack_msn > end_psn，仅清理到end_psn为止
         if (psn_greater_than(temp_end, current_end)) {
             temp_end = current_end;
-            printf("[ACK CLEAN] ACK MSN=%u 超出当前缓存PSN范围[%u~%u]，"
-                   "仅清理到end_psn=%u\n",
-                   ack_msn & PSN_MASK, current_start, current_end, temp_end);
+            // printf("[ACK CLEAN] ACK MSN=%u 超出当前缓存PSN范围[%u~%u]，"
+            //        "仅清理到end_psn=%u\n",
+            //        ack_msn & PSN_MASK, current_start, current_end, temp_end);
         } else {
-            printf("[ACK CLEAN] ACK MSN=%u 不在当前缓存PSN范围内[%u~%u]，"
-                   "无需清理\n",
-                   temp_end, current_start, current_end);
+            // printf("[ACK CLEAN] ACK MSN=%u 不在当前缓存PSN范围内[%u~%u]，"
+            //        "无需清理\n",
+            //        temp_end, current_start, current_end);
             return RETRANS_NO_VALID_PSN_RANGE;
         }
     }
     // bug修复
-    printf("[ACK CLEAN] 开始清理已确认报文：ACK MSN=%u | 原始PSN范围=[%u~%u] | "
-           "清理区间=[%u~%u]\n",
-           temp_end, current_start, current_end, current_start, temp_end);
+    // printf("[ACK CLEAN] 开始清理已确认报文：ACK MSN=%u | 原始PSN范围=[%u~%u] | "
+    //        "清理区间=[%u~%u]\n",
+    //        temp_end, current_start, current_end, current_start, temp_end);
 
     // 批量清理指定PSN区间的数据包
     cleaned_count = batch_clean_psn_range(conn, current_start, temp_end);
 
     // 计算新的起始PSN，处理回绕+仅保留24位有效位
     uint32_t new_start = (temp_end + 1) & PSN_MASK;
-    printf("[ACK CLEAN] 清理完成：释放已确认报文=%d个 | 新start_psn=%u\n",
-           cleaned_count, new_start);
+    // printf("[ACK CLEAN] 清理完成：释放已确认报文=%d个 | 新start_psn=%u\n",
+    //        cleaned_count, new_start);
 
     // 判断是否所有包都被清理（环形语境下new_start大于current_end代表无剩余包）
     if (psn_greater_than(new_start, current_end)) {
@@ -985,7 +985,7 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
         conn->start_psn = PSN_INVALID;
         conn->end_psn = PSN_INVALID;
         conn->cur_psn = 0;
-        printf("[ACK CLEAN] 所有报文已被清理，重置PSN参数\n");
+        // printf("[ACK CLEAN] 所有报文已被清理，重置PSN参数\n");
     } else {
         // 有剩余有效包，仅更新start_psn，end_psn保持不变
         conn->start_psn = new_start;
@@ -1014,7 +1014,7 @@ void age_expired_packets(struct connection_cache_array *conn) {
 
     // PSN有效性基础校验
     if (conn->start_psn == PSN_INVALID || conn->end_psn == PSN_INVALID) {
-        printf("[AGE-PERIODIC] 老化处理：无有效PSN范围，无需清理数据包\n");
+        //printf("[AGE-PERIODIC] 老化处理：无有效PSN范围，无需清理数据包\n");
         return;
     }
 
@@ -1023,9 +1023,9 @@ void age_expired_packets(struct connection_cache_array *conn) {
     uint32_t start_psn = conn->start_psn;
     uint32_t ring_idx = start_psn % RING_BUFFER_SIZE;
     if (conn->ring_buf[ring_idx] == 0) {
-        printf("[WARN] 老化处理：start_psn=0x%06X 对应ring_buf索引=%u "
-               "无数据，重置PSN参数\n",
-               start_psn, ring_idx);
+        // printf("[WARN] 老化处理：start_psn=0x%06X 对应ring_buf索引=%u "
+        //        "无数据，重置PSN参数\n",
+        //        start_psn, ring_idx);
         conn->start_psn = find_valid_min_psn(conn);
         return;
     }
@@ -1037,38 +1037,39 @@ void age_expired_packets(struct connection_cache_array *conn) {
 
     // 校验3：start_psn与内存块PSN不匹配，发生覆盖 → 重新查找有效最小PSN
     if (pkt_header->psn != start_psn) {
-        printf("[WARN] 老化处理：start_psn=0x%06X 与内存块PSN=0x%06X "
-               "不一致，重置PSN参数\n",
-               start_psn, pkt_header->psn);
+        // printf("[WARN] 老化处理：start_psn=0x%06X 与内存块PSN=0x%06X "
+        //        "不一致，重置PSN参数\n",
+        //        start_psn, pkt_header->psn);
         if (conn->ring_buf[ring_idx] != 0) {
             // 释放被覆盖的无效内存块，解决内存泄漏
             free((void *)(uintptr_t)conn->ring_buf[ring_idx]);
-            printf("[RELEASE] 已释放索引=%u 对应的失效内存块\n", ring_idx);
+            // printf("[RELEASE] 已释放索引=%u 对应的失效内存块\n", ring_idx);
+
             // 清空环形缓冲区指针，清除脏数据
             conn->ring_buf[ring_idx] = 0;
         }
 
         // 重新查找有效最小PSN，更新缓存参数
         conn->start_psn = find_valid_min_psn(conn);
-        printf("[RESET] 已重置start_psn为最新有效最小值: 0x%06X\n",
-               conn->start_psn);
+        // printf("[RESET] 已重置start_psn为最新有效最小值: 0x%06X\n",
+        //        conn->start_psn);
         return;
     }
 
     // 校验4：未达到老化阈值 → 跳过
     if ((cur_stamp - pkt_header->recv_stamp) < PACKET_AGE_CHECK_INTERVAL) {
-        printf(
-            "[DEBUG] 老化处理：start_psn=0x%06X 未达到老化阈值，当前时间=%lu "
-            "ms | 缓存时间=%lu ms | 阈值=%u ms，本次跳过\n",
-            start_psn, cur_stamp, pkt_header->recv_stamp,
-            PACKET_AGE_CHECK_INTERVAL);
+        // printf(
+        //     "[DEBUG] 老化处理：start_psn=0x%06X 未达到老化阈值，当前时间=%lu "
+        //     "ms | 缓存时间=%lu ms | 阈值=%u ms，本次跳过\n",
+        //     start_psn, cur_stamp, pkt_header->recv_stamp,
+        //     PACKET_AGE_CHECK_INTERVAL);
         return;
     }
 
     // 触发老化清理
-    printf("[INFO] 老化处理：start_psn=0x%06X 数据包已超时（当前=%lu "
-           "ms/缓存=%lu ms），开始执行数据包老化清理\n",
-           start_psn, cur_stamp, pkt_header->recv_stamp);
+    // printf("[INFO] 老化处理：start_psn=0x%06X 数据包已超时（当前=%lu "
+    //        "ms/缓存=%lu ms），开始执行数据包老化清理\n",
+    //        start_psn, cur_stamp, pkt_header->recv_stamp);
 
     uint32_t original_start = conn->start_psn;
     uint32_t original_end = conn->end_psn;
@@ -1226,7 +1227,7 @@ int clean_global_idle_entry() {
     return total_cleaned;
 }
 
-//==================全局资源老化功能（未完善）==================
+//==================全局资源老化线程==================
 
 // 全局资源老化线程函数
 void *age_thread_proc(void *arg) {

@@ -272,8 +272,8 @@ int parse_bth_header(const unsigned char *bth_start, uint8_t *opcode,
     *opcode = bth->opcode;
     *pkey = ntohs(bth->pkey);
 
-    printf("--------------------------------------------\n");
-    printf("BTH解析中\n");
+    // printf("--------------------------------------------\n");
+    // printf("BTH解析中\n");
 
     // 提取24位的dest_qp
     const uint8_t *dest_qp_ptr = (const uint8_t *)(bth_start + 5);
@@ -286,26 +286,26 @@ int parse_bth_header(const unsigned char *bth_start, uint8_t *opcode,
     // 判断报文类型
     *pkt_type = get_packet_type_rc(*opcode);
 
-    printf("******** ******** ******** ******** ********\n");
-    switch (*pkt_type) {
-    case PKT_TYPE_DATA:
-        printf("DATA/REQUEST:");
-        break;
-    case PKT_TYPE_ACK:
-        printf("ACK:");
-        break;
-    case PKT_TYPE_NACK:
-        printf("NACK:");
-        break;
-    default:
-        printf("UNKNOWN:");
-        break;
-    }
-    printf("\n\tOPCode=\t0x%02x \t | %u\n", *opcode, *opcode);
-    printf("\tPKey=\t0x%04x\t | %u\n", *pkey, *pkey);
-    printf("\tDstQP=\t0x%06X | %u\n", *dest_qp, *dest_qp);
-    printf("\tPSN=\t0x%06X | %u\n", *psn, *psn);
-    printf("******** ******** ******** ******** ********\n");
+    // printf("******** ******** ******** ******** ********\n");
+    // switch (*pkt_type) {
+    // case PKT_TYPE_DATA:
+    //     printf("DATA/REQUEST:");
+    //     break;
+    // case PKT_TYPE_ACK:
+    //     printf("ACK:");
+    //     break;
+    // case PKT_TYPE_NACK:
+    //     printf("NACK:");
+    //     break;
+    // default:
+    //     printf("UNKNOWN:");
+    //     break;
+    // }
+    // printf("\n\tOPCode=\t0x%02x \t | %u\n", *opcode, *opcode);
+    // printf("\tPKey=\t0x%04x\t | %u\n", *pkey, *pkey);
+    // printf("\tDstQP=\t0x%06X | %u\n", *dest_qp, *dest_qp);
+    // printf("\tPSN=\t0x%06X | %u\n", *psn, *psn);
+    // printf("******** ******** ******** ******** ********\n");
 
     return 0;
 }
@@ -445,23 +445,23 @@ void handle_ack_received(const unsigned char *buffer, ssize_t length,
         }
 
         // 调用核心清理函数，处理ACK确认的报文
-        printf("[INFO] handle_ack_received: "
-               "匹配到目标连接，开始清理ACK确认报文 | ACK MSN=0x%06X\n",
-               ack_msn);
+        // printf("[INFO] handle_ack_received: "
+        //        "匹配到目标连接，开始清理ACK确认报文 | ACK MSN=0x%06X\n",
+        //        ack_msn);
         int clean_ret = clean_acked_packets(target_cache, ack_msn);
 
         // 根据清理结果打印分级日志（复用原错误码）
         switch (clean_ret) {
         case RETRANS_NO_VALID_PSN_RANGE:
-            printf("[ACK RECV] 该连接无有效PSN范围，无需清理报文\n");
+            // printf("[ACK RECV] 该连接无有效PSN范围，无需清理报文\n");
             break;
         case RETRANS_NO_CACHED_PACKETS:
             printf("[ACK RECV] 该连接无缓存数据包，无需清理报文\n");
             break;
         default:
             if (clean_ret > 0) {
-                printf("[ACK RECV] ✅ ACK清理完成，本次释放已确认报文=%d个\n",
-                       clean_ret);
+                // printf("[ACK RECV] ✅ ACK清理完成，本次释放已确认报文=%d个\n",
+                //        clean_ret);
             } else if (clean_ret < 0) {
                 printf("[ERROR] handle_ack_received: ACK清理失败，错误码=%d\n",
                        clean_ret);
@@ -1434,16 +1434,16 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
         }
 
         // 步骤1.调用核心清理函数，处理NACK确认的报文
-        printf("[INFO] handle_nack_received: "
-               "匹配到目标连接，开始清理NACK确认报文 | NACK PSN=0x%06X\n",
-               nack_epsn);
+        // printf("[INFO] handle_nack_received: "
+        //        "匹配到目标连接，开始清理NACK确认报文 | NACK PSN=0x%06X\n",
+        //        nack_epsn);
         // 在调用clean_nacked_packets时注意内部nack_epsn-1
         int clean_ret = clean_nacked_packets(cache_array, nack_epsn);
 
         // 根据清理结果打印分级日志（复用原错误码）
         switch (clean_ret) {
         case RETRANS_NO_VALID_PSN_RANGE:
-            printf("[NACK RECV] 该连接无有效PSN范围，无需清理报文\n");
+            // printf("[NACK RECV] 该连接无有效PSN范围，无需清理报文\n");
             break;
         case RETRANS_NO_CACHED_PACKETS:
             printf("[NACK RECV] 该连接无缓存数据包，无需清理报文\n");
@@ -1451,8 +1451,8 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
         default:
             if (clean_ret > 0) {
                 clean_success = 1;
-                printf("[NACK RECV] ✅ NACK清理完成，本次释放已确认报文=%d个\n",
-                       clean_ret);
+                // printf("[NACK RECV] ✅ NACK清理完成，本次释放已确认报文=%d个\n",
+                //        clean_ret);
             } else if (clean_ret < 0) {
                 printf(
                     "[ERROR] handle_nack_received: NACK清理失败，错误码=%d\n",
