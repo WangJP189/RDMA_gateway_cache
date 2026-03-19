@@ -11,6 +11,8 @@
 struct flow_entry *g_flow_table_forward[TABLE_SIZE] = {0};
 struct flow_entry *g_flow_table_reverse[TABLE_SIZE] = {0};
 
+int cache_count = 0;
+
 // ==================== 辅助函数 ====================
 // 将IP字符串转换为本机字节序
 static uint32_t ip_str_to_host(const char *ip_str) {
@@ -837,6 +839,9 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
     // 4. 打印缓存成功日志
     // printf("[INFO] 数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n", psn,
     //        packet_len, conn_cache->start_psn, conn_cache->end_psn);
+    cache_count++;
+    printf("[INFO] 当前缓存数据包总数: %d\n", cache_count);
+
     return 0;
 }
 
