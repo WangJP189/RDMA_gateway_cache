@@ -147,6 +147,8 @@ int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str,
         0) {
         printf("[ERROR] 正向流表插入失败\n");
         return -1;
+    }else{
+        printf("[FLOW] 正向流表插入成功\n");
     }
 
     // 2. 建立反向规则 (Reverse Table)
@@ -159,6 +161,8 @@ int add_to_flow_table(const char *src_ip_str, const char *dst_ip_str,
         0) {
         printf("[ERROR] 反向流表插入失败\n");
         return -1;
+    }else{
+        printf("[FLOW] 反向流表插入成功\n");
     }
 
     printf("[FLOW] 规则条目: %s(QP:%u) <--> %s(QP:%u)\n", src_ip_str, src_qp,

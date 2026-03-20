@@ -373,6 +373,7 @@ void process_control_packet(const unsigned char *buffer, ssize_t length,
         break;
     case 0x03: // 011xxxxx -> NAK (Sequence Error, etc.)
         // ZPY
+        printf("[INFO] 收到NAK报文，当前实现将其视为RNR处理\n");
         handle_nack_received(buffer, length, bucket, key, epsn, role);
         break;
     default:
@@ -1501,8 +1502,8 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
         if (cache_array->start_psn == PSN_INVALID ||
             cache_array->end_psn == PSN_INVALID) {
             printf("[WARN] "
-                   "NACK清理完目的网关所有缓存，epsn=%"
-                   "u，无法进行GBN重传或SR请求，不做操作\n",
+                   "NACK清理完目的网关所有缓存，epsn=%u"
+                   "，无法进行GBN重传或SR请求，不做操作\n",
                    nack_epsn);
             pthread_rwlock_unlock(&reverse_bucket->rwlock);
             return;
