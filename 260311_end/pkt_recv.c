@@ -331,7 +331,7 @@ void process_data_packet(const unsigned char *buffer, ssize_t length,
         struct connection_cache_array *cache =
             get_connection_cache_array(bucket, key);
         if (cache) {
-            age_expired_packets(cache);
+            // age_expired_packets(cache);
             add_to_connection_cache(cache, psn, packet, length);
         }
         pthread_rwlock_unlock(&bucket->rwlock); // 解锁
