@@ -839,8 +839,8 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
     // 4. 打印缓存成功日志
     // printf("[INFO] 数据包缓存成功 - PSN: %u, 长度: %d, 缓存范围: %u-%u\n", psn,
     //        packet_len, conn_cache->start_psn, conn_cache->end_psn);
-    cache_count++;
-    printf("[INFO] 当前缓存数据包总数: %d\n", cache_count);
+    // cache_count++;
+    // printf("[INFO] 当前缓存数据包总数: %d\n", cache_count);
 
     return 0;
 }
@@ -870,17 +870,20 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     if (conn->ring_buf[ring_index] != 0) {
         unsigned char *old_mem_block =
             (unsigned char *)conn->ring_buf[ring_index];
-        // printf("[OVERWRITE] 环形数组索引=%d "
-        //        "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
-        //        ring_index, (uintptr_t)old_mem_block);
+        printf("[OVERWRITE] 环形数组索引=%d "
+               "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
+               ring_index, (uintptr_t)old_mem_block);
         free(old_mem_block); // 释放旧数据包内存
     }
 
     // 存入新数据包地址
     conn->ring_buf[ring_index] = (uintptr_t)mem_block;
-    // printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | "
-    //        "数据长度=%d | 时间戳=%lu ms\n",
-    //        psn, ring_index, (uintptr_t)mem_block, data_len, header->recv_stamp);
+    printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | "
+           "数据长度=%d | 时间戳=%lu ms\n",
+           psn, ring_index, (uintptr_t)mem_block, data_len, header->recv_stamp);
+    
+    cache_count++;
+    printf("[INFO] 已缓存数据包总数: %d\n", cache_count);
 
     // 更新连接的PSN参数
     // 处理start_psn：初始状态 或 物理回绕后更小的PSN
