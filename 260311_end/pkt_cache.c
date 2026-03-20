@@ -878,6 +878,7 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
                "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
                ring_index, (uintptr_t)old_mem_block);
         free(old_mem_block); // 释放旧数据包内存
+        cache_count--; // 更新全局缓存计数器
     }
 
     // 存入新数据包地址
