@@ -972,24 +972,24 @@ int clean_acked_packets(struct connection_cache_array *conn, uint32_t ack_msn) {
             //        "仅清理到end_psn=%u\n",
             //        ack_msn & PSN_MASK, current_start, current_end, temp_end);
         } else {
-            // printf("[ACK CLEAN] ACK MSN=%u 不在当前缓存PSN范围内[%u~%u]，"
-            //        "无需清理\n",
-            //        temp_end, current_start, current_end);
+            printf("[ACK CLEAN] ACK MSN=%u 不在当前缓存PSN范围内[%u~%u]，"
+                   "无需清理\n",
+                   temp_end, current_start, current_end);
             return RETRANS_NO_VALID_PSN_RANGE;
         }
     }
     // bug修复
-    // printf("[ACK CLEAN] 开始清理已确认报文：ACK MSN=%u | 原始PSN范围=[%u~%u] | "
-    //        "清理区间=[%u~%u]\n",
-    //        temp_end, current_start, current_end, current_start, temp_end);
+    printf("[ACK CLEAN] 开始清理已确认报文：ACK MSN=%u | 原始PSN范围=[%u~%u] | "
+           "清理区间=[%u~%u]\n",
+           temp_end, current_start, current_end, current_start, temp_end);
 
     // 批量清理指定PSN区间的数据包
     cleaned_count = batch_clean_psn_range(conn, current_start, temp_end);
 
     // 计算新的起始PSN，处理回绕+仅保留24位有效位
     uint32_t new_start = (temp_end + 1) & PSN_MASK;
-    // printf("[ACK CLEAN] 清理完成：释放已确认报文=%d个 | 新start_psn=%u\n",
-    //        cleaned_count, new_start);
+    printf("[ACK CLEAN] 清理完成：释放已确认报文=%d个 | 新start_psn=%u\n",
+           cleaned_count, new_start);
 
     // 判断是否所有包都被清理（环形语境下new_start大于current_end代表无剩余包）
     if (psn_greater_than(new_start, current_end)) {

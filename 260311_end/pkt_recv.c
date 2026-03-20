@@ -640,6 +640,10 @@ int clean_nacked_packets(struct connection_cache_array *conn,
             printf("[NACK CLEAN] NACK PSN=%u 不在当前缓存PSN范围内[%u~%u]，"
                    "无需清理\n",
                    temp_end, current_start, current_end);
+
+            // printf("111[NACK CLEAN] NACK PSN=%u 不在当前缓存PSN范围内[%u~%u]，"
+            //        "无需清理\n",
+            //        temp_end, conn->start_psn, conn->end_psn);
             return RETRANS_NO_VALID_PSN_RANGE;
         }
     }
