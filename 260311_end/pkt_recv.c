@@ -1472,11 +1472,11 @@ void handle_nack_received(const unsigned char *buffer, ssize_t length,
                "跳过NACK清理\n",
                key.src_ip, key.dst_ip);
     }
-    if (!clean_success) {
-        printf("[NACK RECV] NACK清理未成功，跳过后续重传处理\n");
-        pthread_rwlock_unlock(&reverse_bucket->rwlock); // 解锁
-        return;
-    }
+    // if (!clean_success) {
+    //     printf("[NACK RECV] NACK清理未成功，跳过后续重传处理\n");
+    //     pthread_rwlock_unlock(&reverse_bucket->rwlock); // 解锁
+    //     return;
+    // }
     // 区分RDMA的ACK和TCP的ACK，TCP的ACK是累计确认，表示下一个期待的字节序号
     // RDMA的ACK报文中的PSN表示小于等于PSN的数据包都已收到
     // RDMA的NAK报文中的PSN才表示下一个期待的PSN，因为该PSN未被接收处理
