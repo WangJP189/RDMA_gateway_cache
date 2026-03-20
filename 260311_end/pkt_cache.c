@@ -924,8 +924,8 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
     conn->cur_psn = psn;
     conn->last_active_stamp = get_current_timestamp_ms(); // 更新最后活跃时间戳
 
-    // printf("[UPDATE] 连接PSN参数：start_psn=%u, end_psn=%u, cur_psn=%u\n",
-    //        conn->start_psn, conn->end_psn, conn->cur_psn);
+    printf("[UPDATE] 连接PSN参数：start_psn=%u, end_psn=%u, cur_psn=%u\n",
+           conn->start_psn, conn->end_psn, conn->cur_psn);
 
     return 0;
 }
