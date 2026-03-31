@@ -15,6 +15,19 @@
 #define ERR_FLOW_RULE_DEL (-202) // 流规则删除失败
 #define ERR_CONN_CTX_DEL (-211)  // 连接上下文删除失败
 
+// WJP
+// 定义重传处理结果的枚举类型(也可以改成宏定义的整数常量)
+typedef enum {
+    RETRANS_SUCCESS = 0,             // 处理成功
+    RETRANS_INVALID_PARAM = -1,      // 参数无效
+    RETRANS_NO_VALID_PSN_RANGE = -2, // 无有效PSN范围
+    RETRANS_NO_CACHED_PACKETS = -3,  // 未缓存任何数据包
+    RETRANS_NO_NEED = -4,            // 无需处理重传（start_psn >= epsn）
+    RETRANS_DATA_ALLOC_FAIL = -5,    // connection_cache_array数据分配失败
+    RETRANS_NO_PACKET = -6,          // 指定ring_buffer位置无数据包
+    RETRANS_PACkET_PSN_MISMATCH = -7 // 指定ring_buffer位置数据包PSN不匹配
+} retransmit_process_result;
+
 // --- 内存池配置 ---
 #define NUM_MBUFS 8191      // 内存池容量 (推荐2^n-1)
 #define MBUF_CACHE_SIZE 512 // 本地缓存大小
@@ -52,5 +65,11 @@
 // --- 时延配置 ---
 #define AGING_INTERVAL 500 // 500ms 老化周期
 #define SR_REQ_INTERVAL 1  // 1ms SR重传请求延时
+
+// --- 缓存配置 ---
+#define PSN_MASK 0xFFFFFF       // 24位PSN掩码（0~16777215）
+#define PSN_HALF_CYCLE 0x800000 // 24位PSN的半周期（判断回绕的阈值）
+#define PSN_MAX_VALUE PSN_MASK  // PSN最大值（2^24-1）
+#define PSN_INVALID 0x1000000   // 无效PSN（大于最大值，表示未初始化）
 
 #endif // CONFIG_H
