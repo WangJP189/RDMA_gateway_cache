@@ -240,6 +240,13 @@ static void process_data_packet(struct rte_mbuf *mbuf, const struct ib_bth *bth,
     }
     */
 
+    // WJP
+    // ======================== 新增(老化+缓存) ===============================
+    // 1. 老化过期报文（封装函数）
+    age_expired_packets(ctx);
+    // 2. 缓存当前数据报文（封装函数）
+    add_to_connection_cache(ctx, psn, mbuf);
+
     ctx->last_active_tsc = rte_get_timer_cycles();
     ctx->packet_count++;
 
