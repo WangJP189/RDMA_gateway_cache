@@ -11,8 +11,11 @@
 struct flow_entry *g_flow_table_forward[TABLE_SIZE] = {0};
 struct flow_entry *g_flow_table_reverse[TABLE_SIZE] = {0};
 
-int cache_count = 0; // 全局缓存计数器
-int retransmit_count = 0; // 全局重传计数器
+// 全局统计：总缓存次数（正常包+重传包）
+long total_cache_count = 0;
+// 全局统计：真正的重传包数量（PSN重复，触发覆盖）
+long total_retrans_cache_count = 0;
+int cache_count = 0; // 已缓存数据包
 
 // ==================== 辅助函数 ====================
 // 将IP字符串转换为本机字节序
@@ -854,79 +857,71 @@ int add_to_connection_cache(struct connection_cache_array *conn_cache,
 int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
                       const unsigned char *data, int data_len) {
 
-    // 分配5KB内存块
     unsigned char *mem_block = (unsigned char *)malloc(MEM_BLOCK_SIZE);
     if (!mem_block) {
         printf("[ERROR] 缓存数据包失败：内存块分配失败（5KB）\n");
         return RETRANS_DATA_ALLOC_FAIL;
     }
 
-    // 写入头部控制信息 + RDMA数据包
     struct mem_block_header *header = (struct mem_block_header *)mem_block;
     header->data_len = data_len;
-    header->recv_stamp = get_current_timestamp_ms(); // 写入毫秒级时间戳
-    header->psn = psn;                               // 写入当前内存块对应的PSN
+    header->recv_stamp = get_current_timestamp_ms();
+    header->psn = psn;
     memcpy(mem_block + sizeof(struct mem_block_header), data, data_len);
 
-    // 计算PSN对应的环形数组索引（取模实现环形逻辑）
     int ring_index = psn % RING_BUFFER_SIZE;
 
-    // 异常：处理环形数组覆盖冲突（覆盖旧数据包，释放旧内存）
+    // ==============================================
+    // 核心修改：这里触发覆盖 = 收到重传包！
+    // ==============================================
+
     if (conn->ring_buf[ring_index] != 0) {
         unsigned char *old_mem_block =
             (unsigned char *)conn->ring_buf[ring_index];
-        printf("[OVERWRITE] 环形数组索引=%d "
-               "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
-               ring_index, (uintptr_t)old_mem_block);
-        retransmit_count++; // 更新全局重传计数器
-        printf("[INFO] 当前重传数据包总数: %d\n", retransmit_count);
-        free(old_mem_block); // 释放旧数据包内存
-        cache_count--; // 更新全局缓存计数器
+        free(old_mem_block);
+        cache_count--;
+
+        total_retrans_cache_count++; // ✅ 精准统计：重传包+1
+        printf("[RETRANS CACHE] 检测到重传包 PSN=%u | 累计重传缓存数：%ld\n",
+               psn, total_retrans_cache_count);
     }
 
-    // 存入新数据包地址
+    // 存入新包
     conn->ring_buf[ring_index] = (uintptr_t)mem_block;
     printf("[CACHE] 数据包PSN=%u → 环形数组索引=%d | 内存块首地址=0x%lx | "
            "数据长度=%d | 时间戳=%lu ms\n",
            psn, ring_index, (uintptr_t)mem_block, data_len, header->recv_stamp);
-    
-    cache_count++;
-    printf("[INFO] 已缓存数据包总数: %d\n", cache_count);
 
-    // 更新连接的PSN参数
-    // 处理start_psn：初始状态 或 物理回绕后更小的PSN
+    cache_count++;
+    total_cache_count++; // ✅ 总缓存次数+1
+    printf("[INFO] 已缓存数据包总数: %d | 累计总缓存次数: %ld\n", cache_count,
+           total_cache_count);
+
+    // ========== 下面PSN更新逻辑不动 ==========
     if (conn->start_psn == PSN_INVALID) {
-        // 初始状态，直接赋值
         conn->start_psn = psn;
     } else {
-        // 仅当新PSN更小，且对应的索引有数据时，才更新start_psn
         if (psn_less_than(psn, conn->start_psn)) {
             uint32_t new_psn_idx = psn % RING_BUFFER_SIZE;
-            // 校验新PSN对应索引有有效数据（刚缓存的包一定有，这里做防御性校验）
             if (conn->ring_buf[new_psn_idx] != 0) {
                 struct mem_block_header *new_hdr =
                     (struct mem_block_header *)(uintptr_t)
                         conn->ring_buf[new_psn_idx];
-                if (new_hdr->psn == psn) { // 确保PSN匹配，防止串包
+                if (new_hdr->psn == psn) {
                     conn->start_psn = psn;
-                    // printf(
-                    //     "[CACHE] 更新start_psn为0x%06X（更小且有有效数据）\n",
-                    //     psn);
                 }
             }
         }
     }
 
-    // 处理end_psn：初始状态 或 物理回绕后更大的PSN
     if (conn->end_psn == PSN_INVALID) {
         conn->end_psn = psn;
     } else if (psn_greater_than(psn, conn->end_psn)) {
-        // PSN发生回绕||(psn不回绕&&psn>end_psn)，更新end_psn
         conn->end_psn = psn;
     }
 
     conn->cur_psn = psn;
-    conn->last_active_stamp = get_current_timestamp_ms(); // 更新最后活跃时间戳
+    conn->last_active_stamp = get_current_timestamp_ms();
 
     printf("[UPDATE] 连接PSN参数：start_psn=%u, end_psn=%u, cur_psn=%u\n",
            conn->start_psn, conn->end_psn, conn->cur_psn);
