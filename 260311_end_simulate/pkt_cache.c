@@ -11,7 +11,8 @@
 struct flow_entry *g_flow_table_forward[TABLE_SIZE] = {0};
 struct flow_entry *g_flow_table_reverse[TABLE_SIZE] = {0};
 
-int cache_count = 0;
+int cache_count = 0; // 全局缓存计数器
+int retransmit_count = 0; // 全局重传计数器
 
 // ==================== 辅助函数 ====================
 // 将IP字符串转换为本机字节序
@@ -877,6 +878,8 @@ int cache_rdma_packet(struct connection_cache_array *conn, uint32_t psn,
         printf("[OVERWRITE] 环形数组索引=%d "
                "存在旧数据包，已释放旧内存块（地址=0x%lx）\n",
                ring_index, (uintptr_t)old_mem_block);
+        retransmit_count++; // 更新全局重传计数器
+        printf("[INFO] 当前重传数据包总数: %d\n", retransmit_count);
         free(old_mem_block); // 释放旧数据包内存
         cache_count--; // 更新全局缓存计数器
     }

@@ -137,4 +137,104 @@ int is_psn_expired(struct conn_ctx_v4 *conn, uint32_t psn,
     return (survival_time > AGING_INTERVAL) ? 1 : 0;
 }
 
+
+
+// WJP
+// ============ 连接级老化清理 ============
+/**
+ * @brief DPDK版：判断连接是否空闲过期
+ * @param ctx 连接上下文
+ * @param current_tsc 当前TSC时钟
+ * @param timeout_tsc 老化阈值(TSC周期)
+ * @return 1=过期, 0=未过期, -1=参数异常
+ */
+int is_conn_idle_expired(struct conn_ctx_v4 *ctx, uint64_t current_tsc,
+                         uint64_t timeout_tsc) {
+    if (ctx == NULL) {
+        return -1;
+    }
+    // 核心判断：最后活跃时间 > 老化阈值
+    return (current_tsc - ctx->last_active_tsc > timeout_tsc) ? 1 : 0;
+}
+
+/**
+ * @brief DPDK版：全局清理空闲连接
+ * @param conn_hash DPDK连接哈希表
+ * @return 清理的连接数量
+ */
+int clean_global_idle_entry(struct rte_hash *conn_hash) {
+    if (conn_hash == NULL) {
+        pr_err("[CLEAN IDLE] 连接哈希表无效\n");
+        return 0;
+    }
+
+    // 直接使用宏定义 AGING_INTERVAL 计算超时周期
+    uint64_t hz = rte_get_timer_hz();
+    uint64_t timeout_tsc = (hz / 1000) * AGING_INTERVAL;
+    uint64_t current_tsc = rte_get_timer_cycles();
+    uint32_t aged_count = 0;
+    uint32_t iterate_count = 0;
+
+    // DPDK哈希表RCU迭代器
+    const void *next_key;
+    void *next_data;
+    uint32_t iter = 0;
+
+    pr_info("[CLEAN GLOBAL IDLE] 开始全局空闲连接清理\n");
+
+    while (rte_hash_iterate(conn_hash, &next_key, &next_data, &iter) >= 0) {
+        struct conn_ctx_v4 *ctx = (struct conn_ctx_v4 *)next_data;
+        const struct conn_key_v4 *key = (const struct conn_key_v4 *)next_key;
+
+        if (unlikely(ctx == NULL)) {
+            continue;
+        }
+
+        // 判定连接过期
+        if (is_conn_idle_expired(ctx, current_tsc, timeout_tsc) == 1) {
+            rte_hash_del_key(conn_hash, key);
+            aged_count++;
+        }
+
+        // 防CPU占满：迭代休眠
+        iterate_count++;
+        if (iterate_count >= 500) {
+            iterate_count = 0;
+            usleep(100);
+        }
+    }
+
+    if (aged_count > 0) {
+        pr_info("[CLEAN GLOBAL IDLE] 清理完成，共释放 %u 个闲置连接\n",
+                aged_count);
+    } else {
+        pr_info("[CLEAN GLOBAL IDLE] 清理完成，无闲置连接\n");
+    }
+
+    return aged_count;
+}
+
+/**
+ * @brief DPDK连接释放回调（自动释放mbuf/定时器/锁）
+ */
+void free_conn_ctx_cb(void *data, void *arg) {
+    struct conn_ctx_v4 *ctx = (struct conn_ctx_v4 *)data;
+    if (ctx == NULL)
+        return;
+
+    // 1. 停止DPDK重传定时器
+    rte_timer_stop(&ctx->retry_timer);
+
+    // 2. 批量清理所有缓存的DPDK mbuf
+    batch_clean_psn_range(ctx, 0, PSN_MASK);
+
+    // 3. 销毁自旋锁
+    rte_spinlock_destroy(&ctx->lock);
+
+    // 4. 从DPDK内存池释放连接上下文
+    rte_mempool_put(g_data.conn_ctx_pool, ctx);
+
+    pr_debug("[FREE CONN] 连接资源已完全释放\n");
+}
+
 #endif // UTILS_H
