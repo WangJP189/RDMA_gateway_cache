@@ -89,6 +89,18 @@ struct conn_ctx_v4 {
     struct conn_key_v4 conn_key;
     enum task_reason current_reason;
     uint32_t nak_psn;
+
+    // ===================== 缓存模块新增字段 =====================
+    enum conn_state state; // 连接状态（控制是否允许缓存）
+    uint32_t rto_ms;       // 从CM报文获取的RTO（动态老化用）
+    uint8_t rnr_timer_idx; // RNR定时器索引（动态老化用）
+};
+
+// 仅新增：连接状态（控制缓存是否允许）
+enum conn_state {
+    CONN_STATE_INIT = 0,         // 初始状态，禁止缓存
+    CONN_STATE_ESTABLISHED = 1,  // 已建连，允许缓存
+    CONN_STATE_DISCONNECTING = 2 // 断开中，禁止缓存
 };
 
 #endif // DATA_STRUCTURES_H

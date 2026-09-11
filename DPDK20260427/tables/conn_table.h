@@ -38,4 +38,17 @@ void binary_age_psn(struct conn_ctx_v4 *conn, uint32_t start_psn,
 int batch_clean_psn_range(struct conn_ctx_v4 *ctx, uint32_t start,
                           uint32_t end);
 
+// ===================== 缓存模块新增接口（仅缓存，无重传）
+// =====================
+// 1. CM建连：初始化连接缓存
+void conn_cache_init(struct conn_ctx_v4 *ctx);
+// 2. CM断连/异常断开：全量清空连接缓存
+void conn_cache_clean_all(struct conn_ctx_v4 *ctx);
+// 3. ACK：按PSN清理已确认缓存（兼容回绕）
+int conn_cache_clean_by_ack(struct conn_ctx_v4 *ctx, uint32_t ack_psn);
+// 4. 原始NAK：查询缓存是否存在（只查不清）
+int conn_cache_check_psn(struct conn_ctx_v4 *ctx, uint32_t psn);
+// 5. 获取动态老化时间（按RTO/RNR计算）
+uint64_t conn_cache_get_age_time(struct conn_ctx_v4 *ctx);
+
 #endif // CONN_TABLE_H

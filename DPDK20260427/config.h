@@ -63,12 +63,16 @@ typedef enum {
 #define ARRAY_INDEX_MASK 0x00000FFF // 连接上下文mbuf指针数组掩码
 
 // --- 时延配置 ---
-#define AGING_INTERVAL 500 // 500ms 老化周期
 #define SR_REQ_INTERVAL 1  // 1ms SR重传请求延时
 
 // --- 缓存配置 ---
 #define PSN_MASK 0xFFFFFF       // 24位PSN掩码（0~16777215）
 #define PSN_HALF_CYCLE 0x800000 // 24位PSN的半周期（判断回绕的阈值）
 #define PSN_MAX_VALUE PSN_MASK  // PSN最大值（2^24-1）
+
+// 缓存动态老化规则（新增）
+#define CONN_AGE_MULTI_RTO 3  // 3×RTO
+#define CONN_AGE_MULTI_RNR 2  // 2×RNR_TIMER
+#define RNR_TIMER_DEFAULT 500 // 默认RNR时间(ms)
 
 #endif // CONFIG_H
