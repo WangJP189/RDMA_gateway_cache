@@ -1,0 +1,4 @@
+method,malloc_per_store,std
+psn_fixed,1.0000,0.0000
+psn_dynamic,1.0000,0.0000
+psn_tiered,0.0000,0.0000
