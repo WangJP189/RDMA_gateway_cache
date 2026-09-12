@@ -1,0 +1,4 @@
+method,overwrite_stores,mallocs,mallocs_per_store
+psn_fixed,12800,12800,1.0000
+psn_dynamic,12800,12800,1.0000
+psn_tiered,12800,0,0.0000

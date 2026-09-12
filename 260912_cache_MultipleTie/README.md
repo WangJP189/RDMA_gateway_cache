@@ -39,7 +39,8 @@
 ├── ANALYSIS.md                # 实验数据解读摘要（含全部表格 + 图解读 + 结论）
 ├── psn_lookup_benchmark/      # 实验一：时间开销（查找延迟 + 随 N 增长）
 ├── psn_space_bench/           # 实验二：空间开销（空间利用率 + 多流摊销）
-└── psn_behavior_bench/        # 实验三：存/取行为（任务 A–E）
+├── psn_behavior_bench/        # 实验三：存/取行为（6 方法对比）
+└── paper_figures/             # 论文组合图（图 1 时间 / 图 2 空间 / 图 3 行为）
 ```
 
 ---
@@ -176,27 +177,31 @@ python3 plot_space.py --dir ./out --out ./out --multiflow
 **结论**：分档动态块在档界附近利用率 78%~98%，**始终优于固定 5KB 块（1.2%~80%）**，
 代价是 5× 固定数组开销与 2 幂取整（详见 [ANALYSIS.md](ANALYSIS.md) §2）。
 
-### 实验三：存/取行为（任务 A–E）— `psn_behavior_bench/`
+### 实验三：存/取行为（跨 6 种方法对比）— `psn_behavior_bench/`
 
-独立复刻「档位标记数组 + 分档环形数组」机制，做存/取行为与正确性实验：
+复刻 **6 种缓存方法**（`fifo`/`chained_hash`/`balanced_tree`/`psn_fixed`/
+`psn_dynamic`/`psn_tiered`），对比存/取处理延迟与行为确定性：
 
 | 任务 | 内容 | 证明 |
 |------|------|------|
-| A | 顺序存储（psn 0..N-1 递增 store） | 存储正确、payload+PSN 全量校验一致 |
-| B | 乱序存储（随机置换 store）→ 顺序取 | 乱序 store 后按序取回，**排序/交换操作数 = 0**（零整理） |
+| A | 顺序存储（psn 0..N-1 递增 store） | store 正确、payload+PSN 全量校验 |
+| B | 乱序存储（随机置换）→ 顺序取回 | 乱序 store 后按序取回，**排序/交换操作数 = 0**（零整理） |
 | C | 随机丢包取回（丢包率 1%） | 丢包判定 O(1) 且准确 |
-| D | 突发丢包取回（连续丢 512 包） | 突发丢包同样 100% 判定 |
-| E | 丢包率扫描（0%~10%） | store/retrieve 延迟**与丢包率无关**、判定恒 100% |
+| D | 突发丢包取回（连续 512 包） | 突发丢包同样 100% 判定 |
+| E | 丢包率扫描（0%~10%） | store/retrieve 延迟与丢包率无关、判定恒 100% |
+| 附 | 覆盖写稳态 malloc 计数 | 分档池复用，**0 次 malloc**（动态/固定 = 1 次） |
 
 ```bash
 cd psn_behavior_bench && make
-./behavior_bench -o ./out             # 默认 N=10240, L=1024, B=128, R=200, 丢包率 0~10%
-python3 plot_behavior.py --dir ./out --out ./out
+./behavior_bench -o ./out             # 默认 N=10240, L=1024, B=128, R=100
+python3 ../paper_figures/plot_figures.py   # 生成论文组合图（图 1/2/3）
 ```
 
 **结论**（详见 [ANALYSIS.md](ANALYSIS.md) §3）：
-store P50 ≈ 52ns（顺序/乱序基本一致）、retrieve P50 ≈ 29ns（found/lost 基本一致）、
-丢包判定 100%、内存复用率 **94.6%**——证明「分档池」稳态下几乎不再 malloc。
+① 取回延迟 FIFO O(n) 重排 **8.8µs**（5120 次 PSN 比较）vs 本文 **46ns（0 次比较）**，
+快 ~190×；② store 控制面开销 tiered **84ns** < dynamic 99ns < fixed 281ns <
+树 494ns；③ 稳态 malloc：tiered **0 次/覆盖写** vs dynamic/fixed **1 次**——分档池
+消除了逐包分配器开销。
 
 ---
 
@@ -214,9 +219,11 @@ cd psn_lookup_benchmark && make && ./psn_bench -o ./out --sweep && \
 cd psn_space_bench && make && ./space_bench -o ./out --multiflow && \
    python3 plot_space.py --dir ./out --out ./out --multiflow && cd ..
 
-# 3. 实验三：行为
-cd psn_behavior_bench && make && ./behavior_bench -o ./out && \
-   python3 plot_behavior.py --dir ./out --out ./out && cd ..
+# 3. 实验三：行为（6 方法对比）
+cd psn_behavior_bench && make && ./behavior_bench -o ./out && cd ..
+
+# 4. 生成论文组合图（图 1 时间 / 图 2 空间 / 图 3 行为）
+python3 paper_figures/plot_figures.py
 ```
 
 环境：Ubuntu 24.04（x86_64）、gcc `-O2 -Wall -std=gnu11`、pthread；
