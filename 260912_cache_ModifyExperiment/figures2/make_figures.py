@@ -143,17 +143,16 @@ def save(fig, name):
 
 
 # ----------------------------------------------------------------------------
-# Figure 1 -- Time overhead
+# Figure 1a -- Lookup latency vs cache depth N (log‑log subplot a)
 # ----------------------------------------------------------------------------
-def fig1():
-    fig, (axa, axb) = plt.subplots(1, 2, figsize=(7.0, 2.7))
-
+def fig1a():
+    fig, axa = plt.subplots(figsize=(3.4, 2.7))  # ICASSP单栏宽度
     # -------- (a) lookup latency vs cache depth N (log-log) -----------------
     rows = read_csv(os.path.join(LOOKUP, "scaling.csv"))
     methods = ["fifo", "chained_hash", "balanced_tree", "psn_mapping"]
     for m in methods:
         pts = sorted([r for r in rows if r["method"] == m],
-                     key=lambda r: int(r["N"]))
+                      key=lambda r: int(r["N"]))
         N = np.array([int(r["N"]) for r in pts], float)
         med = np.array([float(r["median_ns"]) for r in pts])
         std = np.array([float(r["median_std"]) for r in pts])
@@ -165,7 +164,6 @@ def fig1():
                      capsize=2.5, capthick=0.8, zorder=r["zorder"],
                      alpha=r["alpha"], markeredgecolor=r["color"],
                      markeredgewidth=0.6)
-
     axa.set_xscale("log")
     axa.set_yscale("log")
     axa.set_xlim(400, 16000)
@@ -176,9 +174,7 @@ def fig1():
     axa.set_xlabel("Cache depth N (entries)")
     axa.set_ylabel("Median lookup latency (ns)")
     axa.set_axisbelow(True)
-
-    # asymptotic annotations, right-aligned just past the last data point,
-    # each placed in a clear gap between the four lines so nothing overlaps
+    # asymptotic annotations
     axa.text(15600, 15,    r"$O(1)$ flat", color=COLOR["psn"],
              ha="right", va="center", fontsize=8)
     axa.text(15600, 50,    r"$O(\log n)$", color=COLOR["balanced_tree"],
@@ -186,6 +182,24 @@ def fig1():
     axa.text(15600, 3600,  r"$O(n)$", color=COLOR["fifo"],
              ha="right", va="center", fontsize=8)
 
+    # panel_label(axa, "(a)")
+    # legend放在顶部，单栏4列
+    handles = [Line2D([], [], label=NAME[k], color=COLOR[k],
+                      lw=recipe(k)["lw"], ls=recipe(k)["ls"],
+                      marker=recipe(k)["marker"], ms=recipe(k)["ms"])
+               for k in ["fifo", "chained_hash", "balanced_tree", "psn"]]
+    axa.legend(handles=handles, ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.18),
+               frameon=False, columnspacing=1.0, handlelength=1.4, fontsize=7.5)
+
+    fig.subplots_adjust(left=0.18, right=0.96, top=0.82, bottom=0.17)
+    return fig
+
+
+# ----------------------------------------------------------------------------
+# Figure 1b -- CDF of lookup latency (random access subplot b)
+# ----------------------------------------------------------------------------
+def fig1b():
+    fig, axb = plt.subplots(figsize=(3.4, 2.7)) # ICASSP单栏宽度
     # -------- (b) CDF of lookup latency (random access) ---------------------
     methods_b = ["fifo", "chained_hash", "balanced_tree", "psn_mapping"]
     for m in methods_b:
@@ -196,8 +210,7 @@ def fig1():
         r = recipe(key)
         axb.plot(x, y, label=NAME[key], color=r["color"], lw=r["lw"],
                  ls=r["ls"], zorder=r["zorder"], alpha=r["alpha"])
-
-    # P50 / P90 / P99 on the PSN Mapping curve (from summary.csv, random pattern)
+    # P50 / P90 / P99 on the PSN Mapping curve
     summ = [r for r in read_csv(os.path.join(LOOKUP, "summary.csv"))
             if r["method"] == "psn_mapping" and r["pattern"] == "random"][0]
     pct = {k: float(summ[f"{k}_ns"]) for k in ("p50", "p90", "p99")}
@@ -210,7 +223,7 @@ def fig1():
     axb.set_xlabel("Lookup latency (ns)")
     axb.set_ylabel("Cumulative probability")
 
-    # dotted guide lines + dots for P50/P90/P99 (values read from summary.csv)
+    # dotted guide lines + dots for P50/P90/P99
     for k, yv in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99)):
         xv = pct[k]
         axb.axvline(xv, ymin=0, ymax=yv / 1.04, color=COLOR["psn"],
@@ -218,8 +231,6 @@ def fig1():
         axb.plot([xv], [yv], marker="o", ms=4.5, color=COLOR["psn"],
                  mec="white", mew=0.8, zorder=11)
 
-    # short two-line value labels with a white halo (legible over the steep CDF);
-    # staggered so the three halos never touch each other or cover their own dot
     halo = dict(boxstyle="round,pad=0.25", fc="white", ec=COLOR["psn"],
                 lw=0.5, alpha=0.92)
     axb.text(pct["p50"], 0.38, f"P50\n{pct['p50']:.1f} ns",
@@ -232,24 +243,19 @@ def fig1():
              ha="center", va="center", fontsize=7, color=COLOR["psn"],
              zorder=12, bbox=halo)
 
-    panel_label(axa, "(a)")
-    panel_label(axb, "(b)")
-
-    # shared legend across the top (both panels share the same 4 series)
-    handles = [Line2D([], [], **{**recipe("psn" if k == "psn" else k),
-                                 "marker": recipe("psn" if k == "psn" else k)["marker"],
-                                 "ms": recipe("psn" if k == "psn" else k)["ms"]})
+    # panel_label(axb, "(b)")
+    axb.set_axisbelow(True)
+    # legend
+    handles = [Line2D([], [], label=NAME[k], color=COLOR[k],
+                      lw=recipe(k)["lw"], ls=recipe(k)["ls"],
+                      marker=recipe(k)["marker"], ms=recipe(k)["ms"])
                for k in ["fifo", "chained_hash", "balanced_tree", "psn"]]
-    fig.legend(handles=[Line2D([], [], label=NAME[k], color=COLOR[k],
-                               lw=recipe(k)["lw"], ls=recipe(k)["ls"],
-                               marker=recipe(k)["marker"], ms=recipe(k)["ms"])
-                        for k in ["fifo", "chained_hash", "balanced_tree", "psn"]],
-               ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.02),
-               frameon=False, columnspacing=1.2, handlelength=1.6)
+    axb.legend(handles=handles, ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.18),
+               frameon=False, columnspacing=1.0, handlelength=1.4, fontsize=7.5)
 
-    fig.subplots_adjust(left=0.10, right=0.97, top=0.86, bottom=0.15,
-                        wspace=0.28)
+    fig.subplots_adjust(left=0.18, right=0.96, top=0.82, bottom=0.17)
     return fig
+
 
 
 # ----------------------------------------------------------------------------
@@ -260,9 +266,12 @@ def fig2():
 
     rows = read_csv(os.path.join(SPACE, "space_summary.csv"))
     # drop the 1280 B point to avoid the dip; only 5 representative series
+    # keep = {"fifo": "fifo", "chained_hash": "chained_hash",
+    #         "balanced_tree": "balanced_tree", "psn_map_tiered": "psn",
+    #         "contiguous": "contiguous"}
     keep = {"fifo": "fifo", "chained_hash": "chained_hash",
-            "balanced_tree": "balanced_tree", "psn_map_tiered": "psn",
-            "contiguous": "contiguous"}
+        "balanced_tree": "balanced_tree", "psn_map_tiered": "psn",
+    }
     for raw, key in keep.items():
         pts = sorted([r for r in rows if r["method"] == raw
                       and int(r["packet_size"]) != 1280 and int(r["packet_size"]) != 1400],
@@ -275,10 +284,10 @@ def fig2():
                 zorder=r["zorder"], alpha=r["alpha"],
                 markeredgecolor=r["color"], markeredgewidth=0.5)
 
-    # shaded typical RDMA data packet range
-    ax.axvspan(1024, 4096, color="#08519C", alpha=0.06, zorder=0)
-    ax.text(2560, 8.5, "Typical RDMA data packet range\n(1024–4096 B)",
-            ha="center", va="bottom", fontsize=7.5, color="#08519C")
+    # # shaded typical RDMA data packet range
+    # ax.axvspan(1024, 4096, color="#08519C", alpha=0.06, zorder=0)
+    # ax.text(2560, 8.5, "Typical RDMA data packet range\n(1024–4096 B)",
+    #         ha="center", va="bottom", fontsize=7.5, color="#08519C")
 
     ax.set_xlim(0, 4200)
     ax.set_ylim(0, 104)
@@ -358,7 +367,8 @@ def fig3():
 
 # ----------------------------------------------------------------------------
 def main():
-    save(fig1(), "fig1_time.pdf")
+    save(fig1a(), "fig1_time1.pdf")
+    save(fig1b(), "fig1_time2.pdf")
     save(fig2(), "fig2_space.pdf")
     save(fig3(), "fig3_behavior.pdf")
 
