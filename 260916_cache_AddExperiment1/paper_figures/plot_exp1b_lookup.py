@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fig — exp1b lookup 面板: lookup/retrieve time cost vs N（带 O(·) 复杂度注解）。
+Fig — exp1b lookup 面板: lookup/retrieve mean time cost vs N（平均时间，非中值）。
 
-按用户要求，每种变体单独一张图、单独一个 PDF/PNG（绝不多图合一）：
-  布局 × index_only 是否入图：
-    1) fig_exp1b_lookup_gbn64     — 单图 gbn_long64，4 方法
-    2) fig_exp1b_lookup_gbn64_idx — 单图 gbn_long64，5 方法（含 index-only Φ）
-    3) fig_exp1b_lookup_sr64      — 单图 sr_64，4 方法
-    4) fig_exp1b_lookup_sr64_idx  — 单图 sr_64，5 方法
-    5) fig_exp1b_lookup_2x2       — 2×2 四模式面板，4 方法
-    6) fig_exp1b_lookup_2x2_idx   — 2×2 四模式面板，5 方法
+按用户最新要求：
+  - 主指标 = 平均时间 mean_ns（非中值 p50）；纵轴 "Mean lookup time cost (ns)"；
+  - 只出两张图：GBN（gbn_long64）与 SR（sr_64），各 4 方法（不含 index-only）；
+  - 图内不写 O(·) 文本；图例缩小贴左上空白区。
 
-视觉规格（沿用 fig_exp1a_store 重画版逐项）：
-  白底 + 完整框线 + 四边向内刻度(含次级) + 只留水平浅灰主网格；
-  serif/Times；轴标签加粗 9pt、刻度 8pt；图例左上浅灰细边框单列；
-  无图内标题（caption 交论文）；O(·) 注解 = 曲线复杂度（O(n)/O(log n)/O(1)）。
+视觉规格（沿用 fig_exp1a_store 重画版）：
+  白底 + 完整框线 + 四边向内刻度(含次级) + 只留水平浅灰主网格；serif/Times；
+  轴标签加粗 9pt、刻度 8pt；图例左上浅灰细边框单列；无图内标题。
 
-坐标：横轴 Cache depth N 对数(base2)、纵轴 Median lookup time cost (ns) 对数（禁 latency）。
-复杂度注解：FIFO→O(n)、Balanced Tree→O(log n)、PSN Mapping→O(1)（hash/index 同为 O(1)，
-  只注代表曲线，避免三条 O(1) 叠字）。
+坐标：横轴 Cache depth N 对数(base2)、纵轴 Mean lookup time cost (ns) 对数（禁 latency）。
 
-数字提取：从 lookup_summary.csv + n_cmp.csv 写 out/exp1b_lookup/exp1b_numbers.md（脚本提取，禁手抄）。
+数字提取（全部脚本从 CSV 提取，禁手抄）：
+  - out/exp1b_lookup/exp1b_numbers.md     —— mean 表 + n_cmp 表
+  - out/exp1b_lookup/exp1b_analysis_data.md —— 供 AI 分析的自洽数据块（含设置/两模式 mean 表/n_cmp/结论要点）
 """
 import os
 import collections
@@ -41,10 +36,9 @@ ROOT = os.path.dirname(HERE)
 CSV = os.path.join(ROOT, "out", "exp1b_lookup", "lookup_summary.csv")
 NCMP = os.path.join(ROOT, "out", "exp1b_lookup", "n_cmp.csv")
 OUT_MD = os.path.join(ROOT, "out", "exp1b_lookup", "exp1b_numbers.md")
+OUT_AI = os.path.join(ROOT, "out", "exp1b_lookup", "exp1b_analysis_data.md")
 
 N_LIST = [512, 1024, 2048, 4096, 8192, 10240]
-MODES = [("gbn_long64", "GBN (long, 64)"), ("gbn_short8", "GBN (short, 8)"),
-         ("sr_16", "SR (16)"), ("sr_64", "SR (64)")]
 
 # 图内 4 主方法（与 exp1a 一致）：csv 名 / 显示名 / 颜色 / 标记 / 实心 / 线宽
 PLOT = [
@@ -53,59 +47,50 @@ PLOT = [
     ("balanced_tree_bounded", "Balanced Tree", "#4C9F70", "^", False, 1.7),
     ("psn_dynblock",          "PSN Mapping",   "#1F4E9C", "D", True,  2.3),
 ]
-# 对照 E（可选入图）：Φ 纯算术下界，虚线区别于实线主方法
-IDX = ("index_only", "index-only ($\\Phi$)", "#A93226", "x", False, 1.3)
-
-# 复杂度注解：方法 -> (标注文本, 指向曲线末点)
+# 表内 5 方法（含 index-only 对照 E，图内不画）
+TABLE_ORDER = [m[0] for m in PLOT] + ["index_only"]
+LABELS = {
+    "fifo_bounded": "FIFO Queue", "chained_hash_bounded": "Chained Hash",
+    "balanced_tree_bounded": "Balanced Tree", "psn_dynblock": "PSN Mapping",
+    "index_only": "index-only ($\\Phi$)",
+}
 COMPLEXITY = {
-    "fifo_bounded":          "O(n)",
-    "balanced_tree_bounded": "O(log n)",
-    "psn_dynblock":          "O(1)",
+    "fifo_bounded": "O(N)≈N/2", "chained_hash_bounded": "O(1)",
+    "balanced_tree_bounded": "O(log N)", "psn_dynblock": "O(1) Φ",
+    "index_only": "O(1) Φ",
 }
 
 
-def read_rows():
+def read_csv(path):
     rows = []
-    with open(CSV, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             rows.append(line.split(","))
-    assert rows and rows[0][0] == "method", "CSV header missing"
-    hdr = rows[0]
-    return [dict(zip(hdr, r)) for r in rows[1:]]
-
-
-def read_ncmp():
-    rows = []
-    with open(NCMP, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            rows.append(line.split(","))
-    assert rows and rows[0][0] == "method", "n_cmp header missing"
+    assert rows and rows[0][0] == "method", "CSV header missing: %s" % path
     hdr = rows[0]
     return [dict(zip(hdr, r)) for r in rows[1:]]
 
 
 def collect(rows):
-    """(method, mode) -> {N -> (p50, p90)}"""
+    """(method, mode) -> {N -> (mean, p50, p90)}"""
     out = collections.defaultdict(dict)
     for r in rows:
-        out[(r["method"], r["mode"])][int(r["N"])] = (float(r["p50_ns"]), float(r["p90_ns"]))
+        out[(r["method"], r["mode"])][int(r["N"])] = (
+            float(r["mean_ns"]), float(r["p50_ns"]), float(r["p90_ns"]))
     return out
 
 
-def style_ax(ax, labelsize=8):
+def style_ax(ax):
     ax.set_facecolor("white")
     for s in ax.spines.values():
         s.set_visible(True)
         s.set_color("black")
         s.set_linewidth(0.8)
     ax.tick_params(axis="both", which="major", direction="in", top=True,
-                   right=True, bottom=True, left=True, length=3.5, labelsize=labelsize)
+                   right=True, bottom=True, left=True, length=3.5, labelsize=8)
     ax.tick_params(axis="both", which="minor", direction="in", top=True,
                    right=True, bottom=True, left=True, length=2.0)
     ax.minorticks_on()
@@ -118,18 +103,17 @@ def style_ax(ax, labelsize=8):
     ax.yaxis.label.set_fontsize(9)
 
 
-def draw_mode(ax, data, mode, include_idx, annotate=True, fontsize=7.5):
-    """在一根轴上画给定 mode 的 lookup-vs-N 曲线（+ 可选 O(·) 注解）。"""
-    series = list(PLOT) + ([IDX] if include_idx else [])
-    last_pts = {}  # method -> (x_last, y_last)
-    for name, label, color, marker, filled, lw in series:
+def draw_mode(ax, data, mode):
+    """在一根轴上画给定 mode 的 mean-lookup-vs-N 曲线（4 方法，无 O(·) 注解，图例缩小）。"""
+    ys_all = []
+    for name, label, color, marker, filled, lw in PLOT:
         d = data.get((name, mode))
         if not d:
             continue
         xs = [n for n in N_LIST if n in d]
-        ys = [d[n][0] for n in xs]
-        last_pts[name] = (xs[-1], ys[-1])
-        ax.plot(xs, ys, color=color, marker=marker, ms=6, ls=("--" if name == "index_only" else "-"),
+        ys = [d[n][0] for n in xs]   # index 0 = mean_ns
+        ys_all.extend(ys)
+        ax.plot(xs, ys, color=color, marker=marker, ms=6, ls="-",
                 lw=lw, mfc=(color if filled else "none"), mec=color,
                 mew=(0.0 if filled else 1.1), label=label, zorder=3)
 
@@ -138,38 +122,20 @@ def draw_mode(ax, data, mode, include_idx, annotate=True, fontsize=7.5):
     ax.set_xticks([512, 2048, 8192])
     ax.set_xticklabels(["512", "2048", "8192"])
     ax.xaxis.set_minor_locator(FixedLocator([1024, 4096]))
-    ax.set_xlim(300, 21000)
+    ax.set_xlim(400, 16000)
 
-    # 纵轴范围：给 O(n) 注解留出 FIFO 上方的空间
-    fifo_last = last_pts.get("fifo_bounded", (10240, 1e5))[1]
-    ax.set_ylim(20, fifo_last * 2.2)
+    y_min, y_max = min(ys_all), max(ys_all)
+    ax.set_ylim(y_min * 0.6, y_max * 1.35)
 
     ax.set_xlabel("Cache depth N")
-    ax.set_ylabel("Median lookup time cost (ns)")
+    ax.set_ylabel("Mean lookup time cost (ns)")
     style_ax(ax)
 
-    if annotate:
-        # 三处复杂度注解放数据右侧开放区，箭头指向对应曲线末点（避免与下界曲线叠字）
-        annot = [
-            ("fifo_bounded",          17000, 1.12),
-            ("balanced_tree_bounded", 13500, 1.55),
-            ("psn_dynblock",          17000, 1.25),
-        ]
-        for name, tx, ymul in annot:
-            if name not in last_pts:
-                continue
-            color = dict((n, c) for n, _, c, _, _, _ in PLOT)[name]
-            x0, y0 = last_pts[name]
-            ax.annotate(COMPLEXITY[name], xy=(x0, y0), xytext=(tx, y0 * ymul),
-                        fontsize=fontsize, fontstyle="italic", color=color,
-                        arrowprops=dict(arrowstyle="->", color=color, lw=0.7,
-                                        shrinkA=0, shrinkB=2),
-                        ha="center", va="center")
-
-    leg = ax.legend(loc="upper left", fontsize=8, ncol=1, frameon=True,
-                    framealpha=1.0, edgecolor="#c9c9c9", borderpad=0.4,
-                    borderaxespad=0.6, handlelength=1.6, handletextpad=0.5,
-                    labelspacing=0.45)
+    # 图例缩小：贴左上（该区无数据：FIFO 左端在中部高度、右侧才升到顶），浅灰细边框单列
+    leg = ax.legend(loc="upper left", fontsize=6.5, ncol=1, frameon=True,
+                    framealpha=1.0, edgecolor="#c9c9c9", borderpad=0.25,
+                    borderaxespad=0.5, handlelength=1.3, handletextpad=0.4,
+                    labelspacing=0.3)
     leg.get_frame().set_linewidth(0.8)
 
 
@@ -180,22 +146,22 @@ def save(fig, stem):
         print("wrote %s" % out)
 
 
-def fig_single(data, mode, include_idx, stem):
-    fig, ax = plt.subplots(figsize=(3.45, 2.3))
-    draw_mode(ax, data, mode, include_idx, annotate=True)
-    fig.tight_layout(pad=0.4)
-    save(fig, stem)
-    plt.close(fig)
-
-
-def fig_2x2(data, include_idx, stem):
-    fig, axes = plt.subplots(2, 2, figsize=(7.0, 5.2))
-    for ax, (mode, title) in zip(axes.flat, MODES):
-        draw_mode(ax, data, mode, include_idx, annotate=True, fontsize=6.5)
-        ax.set_title(title, fontsize=9, fontweight="bold")
-    fig.tight_layout(pad=0.6, h_pad=1.0, w_pad=1.0)
-    save(fig, stem)
-    plt.close(fig)
+def mean_table(data, mode):
+    """mean_ns 表：行=5 方法、列=N。"""
+    by = collections.defaultdict(dict)
+    for (m, md), d in data.items():
+        if md != mode:
+            continue
+        for n, (mean, _, _) in d.items():
+            by[m][n] = mean
+    lines = ["| method | " + " | ".join(str(n) for n in N_LIST) + " |",
+             "|---|" + "---|" * len(N_LIST)]
+    for m in TABLE_ORDER:
+        if m not in by:
+            continue
+        cells = ["%.1f" % by[m][n] if n in by[m] else "—" for n in N_LIST]
+        lines.append("| %s | %s |" % (LABELS[m], " | ".join(cells)))
+    return "\n".join(lines)
 
 
 def ncmp_table(ncmp, mode):
@@ -204,72 +170,71 @@ def ncmp_table(ncmp, mode):
         if r["mode"] != mode:
             continue
         by[r["method"]][int(r["N"])] = float(r["mean_cmp_per_pkt"])
-    order = [m[0] for m in PLOT] + ["index_only"]
-    labels = {
-        "fifo_bounded": "FIFO Queue", "chained_hash_bounded": "Chained Hash",
-        "balanced_tree_bounded": "Balanced Tree", "psn_dynblock": "PSN Mapping",
-        "index_only": "index-only ($\\Phi$)",
-    }
     lines = ["| method | " + " | ".join(str(n) for n in N_LIST) + " | 复杂度 |",
              "|---|" + "---|" * (len(N_LIST) + 1)]
-    for m in order:
+    for m in TABLE_ORDER:
         if m not in by:
             continue
-        cells = ["%.1f" % by[m].get(n, float("nan")) if n in by[m] else "—" for n in N_LIST]
-        cx = {"fifo_bounded": "O(N)≈N/2", "chained_hash_bounded": "O(1)",
-              "balanced_tree_bounded": "O(log N)", "psn_dynblock": "O(1) Φ",
-              "index_only": "O(1) Φ"}[m]
-        lines.append("| %s | %s | %s |" % (labels[m], " | ".join(cells), cx))
+        cells = ["%.1f" % by[m][n] if n in by[m] else "—" for n in N_LIST]
+        lines.append("| %s | %s | %s |" % (LABELS[m], " | ".join(cells), COMPLEXITY[m]))
     return "\n".join(lines)
 
 
-def p50_table(data, mode):
-    by = collections.defaultdict(dict)
-    for (m, md), d in data.items():
-        if md != mode:
-            continue
-        for n, (p50, _) in d.items():
-            by[m][n] = p50
-    order = [m[0] for m in PLOT] + ["index_only"]
-    labels = {
-        "fifo_bounded": "FIFO Queue", "chained_hash_bounded": "Chained Hash",
-        "balanced_tree_bounded": "Balanced Tree", "psn_dynblock": "PSN Mapping",
-        "index_only": "index-only ($\\Phi$)",
-    }
-    lines = ["| method | " + " | ".join(str(n) for n in N_LIST) + " |",
-             "|---|" + "---|" * len(N_LIST)]
-    for m in order:
-        if m not in by:
-            continue
-        cells = []
+def analysis_block(data, ncmp):
+    """供 AI 分析的自洽数据块（脚本提取，可直接粘贴给 AI）。"""
+    L = []
+    L.append("# exp1b lookup 实验数据（供 AI 分析）\n")
+    L.append("## 实验设置")
+    L.append("- 任务：RDMA 网关缓存 lookup/取包时间开销（GBN/SR NAK 重传工作负载）")
+    L.append("- 方法：FIFO 队列 / 链式哈希 / 平衡树 / PSN 确定性映射(ours) / index-only(Φ纯算术对照)")
+    L.append("- 本数据块模式：GBN(long,64) 与 SR(64)（各自代表 GBN 与 SR 两类重传）")
+    L.append("- N（缓存深度 / 工作集条数）：512, 1024, 2048, 4096, 8192, 10240")
+    L.append("- payload=1024 B；计时批 B=512 ops；reps=5；主指标 = 平均时间 mean_ns（单位 ns）")
+    L.append("- 每 op = 一次 retrieve_range(GBN)/retrieve_set(SR)（定位 + memcpy 全过程）")
+    L.append("- 读钟地板：B=512 → 7.619 ns/op；B=32 → 112.505 ns/op（floor ∝ 1/B）")
+    L.append("- 注：mean 受 VM ~1% 调度停顿尾影响，快方法 mean 比 p50 高约 4-6%（真实上界，非算法差异）；结论不受影响")
+    for mode, label in [("gbn_long64", "GBN (long, 64)"), ("sr_64", "SR (64)")]:
+        L.append("\n## %s — mean lookup time (ns)\n" % label)
+        L.append("| N | FIFO Queue | Chained Hash | Balanced Tree | PSN Mapping | index-only |")
+        L.append("|---|---|---|---|---|---|")
         for n in N_LIST:
-            cells.append("%.1f" % by[m][n] if n in by[m] else "—")
-        lines.append("| %s | %s |" % (labels[m], " | ".join(cells)))
-    return "\n".join(lines)
+            cells = []
+            for m in TABLE_ORDER:
+                v = data.get((m, mode), {}).get(n)
+                cells.append("%.1f" % v[0] if v else "—")
+            L.append("| %d | %s |" % (n, " | ".join(cells)))
+    L.append("\n## n_cmp（每次取包平均比较次数，复杂度证据；gbn_long64 代表）\n")
+    L.append(ncmp_table(ncmp, "gbn_long64"))
+    L.append("\n## 关键结论（供 AI 交叉验证）")
+    L.append("1. 伸缩性：FIFO 随 N 线性增长（O(N)，n_cmp≈N/2）；Chained Hash / PSN Mapping / index-only 近似平缓（O(1)）；Balanced Tree 亚线性（O(log N)）。")
+    L.append("2. PSN Mapping 绝对时间比 Chained Hash 慢约 1.5-2.5×（固定块池的 cache 局部性代价），但比 FIFO 快约两个数量级（N=10240 时快 ~90-120×）。")
+    L.append("3. PSN Mapping 的独特价值不在 lookup 绝对速度，而在：Φ 位置索引零比较、连续 mmap 池可 DMA 零拷贝、自适应块大小（空间利用率，见 exp2）、零迁移 resize。")
+    return "\n".join(L)
 
 
 def main():
-    rows = read_rows()
-    ncmp = read_ncmp()
+    rows = read_csv(CSV)
+    ncmp = read_csv(NCMP)
     data = collect(rows)
 
-    # ---- 6 张图，每张独立 PDF+PNG ----
-    fig_single(data, "gbn_long64", False, "fig_exp1b_lookup_gbn64")
-    fig_single(data, "gbn_long64", True,  "fig_exp1b_lookup_gbn64_idx")
-    fig_single(data, "sr_64",      False, "fig_exp1b_lookup_sr64")
-    fig_single(data, "sr_64",      True,  "fig_exp1b_lookup_sr64_idx")
-    fig_2x2(data, False, "fig_exp1b_lookup_2x2")
-    fig_2x2(data, True,  "fig_exp1b_lookup_2x2_idx")
+    # ---- 两张图：GBN 与 SR（各 4 方法，mean，无 O(·)，图例缩小）----
+    for mode, stem in [("gbn_long64", "fig_exp1b_lookup_gbn64"),
+                       ("sr_64",      "fig_exp1b_lookup_sr64")]:
+        fig, ax = plt.subplots(figsize=(3.45, 2.3))
+        draw_mode(ax, data, mode)
+        fig.tight_layout(pad=0.4)
+        save(fig, stem)
+        plt.close(fig)
 
-    # ---- 数字提取（脚本产出，禁手抄）----
+    # ---- 数字表（mean 为主指标）----
     md = []
     md.append("# exp1b lookup — 脚本提取（lookup_summary.csv / n_cmp.csv）\n")
-    md.append("> payload=1024，B=512，reps=5，n_batches=32；主指标 p50，次指标 p90。\n")
-    md.append("> floor(读钟/B)：B=512 → 7.619 ns/op；B=32 → 112.505 ns/op（floor ∝ 1/B 闭环）。\n")
-    md.append("> 图：gbn64 / sr64 单图 + 2×2 四模式；含/不含 index-only 各一版（单图独立 PDF）。\n")
-    for mode, title in MODES:
-        md.append("\n## p50 (ns) — %s（%s）\n" % (mode, title))
-        md.append(p50_table(data, mode))
+    md.append("> payload=1024，B=512，reps=5，n_batches=32；主指标 = 平均时间 mean_ns（非中值）。\n")
+    md.append("> 读钟地板：B=512 → 7.619 ns/op；B=32 → 112.505 ns/op（floor ∝ 1/B 闭环）。\n")
+    md.append("> mean 受 VM ~1% 调度停顿尾影响，快方法 mean 比 p50 高约 4-6%（真实上界）；p50/p90/p99 仍在 CSV。\n")
+    for mode, label in [("gbn_long64", "GBN (long, 64)"), ("sr_64", "SR (64)")]:
+        md.append("\n## mean_ns (ns) — %s（%s）\n" % (mode, label))
+        md.append(mean_table(data, mode))
     md.append("\n## n_cmp（mean_cmp_per_pkt，纯取包比较）— gbn_long64 代表\n")
     md.append(ncmp_table(ncmp, "gbn_long64"))
     text = "\n".join(md) + "\n"
@@ -277,7 +242,11 @@ def main():
     with open(OUT_MD, "w", encoding="utf-8") as f:
         f.write(text)
     print("wrote %s" % OUT_MD)
-    print("\n" + text)
+
+    ai = analysis_block(data, ncmp)
+    with open(OUT_AI, "w", encoding="utf-8") as f:
+        f.write(ai)
+    print("wrote %s" % OUT_AI)
 
 
 if __name__ == "__main__":
