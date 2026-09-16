@@ -7,9 +7,9 @@ SRC_CORE := src/config.c src/util.c src/pool.c src/dynblock.c
 SIM_SRC  := sim/traffic.c sim/loss.c sim/nak.c sim/sim_main.c
 SRC_BASE := baselines/baseline.c
 
-BIN := build/selftest build/sim build/baseline_smoke build/exp1a_store
+BIN := build/selftest build/sim build/baseline_smoke build/exp1a_store build/exp1b_lookup
 
-.PHONY: all smoke run-exp1a clean
+.PHONY: all smoke run-exp1a run-exp1b clean
 
 all: $(BIN)
 
@@ -31,6 +31,13 @@ build/exp1a_store: $(SRC_CORE) $(SRC_BASE) bench/exp1a_store.c
 
 run-exp1a: build/exp1a_store
 	./build/exp1a_store
+
+build/exp1b_lookup: $(SRC_CORE) $(SRC_BASE) bench/exp1b_lookup.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Ibaselines $^ -o $@ $(LDLIBS)
+
+run-exp1b: build/exp1b_lookup
+	./build/exp1b_lookup
 
 # A13 运行时部分：sim_link_gbps=1 与 1000 各跑同一序列，S_trace.csv 逐字节一致。
 smoke: $(BIN)

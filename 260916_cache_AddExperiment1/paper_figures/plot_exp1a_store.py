@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fig — 时间开销图 · store 面板（exp1a）：store time cost vs packet size。
+Fig — exp1a store 面板（重画版，2026-09-16 定稿）: store time cost vs packet size。
 
-读取 out/exp1a_store/store_summary.csv（B=8192 主矩阵），画 6 条序列：
-  fifo_bounded / chained_hash_bounded / balanced_tree_bounded /
-  psn_dynblock（自适应收敛后冻结）/ psn_dynblock_fixed（S=4096 固定，虚线对照）/
-  index_only（Φ 不可约成本）。
+序列（与论文 3.1「三种常用结构 + 我们」一一对应，图文一致，只画 4 条）：
+  FIFO Queue / Chained Hash / Balanced Tree / PSN Mapping（= dynblock adaptive S）。
+  index_only 与 dynblock(fixed S=4096) 从图中移出 → 只进 RESULTS.md 表 + 正文数字。
 
-规格（2026-09-16 定稿）：
-  - 横轴 packet size（64/1024/4096 B），对数；纵轴 store time cost（ns），对数；
-  - 矢量 PDF + 300 dpi PNG；黑白可读：靠线型 + 标记区分（不只靠颜色）；
-  - 字体 serif（Times 度量兼容替代），缩放后字号 ≥7pt；
-  - 主指标 p50；次指标 p90（本图只画 p50，p90/p99 见 RESULTS.md 脚本提取表）；
-  - 图注（名词性短语）="Store time cost versus packet size."；
-  - 图内注：N=10240, batch B=8192, R=5 runs；单位 ns。
+视觉规格（照参考图 fig1_time 风格，逐项落实）：
+  - serif/Times；轴标签加粗；单栏字号：轴标签 9 / 刻度 8 / 图例 8；
+  - 白底 + 完整框线（四边 spine 全留）；四边向内刻度 + 次级 minor ticks；
+  - 只留水平浅灰主网格线（无竖网格/竖线）；
+  - 线宽 1.7（基线）/ 2.3（PSN Mapping）；标记 ○/□/△/◆ ~7pt；
+  - 颜色：FIFO=#8C8C8C｜Chained Hash=#E8A33D｜Balanced Tree=#4C9F70｜PSN Mapping=#1F4E9C（实心）；
+  - 图例放坐标区内左上：浅灰细边框、单列；
+  - 无图内标题栏（caption 交论文 \\caption{}）；无 O(·) 标注（那是 exp1b 的活）。
 
-数字提取：同时把 B=8192 的 p50/p90（及 B=1024 交叉验证）以 markdown 表打印到
-stdout + 写入 out/exp1a_store/exp1a_numbers.md，供 RESULTS.md 直接引用（禁手抄）。
+坐标：横轴 Packet size (B) 对数（刻度仅 64/1024/4096）；纵轴 Store time cost (ns) 对数（禁 latency）。
+尺寸：单栏 3.45×2.3 in（默认）；跨栏按 7.0×3.6 in 同比例放大、字号×2。
+
+数字提取：把 B=8192 p50/p90 + B=1024 p50（6 方法）写 out/exp1a_store/exp1a_numbers.md
+与 RESULTS.md（数字全部脚本从 CSV 提取，禁手抄）。
 """
 import os
-import csv
 import collections
 
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FixedLocator
 
-# ---- serif 字体（Times 度量兼容替代）----
+# ---- serif（Times 度量兼容替代）----
 plt.rcParams["font.family"] = "serif"
 plt.rcParams["font.serif"] = ["Times New Roman", "Liberation Serif", "DejaVu Serif"]
 plt.rcParams["axes.unicode_minus"] = False
-plt.rcParams["font.size"] = 9
+plt.rcParams["font.size"] = 8
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -40,24 +42,25 @@ CSV_PATH = os.path.join(ROOT, "out", "exp1a_store", "store_summary.csv")
 OUT_MD = os.path.join(ROOT, "out", "exp1a_store", "exp1a_numbers.md")
 RESULTS_MD = os.path.join(ROOT, "RESULTS.md")
 
-# 序列定义（顺序 = 图例顺序；黑白可读：线型 + 标记 + 填充 区分）
-SERIES = [
-    ("fifo_bounded",          "FIFO (bounded)",
-     dict(color="black", ls="-",  marker="o", mfc="none",  lw=1.2, ms=5.5)),
-    ("chained_hash_bounded",  "chained hash (bounded)",
-     dict(color="black", ls="--", marker="s", mfc="none",  lw=1.2, ms=5.0)),
-    ("balanced_tree_bounded", "balanced tree (bounded)",
-     dict(color="black", ls="-.", marker="^", mfc="none",  lw=1.2, ms=6.0)),
-    ("psn_dynblock",          "dynblock (adaptive S)",
-     dict(color="black", ls="-",  marker="D", mfc="black", lw=2.2, ms=5.5)),
-    ("psn_dynblock_fixed",    "dynblock (fixed S=4096)",
-     dict(color="black", ls=":",  marker="D", mfc="none",  lw=1.4, ms=5.5)),
-    ("index_only",            "index-only ($\\Phi$)",
-     dict(color="0.45", ls=":",  marker="x", mfc="none",  lw=1.0, ms=6.0)),
+# ---- 图内 4 序列：csv 名 / 显示名 / 颜色 / 标记 / 实心 / 线宽 ----
+PLOT = [
+    ("fifo_bounded",          "FIFO Queue",    "#8C8C8C", "o", False, 1.7),
+    ("chained_hash_bounded",  "Chained Hash",  "#E8A33D", "s", False, 1.7),
+    ("balanced_tree_bounded", "Balanced Tree", "#4C9F70", "^", False, 1.7),
+    ("psn_dynblock",          "PSN Mapping",   "#1F4E9C", "D", True,  2.3),
 ]
-ORDER = [s[0] for s in SERIES]
-LABEL = dict((s[0], s[1]) for s in SERIES)
-STYLE = dict((s[0], s[2]) for s in SERIES)
+
+# ---- 表内 6 方法（含被移出图的两个）----
+TABLE_ORDER = ["fifo_bounded", "chained_hash_bounded", "balanced_tree_bounded",
+               "psn_dynblock", "psn_dynblock_fixed", "index_only"]
+TABLE_LABEL = {
+    "fifo_bounded":          "FIFO Queue",
+    "chained_hash_bounded":  "Chained Hash",
+    "balanced_tree_bounded": "Balanced Tree",
+    "psn_dynblock":          "PSN Mapping (adaptive S)",
+    "psn_dynblock_fixed":    "PSN Mapping (fixed S=4096)",
+    "index_only":            "index-only ($\\Phi$)",
+}
 
 
 def read_rows():
@@ -87,13 +90,11 @@ def collect(rows, B):
 
 
 def md_table(data, key):
-    """p50 主表（key='p50'/'p90'）：行=方法、列=payload。"""
+    """p50 主表（key='p50'/'p90'）：行=6 方法、列=payload。"""
     payloads = [64, 1024, 4096]
     idx = 0 if key == "p50" else 1
-    head = "| method | 64 B | 1024 B | 4096 B |"
-    sep = "|---|---|---|---|"
-    lines = [head, sep]
-    for m in ORDER:
+    lines = ["| method | 64 B | 1024 B | 4096 B |", "|---|---|---|---|"]
+    for m in TABLE_ORDER:
         if m not in data:
             continue
         cells = []
@@ -102,8 +103,33 @@ def md_table(data, key):
                 cells.append("%.3f" % data[m][p][idx])
             else:
                 cells.append("—")
-        lines.append("| %s | %s |" % (LABEL[m], " | ".join(cells)))
+        lines.append("| %s | %s |" % (TABLE_LABEL[m], " | ".join(cells)))
     return "\n".join(lines)
+
+
+def style_ax(ax):
+    """白底 + 完整框线 + 四边向内刻度(含次级) + 只留水平浅灰主网格。"""
+    ax.set_facecolor("white")
+    for s in ax.spines.values():
+        s.set_visible(True)
+        s.set_color("black")
+        s.set_linewidth(0.8)
+    # 四边向内刻度（主刻度带标签，次级无标签）
+    ax.tick_params(axis="both", which="major", direction="in", top=True,
+                   right=True, bottom=True, left=True, length=3.5, labelsize=8)
+    ax.tick_params(axis="both", which="minor", direction="in", top=True,
+                   right=True, bottom=True, left=True, length=2.0)
+    ax.minorticks_on()
+    # 只留水平浅灰主网格线（无竖网格/竖线）
+    ax.grid(False)
+    ax.grid(True, which="major", axis="y", color="#dcdcdc", linewidth=0.6,
+            zorder=0)
+    ax.set_axisbelow(True)
+    # 轴标签加粗
+    ax.xaxis.label.set_fontweight("bold")
+    ax.yaxis.label.set_fontweight("bold")
+    ax.xaxis.label.set_fontsize(9)
+    ax.yaxis.label.set_fontsize(9)
 
 
 def main():
@@ -112,36 +138,36 @@ def main():
     data = collect(rows, B_main)
     payloads = [64, 1024, 4096]
 
-    # ---- 画图 ----
-    fig, ax = plt.subplots(figsize=(5.4, 4.2))
-    for m in ORDER:
-        if m not in data:
+    # ---- 画图（单栏 3.45×2.3 in）----
+    fig, ax = plt.subplots(figsize=(3.45, 2.3))
+    for name, label, color, marker, filled, lw in PLOT:
+        if name not in data:
             continue
-        xs = [p for p in payloads if p in data[m]]
-        ys = [data[m][p][0] for p in xs]
-        ax.plot(xs, ys, label=LABEL[m], **STYLE[m])
+        xs = [p for p in payloads if p in data[name]]
+        ys = [data[name][p][0] for p in xs]
+        ax.plot(xs, ys, color=color, marker=marker, ms=7, ls="-", lw=lw,
+                mfc=(color if filled else "none"), mec=color,
+                mew=(0.0 if filled else 1.1), label=label, zorder=3)
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
-    ax.set_xticks(payloads)
+    ax.set_xticks([64, 1024, 4096])
     ax.set_xticklabels(["64", "1024", "4096"])
+    ax.xaxis.set_minor_locator(FixedLocator([128, 256, 512, 2048]))
+    ax.set_xlim(40, 6500)
+    ax.set_ylim(1, 1500)
     ax.set_xlabel("Packet size (B)")
     ax.set_ylabel("Store time cost (ns)")
-    ax.grid(True, which="both", ls=":", color="#cccccc", zorder=0)
-    ax.set_axisbelow(True)
+    style_ax(ax)
 
-    # 图内注：N / batch B / runs + 单位
-    ax.text(0.02, 0.02, "N=10240, batch B=8192, R=5 runs; unit: ns",
-            transform=ax.transAxes, fontsize=7.5, color="#333333",
-            va="bottom", ha="left")
+    # 图例放进坐标区内左上：浅灰细边框、单列
+    leg = ax.legend(loc="upper left", fontsize=8, ncol=1, frameon=True,
+                    framealpha=1.0, edgecolor="#c9c9c9", borderpad=0.4,
+                    borderaxespad=0.6, handlelength=1.6, handletextpad=0.5,
+                    labelspacing=0.45)
+    leg.get_frame().set_linewidth(0.8)
 
-    # 图注（名词性短语，放在图上方作标题）
-    ax.set_title("Store time cost versus packet size", fontsize=10, loc="left",
-                 pad=8)
-
-    leg = ax.legend(loc="upper left", frameon=False, fontsize=7.5,
-                    handlelength=2.4, borderaxespad=0.4, ncol=1)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.tight_layout(pad=0.4)
     for ext in ("png", "pdf"):
         out = os.path.join(HERE, "fig_exp1a_store.%s" % ext)
         fig.savefig(out, dpi=300, bbox_inches="tight")
@@ -162,24 +188,24 @@ def main():
     for m in ("psn_dynblock", "psn_dynblock_fixed"):
         if m in data:
             s = ", ".join("%s B→S=%d" % (p, data[m][p][2]) for p in payloads)
-            md.append("- %s: %s" % (LABEL[m], s))
+            md.append("- %s: %s" % (TABLE_LABEL[m], s))
     text = "\n".join(md) + "\n"
 
     with open(OUT_MD, "w", encoding="utf-8") as f:
         f.write(text)
     print("wrote %s" % OUT_MD)
 
-    # ---- RESULTS.md（数字段由脚本写入，禁手抄）----
+    # ---- RESULTS.md（数字段脚本写入）----
     r = []
     r.append("# RESULTS — 实验结果（数字由脚本从 store_summary.csv 提取）\n")
     r.append("> 生成：`python3 paper_figures/plot_exp1a_store.py`；表内数字禁止手抄。\n")
     r.append("\n## exp1a — store time cost（存时间开销）\n")
     r.append("\n**图：** `paper_figures/fig_exp1a_store.pdf`（同目录 `fig_exp1a_store.png` @300dpi）。\n")
-    r.append("\n**图注（名词性短语）：** Store time cost versus packet size.\n")
-    r.append("\n图内注：N=10240, batch B=8192, R=5 runs；单位 ns。横轴 packet size（64/1024/4096 B）、"
-             "纵轴 store time cost（ns），双对数。主指标 p50，次指标 p90（p99 仅 CSV 留痕，"
-             "~1% 批次遭 ~2ms VM 调度停顿，不可用）。序列：FIFO/hash/tree 三个 bounded 基线、"
-             "dynblock（自适应收敛后冻结）、dynblock（fixed S=4096，虚线对照）、index-only（Φ 不可约成本）。\n")
+    r.append("\n**图注（名词性短语，交论文 `\\caption{}`）：** Store time cost versus packet size.\n")
+    r.append("\n条件（论文 3.1 正文）：N=10240，batch B=8192 主矩阵，R=5 runs，单位 ns；"
+             "B=1024 为交叉验证。横轴 packet size（64/1024/4096 B）、纵轴 store time cost（ns），双对数。"
+             "主指标 p50，次指标 p90（p99 仅 CSV 留痕，~1% 批次遭 ~2ms VM 调度停顿，不可用）。"
+             "图内仅 4 方法；index_only 与 dynblock(fixed S=4096) 仅入下表（正文用数字给自适应收益）。\n")
     r.append("\n### 主矩阵 B=8192 · p50 (ns)\n")
     r.append(md_table(data, "p50"))
     r.append("\n\n### 主矩阵 B=8192 · p90 (ns)\n")
@@ -190,7 +216,7 @@ def main():
     for m in ("psn_dynblock", "psn_dynblock_fixed"):
         if m in data:
             s = ", ".join("%s B→S=%d" % (p, data[m][p][2]) for p in payloads)
-            r.append("- %s: %s" % (LABEL[m], s))
+            r.append("- %s: %s" % (TABLE_LABEL[m], s))
     r.append("\n\n---\n")
     rtext = "\n".join(r) + "\n"
 

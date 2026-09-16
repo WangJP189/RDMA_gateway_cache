@@ -81,11 +81,12 @@
 #define CFG_E1B_GBN_SHORT       8u
 #define CFG_E1B_SR_K1           16u
 #define CFG_E1B_SR_K2           64u
-#define CFG_E1B_QUERIES         10000u
-#define CFG_E1B_PAYLOAD_LIST    { 1024u,64u } /* 主用 1024，64 横向对照 */
-#define CFG_E1B_PAYLOAD_N       2u
-#define CFG_E1B_BATCH_OPS       1u       /* NAK 计时批大小（ops），默认单事件 */
-#define CFG_E1B_BATCH_XVAL_OPS  32u      /* P1-⑨ 对照批大小（ops） */
+#define CFG_E1B_QUERIES         16384u  /* 每 rep 计时操作数（=n_batches*B；B=512 ⇒ 32 批，reps=5 池化 160 样本；
+                                         *  FIFO O(N) 在 N=10240 GBN-64 实测 ~653μs/op，16384×5 需 ~5s/格，全矩阵 ~4.5min） */
+#define CFG_E1B_PAYLOAD_LIST    { 1024u } /* 范围收窄：只跑 1024 */
+#define CFG_E1B_PAYLOAD_N       1u
+#define CFG_E1B_BATCH_OPS       512u    /* retrieve 计时批大小 B：最快 op（SR-16 O(1)~0.7μs）下 floor≈9ns≈1.3% */
+#define CFG_E1B_BATCH_XVAL_OPS  32u     /* 地板交叉验证批大小（floor ∝ 1/B 论证用，非主矩阵） */
 
 /* ==================== D. 实验二 ==================== */
 #define CFG_E2_PKTSIZE_LIST  { 512u,640u,768u,1024u,1280u,1500u,1536u,2048u,3072u,4096u }
