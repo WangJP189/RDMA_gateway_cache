@@ -1,24 +1,31 @@
 /*
  * bench/exp1b_lookup.c — 实验一(b)：取时间开销（lookup time cost vs N）
  * --------------------------------------------------------------------------------
- * 精简矩阵（2026-09-16 范围收窄后）：
+ * 精简矩阵（2026-09-17 修订）：
  *   方法 = fifo_bounded / chained_hash_bounded / balanced_tree_bounded /
- *          psn_dynblock / index_only（对照 E）。
+ *          psn_dynblock(S0=payload) / psn_dynblock_adaptive(收敛后冻结) / index_only(对照 E)。
  *   模式（NAK 重传的真实工作负载，四种）= GBN-long(64) / GBN-short(8) / SR-16 / SR-64。
  *   N（缓存深度 / 工作集条数）= {512,1024,2048,4096,8192,10240}（6 点）；
- *   payload 只跑 1024（范围收窄）。
+ *   payload 只跑 1024。
  *
- * 口径：
- *   - 预填充：向 *_bounded(N) 或 dynblock(环固定 10240) 存 0..N-1 共 N 条，全命中工作集；
- *   - 计时单位 = 一次 retrieve_range / retrieve_set 操作（定位 + memcpy 全过程，即一次
- *     GBN/SR 重传的完整开销）；per-op ns = (t1-t0)/B，B 次操作夹一对裸 rdtsc 摊销；
- *   - 主指标 p50（Median lookup time cost），次指标 p90；p99 仅 CSV 留痕（VM ~2ms 调度停顿
- *     污染 ~1% 批次，不可用）；
- *   - n_cmp：retrieve 前清零、批后累计，报「每次取包平均比较次数」（纯取包比较），
- *     FIFO=O(N)~N/2、tree=O(log N)、hash~O(1)、dynblock/index_only=0（Φ 纯算术）——
- *     复杂度曲线的第三项证据（第一项时间、第二项 floor）；
- *   - 空批地板：同循环结构 + 同一对 rdtsc，批内无 retrieve（asm 屏障防 DCE）；
- *     floor ∝ 1/B，同时测 B=512 与 B=32（xval）把「读钟贵」变成显式已知量。
+ * dynblock 口径（修正 2026-09-17：不再用 S=4096 存 1024B 包，那是对 PSN 的不公平配置）：
+ *   psn_dynblock          —— S0=payload（make_dynblock(cfg, pl)），等价于 CM 上报 MTU 的正确初始化；
+ *   psn_dynblock_adaptive —— S0=4096，预热期 adaptive_enable=1 让 S 按机制收敛到 1024，
+ *                            再 adaptive_enable=0 冻结计时（忠实于自适应机制的「收敛后冻结」）。
+ *   两者 S 最终都 = 1024，结果应一致（互证 S0=MTU 是正确初始化）。
+ *
+ * 重排序维度（2026-09-17 新增，回应「上层是否需要整理」）：
+ *   - GBN（连续区间）：所有方法都按 start+k 递增取，输出天然 PSN 序，无需重排 ⇒ reorder 仅 0。
+ *   - SR（离散集合）：所有方法都按 psns[k] 查询序取，输出未排序；若上层要按 PSN 序发，需排序。
+ *     排序对所有方法对称（同一 64 元素升序插入排序，计时内），故 reorder ∈ {0,1} 两版都跑，
+ *     用于对比「计入整理后」相对排序是否改变。
+ *
+ * 计时口径：
+ *   - 计时单位 = 一次 retrieve_range / retrieve_set（定位 + memcpy 全过程，即一次 GBN/SR 重传
+ *     的完整开销；SR reorder=1 时额外含「把 64 个 PSN 升序整理」这一步）；per-op ns = (t1-t0)/B。
+ *   - 主指标 p50，次指标 p90；p99 仅 CSV 留痕（VM ~2ms 调度停顿污染 ~1% 批次，不可用）。
+ *   - n_cmp：retrieve 前清零、批后累计，报「每次取包平均比较次数」；排序不在缓存内，不计 n_cmp。
+ *   - 空批地板：floor ∝ 1/B，同时测 B=512 与 B=32（xval）。
  *
  * 编译：make build/exp1b_lookup && ./build/exp1b_lookup [--out=DIR]
  * 产物：<out>/lookup_summary.csv + <out>/n_cmp.csv + <out>/resolved_config.json
@@ -54,20 +61,23 @@ typedef b_cache_t *(*make_fn)(const cfg_t *cfg, uint32_t cap, uint32_t pl);
 static b_cache_t *mk_fifo_b(const cfg_t *cfg, uint32_t cap, uint32_t pl) { (void)cfg; return make_fifo_bounded(cap, pl); }
 static b_cache_t *mk_hash_b(const cfg_t *cfg, uint32_t cap, uint32_t pl) { return make_chained_hash_bounded(cap, cfg->hash_nbuckets, pl); }
 static b_cache_t *mk_tree_b(const cfg_t *cfg, uint32_t cap, uint32_t pl) { (void)cfg; return make_balanced_tree_bounded(cap, pl); }
-static b_cache_t *mk_dyn   (const cfg_t *cfg, uint32_t cap, uint32_t pl) { (void)cap; (void)pl; return make_dynblock(cfg, 4096); } /* 环固定 10240，S0=4096 */
+static b_cache_t *mk_dyn_pl(const cfg_t *cfg, uint32_t cap, uint32_t pl) { (void)cap; return make_dynblock(cfg, pl); }   /* S0=ceil_class(pl)=pl */
+static b_cache_t *mk_dyn4096(const cfg_t *cfg, uint32_t cap, uint32_t pl) { (void)cap; (void)pl; return make_dynblock(cfg, 4096); } /* S0=4096，预热收敛 */
 static b_cache_t *mk_idx   (const cfg_t *cfg, uint32_t cap, uint32_t pl) { (void)cfg; (void)pl; return make_index_only(cap); }
 
 typedef struct {
     const char *name;
     make_fn      make;
+    int          converge;   /* 1 = 预热期 adaptive=1 收敛 S→pl，再冻结为 0 */
 } method_t;
 
 static const method_t METHODS[] = {
-    { "fifo_bounded",          mk_fifo_b },
-    { "chained_hash_bounded",  mk_hash_b },
-    { "balanced_tree_bounded", mk_tree_b },
-    { "psn_dynblock",          mk_dyn    },
-    { "index_only",            mk_idx    },
+    { "fifo_bounded",          mk_fifo_b,  0 },
+    { "chained_hash_bounded",  mk_hash_b,  0 },
+    { "balanced_tree_bounded", mk_tree_b,  0 },
+    { "psn_dynblock",          mk_dyn_pl,  0 },   /* S0=payload（主结果） */
+    { "psn_dynblock_adaptive", mk_dyn4096, 1 },   /* 收敛后冻结（机制忠实，互证） */
+    { "index_only",            mk_idx,     0 },
 };
 #define N_METHODS (sizeof(METHODS) / sizeof(METHODS[0]))
 
@@ -94,24 +104,43 @@ static void gen_queries(uint32_t *q, const e1b_mode_t *m, uint32_t N,
     }
 }
 
-/* ---- retrieve 批量计时 + n_cmp：每批 B 次操作夹一对 rdtsc；n_cmp 批前清零、批后累计 ---- */
+/* 上层整理：把 PSN 集升序（小规模插入排序，同对所有方法、计入计时） */
+static void ins_sort_u32(uint32_t *a, uint32_t n) {
+    for (uint32_t i = 1; i < n; i++) {
+        uint32_t x = a[i], j = i;
+        while (j > 0 && a[j - 1] > x) { a[j] = a[j - 1]; j--; }
+        a[j] = x;
+    }
+}
+
+/* ---- retrieve 批量计时 + n_cmp：每批 B 次操作夹一对 rdtsc；n_cmp 批前清零、批后累计 ----
+ * reorder=1 且 SR：先把该次 64 个 PSN 升序整理，再 retrieve_set（「开始取→整理完可发」）。 */
 static size_t time_retrieve(b_cache_t *c, const e1b_mode_t *m, const uint32_t *q,
                             uint32_t B, uint32_t n_batches, uint32_t reps,
-                            uint8_t *out, uint32_t out_cap,
+                            uint8_t *out, uint32_t out_cap, int reorder,
                             double *samples, uint64_t *total_cmp) {
     size_t idx = 0;
     uint64_t cmp = 0;
     uint32_t wsum = 0;
     uint32_t count = m->count, stride = m->is_set ? count : 1u;
+    uint32_t sorted[64];
     for (uint32_t r = 0; r < reps; r++) {
         for (uint32_t b = 0; b < n_batches; b++) {
             const uint32_t *qb = q + (size_t)b * B * stride;
             c->n_cmp = 0;
             uint64_t t0 = rdtsc_raw();
-            for (uint32_t k = 0; k < B; k++) {
-                if (m->is_set)
-                    wsum += c->ops.retrieve_set(c, qb + (size_t)k * stride, count, out, out_cap);
-                else
+            if (m->is_set) {
+                for (uint32_t k = 0; k < B; k++) {
+                    if (reorder) {
+                        memcpy(sorted, qb + (size_t)k * stride, count * sizeof(uint32_t));
+                        ins_sort_u32(sorted, count);
+                        wsum += c->ops.retrieve_set(c, sorted, count, out, out_cap);
+                    } else {
+                        wsum += c->ops.retrieve_set(c, qb + (size_t)k * stride, count, out, out_cap);
+                    }
+                }
+            } else {
+                for (uint32_t k = 0; k < B; k++)
                     wsum += c->ops.retrieve_range(c, qb[(size_t)k * stride], count, out, out_cap);
             }
             uint64_t t1 = rdtsc_raw();
@@ -142,7 +171,7 @@ int main(int argc, char **argv) {
     cfg_t cfg; cfg_default(&cfg);
     snprintf(cfg.out_dir, sizeof(cfg.out_dir), "out/exp1b_lookup");
     if (cfg_override_cli(&cfg, argc, argv) != 0) return 1;
-    cfg.adaptive_enable = 0u;   /* 取路径无 resize；冻结 S 使 dynblock 与 exp1a 固定口径一致 */
+    /* 取路径无 resize；自适应变体在预热期临时开 adaptive、收敛后冻结（见下面 converge 处理） */
 
     tsc_calibrate();
     if (mkdir_p(cfg.out_dir) < 0) { fprintf(stderr, "[exp1b] 无法创建输出目录 %s\n", cfg.out_dir); return 1; }
@@ -157,6 +186,7 @@ int main(int argc, char **argv) {
     uint32_t n_ops     = n_batches * B;
     uint32_t sample_n  = n_batches * reps;
     uint32_t pl        = cfg.e1b_payload_list[0];  /* 只跑 1024（范围收窄） */
+    uint32_t warm      = 6u * cfg.ring_n;          /* 自适应变体预热：S0=4096 收敛到 pl 需 ~5 纪元（4 quiet+2 streak） */
 
     e1b_mode_t modes[4] = {
         { "gbn_long64", cfg.e1b_gbn_long, 0 },
@@ -195,16 +225,18 @@ int main(int argc, char **argv) {
 
     fprintf(f, "# exp1b lookup/retrieve time cost (batch-amortized). payload=%u reps=%u B=%u n_batches=%u\n",
             pl, reps, B, n_batches);
-    fprintf(f, "# methods: fifo_bounded / chained_hash_bounded / balanced_tree_bounded / psn_dynblock / index_only(对照E)\n");
+    fprintf(f, "# methods: fifo_bounded / chained_hash_bounded / balanced_tree_bounded / psn_dynblock(S0=payload) / psn_dynblock_adaptive(收敛后冻结) / index_only(对照E)\n");
     fprintf(f, "# modes: gbn_long64(64) / gbn_short8(8) / sr_16(16) / sr_64(64); per-op = 一次 retrieve_range/retrieve_set(定位+memcpy 全过程)\n");
+    fprintf(f, "# reorder: 0=仅取包; 1=取包前先把 PSN 集升序整理(仅 SR; GBN 输出天然有序故恒 0)\n");
     fprintf(f, "# N=缓存深度(工作集条数); dynblock 环固定 10240 存 N 条(Φ 位置索引 O(1)); index_only=Φ纯算术 len=0 无 memcpy\n");
     fprintf(f, "# p50=主指标 p90=次指标; p99 仅留痕(VM ~2ms 调度停顿污染 ~1%% 批次, 不可用)\n");
     fprintf(f, "# floor(空批,读钟/B): B=%u median=%.3f ns/op; B=%u(xval) median=%.3f ns/op\n",
             B, floor_main, Bx, floor_xval);
-    fprintf(f, "method,mode,N,payload,B,n_batches,reps,mean_ns,std_ns,p50_ns,p90_ns,p99_ns\n");
+    fprintf(f, "method,mode,N,payload,B,n_batches,reps,reorder,mean_ns,std_ns,p50_ns,p90_ns,p99_ns\n");
 
     fprintf(fc, "# exp1b n_cmp: retrieve 比较次数(纯取包比较; retrieve 前清零、批后累计)\n");
-    fprintf(fc, "# mean_cmp_per_pkt = total_cmp / (n_ops*reps*count); FIFO=O(N)~N/2 平均扫描; tree=O(log N); hash~O(1); dynblock/index_only=0(Φ纯算术)\n");
+    fprintf(fc, "# mean_cmp_per_pkt = total_cmp / (n_ops*reps*count); FIFO=O(N)~N/2; tree=O(log N); hash~O(1); dynblock/index_only=0(Φ纯算术)\n");
+    fprintf(fc, "# reorder 不影响 n_cmp(排序在缓存外)，故每 (method,mode,N) 只记一行(取 reorder=0)\n");
     fprintf(fc, "method,mode,N,payload,total_packets,total_cmp,mean_cmp_per_pkt\n");
 
     uint8_t pbuf[4096];
@@ -221,7 +253,15 @@ int main(int argc, char **argv) {
 
             for (uint32_t mi = 0; mi < N_METHODS; mi++) {
                 const method_t *mt = &METHODS[mi];
+
+                /* dynblock 收敛口径：预热期开自适应，让 S 收敛；其余方法/固定 S0 则全程关 */
+                cfg.adaptive_enable = mt->converge ? 1u : 0u;
                 b_cache_t *c = mt->make(&cfg, N, pl);
+
+                if (mt->converge) {                       /* 预热收敛 S：4096 → pl(=1024) */
+                    for (uint32_t k = 0; k < warm; k++) c->ops.store(c, k, pbuf, pl);
+                    cfg.adaptive_enable = 0u;             /* 冻结：计时区间无 resize */
+                }
 
                 for (uint32_t psn = 0; psn < N; psn++) c->ops.store(c, psn, pbuf, pl);   /* 预填充 0..N-1 */
 
@@ -233,27 +273,34 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[exp1b] WARN %s mode=%s N=%u: populate miss (0=%p N-1=%p)\n",
                             mt->name, m->name, N, (void *)p0, (void *)p1);
 
-                uint64_t total_cmp = 0;
-                size_t ns = time_retrieve(c, m, q, B, n_batches, reps, out, out_cap, samples, &total_cmp);
+                /* reorder 维度：GBN 恒 0（输出天然有序）；SR 跑 0/1 两版对比 */
+                int n_reorder = m->is_set ? 2 : 1;
+                for (int ro = 0; ro < n_reorder; ro++) {
+                    uint64_t total_cmp = 0;
+                    size_t ns = time_retrieve(c, m, q, B, n_batches, reps, out, out_cap,
+                                              ro, samples, &total_cmp);
 
-                double mean = mean_dbl(samples, ns);
-                double std  = std_dbl(samples, ns, mean);
-                double p50  = pct_dbl(samples, ns, 50.0);
-                double p90  = pct_dbl(samples, ns, 90.0);
-                double p99  = pct_dbl(samples, ns, 99.0);
+                    double mean = mean_dbl(samples, ns);
+                    double std  = std_dbl(samples, ns, mean);
+                    double p50  = pct_dbl(samples, ns, 50.0);
+                    double p90  = pct_dbl(samples, ns, 90.0);
+                    double p99  = pct_dbl(samples, ns, 99.0);
 
-                uint64_t total_pkts  = (uint64_t)n_ops * reps * m->count;
-                double   cmp_per_pkt = (total_pkts > 0) ? (double)total_cmp / (double)total_pkts : 0.0;
+                    fprintf(f, "%s,%s,%u,%u,%u,%u,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                            mt->name, m->name, N, pl, B, n_batches, reps, ro,
+                            mean, std, p50, p90, p99);
 
-                fprintf(f, "%s,%s,%u,%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                        mt->name, m->name, N, pl, B, n_batches, reps,
-                        mean, std, p50, p90, p99);
-                fprintf(fc, "%s,%s,%u,%u,%llu,%llu,%.3f\n",
-                        mt->name, m->name, N, pl,
-                        (unsigned long long)total_pkts, (unsigned long long)total_cmp, cmp_per_pkt);
-                printf("  %-22s %-11s N=%5u  p50=%9.3f  p90=%9.3f  cmp/pkt=%.1f\n",
-                       mt->name, m->name, N, p50, p90, cmp_per_pkt);
-                fflush(f); fflush(fc); fflush(stdout);
+                    if (ro == 0) {   /* n_cmp 只记一次（reorder 不影响比较次数） */
+                        uint64_t total_pkts  = (uint64_t)n_ops * reps * m->count;
+                        double   cmp_per_pkt = (total_pkts > 0) ? (double)total_cmp / (double)total_pkts : 0.0;
+                        fprintf(fc, "%s,%s,%u,%u,%llu,%llu,%.3f\n",
+                                mt->name, m->name, N, pl,
+                                (unsigned long long)total_pkts, (unsigned long long)total_cmp, cmp_per_pkt);
+                    }
+                    printf("  %-22s %-11s N=%5u reorder=%d  p50=%9.3f  p90=%9.3f\n",
+                           mt->name, m->name, N, ro, p50, p90);
+                    fflush(f); fflush(fc); fflush(stdout);
+                }
                 c->ops.destroy(c);
             }
             free(q);

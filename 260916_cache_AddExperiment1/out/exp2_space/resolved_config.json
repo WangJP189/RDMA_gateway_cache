@@ -64,5 +64,5 @@
   "sim_loss_rate": 0.02,
   "sim_burst_good_p": 0.98999999999999999,
   "sim_burst_bad_p": 0.97999999999999998,
-  "out_dir": "out"
+  "out_dir": "out/exp2_space"
 }

@@ -67,8 +67,8 @@
 
 /* ==================== C. 实验一 ==================== */
 #define CFG_E1A_N               10240u
-#define CFG_E1A_PAYLOAD_LIST    { 64u,1024u,4096u }
-#define CFG_E1A_PAYLOAD_N       3u
+#define CFG_E1A_PAYLOAD_LIST    { 256u,512u,1024u,2048u,4096u } /* RDMA 5 档 MTU（见 memory rdma-mtu-tiers） */
+#define CFG_E1A_PAYLOAD_N       5u
 #define CFG_E1A_TIMED_OPS       500000u  /* 500k：B=8192 下池化 305 点（p50 稳健、p90≈30 点；p99 弃用——VM 调度停顿污染尾部） */
 #define CFG_E1A_BATCH_OPS       8192u    /* 主矩阵 store 计时批量 B：实测一对 rdtsc≈3.8μs ⇒ B=8192 摊 0.46ns（占最快方法 ~5.8%）；
                                           *   B=1024 的 3.7ns 地板占最快方法 46%，对数纵轴失真 ⇒ 弃。 */
@@ -88,13 +88,13 @@
 #define CFG_E1B_BATCH_OPS       512u    /* retrieve 计时批大小 B：最快 op（SR-16 O(1)~0.7μs）下 floor≈9ns≈1.3% */
 #define CFG_E1B_BATCH_XVAL_OPS  32u     /* 地板交叉验证批大小（floor ∝ 1/B 论证用，非主矩阵） */
 
-/* ==================== D. 实验二 ==================== */
-#define CFG_E2_PKTSIZE_LIST  { 512u,640u,768u,1024u,1280u,1500u,1536u,2048u,3072u,4096u }
-#define CFG_E2_PKTSIZE_N     10u
-#define CFG_E2_N_LIST        { 256u,512u,1024u,2048u,4096u,10240u }
+/* ==================== D. 实验二（空间利用率） ==================== */
+#define CFG_E2_PKTSIZE_LIST  { 256u,512u,1024u,2048u,4096u } /* RDMA 5 档 MTU（见 memory rdma-mtu-tiers） */
+#define CFG_E2_PKTSIZE_N     5u
+#define CFG_E2_N_LIST        { 256u,512u,1024u,2048u,4096u,10240u } /* 预留：exp2 只用满窗 N，不做 N 扫描 */
 #define CFG_E2_N_N           6u
-#define CFG_E2_N             10240u
-#define CFG_E2_FIXED_L       1024u
+#define CFG_E2_N             10240u   /* 满窗（=CFG_RING_N） */
+#define CFG_E2_FIXED_L       4096u    /* psn_dynblock_fixed 固定槽大小 S（=最大 MTU，代表「不做弹性的固定块」） */
 #define CFG_HASH_NBUCKETS    16384u  /* hash 自身参数：按目标负载因子 ≈0.6 与预期元素数 N=10240 选定
                                       *  （10240/16384=0.625）；与 behavior_bench.c HASH_BUCKETS=16384 一致。
                                       *  不由 N 决定，不进「与基线对齐」那套；*_bounded 同样用 16384（活集恒 N ⇒ 负载恒 0.625）。 */

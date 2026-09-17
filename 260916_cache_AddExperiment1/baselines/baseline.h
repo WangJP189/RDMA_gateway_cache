@@ -70,4 +70,8 @@ b_cache_t *make_index_only(uint32_t N);
  * 仅对 balanced_tree_bounded 有意义（其它方法直接返回 0）。 */
 int baseline_tree_verify(b_cache_t *bc);
 
+/* exp2 空间利用率：返回该缓存为容纳满窗所需的总分配字节（sizeof 实测）。
+ * 无界基线返回 0（每 store malloc，不参与 exp2）。 */
+uint64_t cache_footprint_bytes(const b_cache_t *bc);
+
 #endif /* BASELINE_H */

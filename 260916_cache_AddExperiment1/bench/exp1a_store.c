@@ -4,7 +4,7 @@
  * 精简矩阵（2026-09-16 范围收窄后）：方法 = fifo_bounded / chained_hash_bounded /
  *   balanced_tree_bounded / psn_dynblock / psn_dynblock_fixed / index_only。
  *   去掉三个无界版（每 store 一次 malloc 已由冒烟 1.0-vs-0 证明，不再计一遍时）。
- * payload ∈ {64, 1024, 4096}；主矩阵 B=8192（读钟底噪 ~3.8μs ⇒ 摊 0.46ns，占最快方法 ~5.8%）；
+ * payload ∈ {256, 512, 1024, 2048, 4096}（RDMA 5 档 MTU）；主矩阵 B=8192（读钟底噪 ~3.8μs ⇒ 摊 0.46ns，占最快方法 ~5.8%）；
  *   B=1024 作交叉验证（不同 B 下排序/差距一致 ⇒ 地板论证闭环）；timed_ops=500000；REPS=5。
  *
  * dynblock 口径（「收敛后冻结」，忠实于自适应机制）：

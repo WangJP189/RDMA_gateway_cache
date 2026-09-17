@@ -130,6 +130,7 @@ b_cache_t *make_fifo(void) {
 typedef struct {
     b_cache_t base;
     uint32_t cap;
+    uint32_t payload_len;      /* exp2 空间利用率：footprint 计算用 */
     fifo_node_t *head, *tail;
     node_pool_t pool;
 } fifo_bounded_t;
@@ -178,6 +179,7 @@ b_cache_t *make_fifo_bounded(uint32_t capacity, uint32_t payload_len) {
     f->base.ops.retrieve_set = generic_retrieve_set;
     f->base.ops.destroy = fifo_bounded_destroy;
     f->cap = capacity;
+    f->payload_len = payload_len;
     pool_init(&f->pool, capacity, sizeof(fifo_node_t) + (size_t)payload_len);
     return &f->base;
 }
@@ -252,6 +254,7 @@ typedef struct {
     b_cache_t base;
     hash_node_t **bkt;
     uint32_t nb, cap;
+    uint32_t payload_len;       /* exp2 空间利用率：footprint 计算用 */
     hash_node_t **slot_owner;   /* [cap]：slot i 当前节点（NULL=空） */
     node_pool_t pool;
 } hash_bounded_t;
@@ -307,6 +310,7 @@ b_cache_t *make_chained_hash_bounded(uint32_t capacity, uint32_t nbuckets, uint3
     h->base.ops.destroy = hash_bounded_destroy;
     h->nb = nbuckets;
     h->cap = capacity;
+    h->payload_len = payload_len;
     h->bkt = (hash_node_t **)calloc(nbuckets, sizeof(hash_node_t *));
     h->slot_owner = (hash_node_t **)calloc(capacity, sizeof(hash_node_t *));
     pool_init(&h->pool, capacity, sizeof(hash_node_t) + (size_t)payload_len);
@@ -484,6 +488,7 @@ typedef struct {
     b_cache_t base;
     avl_node_t *root;
     uint32_t cap;
+    uint32_t payload_len;     /* exp2 空间利用率：footprint 计算用 */
     avl_node_t **fifo_node;   /* 插入序 FIFO 环（容量 cap，存节点指针；head 为队头） */
     uint32_t head;
     node_pool_t pool;
@@ -536,6 +541,7 @@ b_cache_t *make_balanced_tree_bounded(uint32_t capacity, uint32_t payload_len) {
     t->base.ops.retrieve_set = generic_retrieve_set;
     t->base.ops.destroy = tree_bounded_destroy;
     t->cap = capacity;
+    t->payload_len = payload_len;
     t->fifo_node = (avl_node_t **)calloc(capacity, sizeof(avl_node_t *));
     pool_init(&t->pool, capacity, sizeof(avl_node_t) + (size_t)payload_len);
     return &t->base;
@@ -666,4 +672,42 @@ b_cache_t *make_index_only(uint32_t N) {
     io->N = N;
     io->meta = (uint32_t *)calloc(N, sizeof(uint32_t));
     return &io->base;
+}
+
+/* ================= exp2 空间利用率：footprint（分配总量，sizeof 实测） =================
+ * 语义：把「为容纳满窗 N 条、包长 pl」所需的全部预分配字节（池 + 索引/桶 + 元数据）加总，
+ *       不含运行时才 malloc 的溢出块（tier 包下恒 0，此处仍如实累加）。
+ * 无界基线（每 store malloc）不参与 exp2，返回 0。 */
+uint64_t cache_footprint_bytes(const b_cache_t *bc) {
+    if (strcmp(bc->name, "fifo_bounded") == 0) {
+        fifo_bounded_t *f = (fifo_bounded_t *)bc;
+        return (uint64_t)f->cap * (sizeof(fifo_node_t) + f->payload_len);
+    }
+    if (strcmp(bc->name, "chained_hash_bounded") == 0) {
+        hash_bounded_t *h = (hash_bounded_t *)bc;
+        return (uint64_t)h->cap * (sizeof(hash_node_t) + h->payload_len)
+             + (uint64_t)h->nb * sizeof(hash_node_t *)
+             + (uint64_t)h->cap * sizeof(hash_node_t *);
+    }
+    if (strcmp(bc->name, "balanced_tree_bounded") == 0) {
+        tree_bounded_t *t = (tree_bounded_t *)bc;
+        return (uint64_t)t->cap * (sizeof(avl_node_t) + t->payload_len)
+             + (uint64_t)t->cap * sizeof(avl_node_t *);
+    }
+    if (strcmp(bc->name, "psn_dynblock") == 0) {
+        dynblock_t *d = (dynblock_t *)bc;
+        conn_t *c = &d->conn;
+        uint64_t bytes = (uint64_t)c->cur.N * c->cur.stride;              /* 环池（含旧代） */
+        if (c->has_old) bytes += (uint64_t)c->old.N * c->old.stride;
+        bytes += (uint64_t)c->N * sizeof(slot_meta_t);                    /* meta */
+        bytes += (uint64_t)c->cfg->ovf_cap * sizeof(ovf_entry_t);         /* 溢出数组 */
+        for (uint32_t oi = 0; oi < c->cfg->ovf_cap; oi++)                 /* 溢出块实占（tier 包=0） */
+            if (c->ovf[oi].used) bytes += align16(HDR_SZ + c->ovf[oi].len);
+        return bytes;
+    }
+    if (strcmp(bc->name, "index_only") == 0) {
+        index_only_t *io = (index_only_t *)bc;
+        return (uint64_t)io->N * sizeof(uint32_t);
+    }
+    return 0;   /* 无界基线：exp2 不使用 */
 }

@@ -16,7 +16,7 @@ Fig — exp1a store 面板（重画版，2026-09-16 定稿）: store time cost v
   - 图例放坐标区内左上：浅灰细边框、单列；
   - 无图内标题栏（caption 交论文 \\caption{}）；无 O(·) 标注（那是 exp1b 的活）。
 
-坐标：横轴 Packet size (B) 对数（刻度仅 64/1024/4096）；纵轴 Store time cost (ns) 对数（禁 latency）。
+坐标：横轴 Packet size (B) 对数（刻度 256/512/1024/2048/4096）；纵轴 Store time cost (ns) 对数（禁 latency）。
 尺寸：单栏 3.45×2.3 in（默认）；跨栏按 7.0×3.6 in 同比例放大、字号×2。
 
 数字提取：把 B=8192 p50/p90 + B=1024 p50（6 方法）写 out/exp1a_store/exp1a_numbers.md
@@ -62,6 +62,9 @@ TABLE_LABEL = {
     "index_only":            "index-only ($\\Phi$)",
 }
 
+# RDMA 5 档 MTU（横坐标/变量统一用这 5 档，见 memory rdma-mtu-tiers）
+PAYLOADS = [256, 512, 1024, 2048, 4096]
+
 
 def read_rows():
     rows = []
@@ -91,9 +94,11 @@ def collect(rows, B):
 
 def md_table(data, key):
     """p50 主表（key='p50'/'p90'）：行=6 方法、列=payload。"""
-    payloads = [64, 1024, 4096]
+    payloads = PAYLOADS
     idx = 0 if key == "p50" else 1
-    lines = ["| method | 64 B | 1024 B | 4096 B |", "|---|---|---|---|"]
+    header = "| method | " + " | ".join("%d B" % p for p in payloads) + " |"
+    sep = "|---|" + "---|" * len(payloads)
+    lines = [header, sep]
     for m in TABLE_ORDER:
         if m not in data:
             continue
@@ -136,7 +141,7 @@ def main():
     rows = read_rows()
     B_main = 8192
     data = collect(rows, B_main)
-    payloads = [64, 1024, 4096]
+    payloads = PAYLOADS
 
     # ---- 画图（单栏 3.45×2.3 in）----
     fig, ax = plt.subplots(figsize=(3.45, 2.3))
@@ -151,10 +156,10 @@ def main():
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
-    ax.set_xticks([64, 1024, 4096])
-    ax.set_xticklabels(["64", "1024", "4096"])
-    ax.xaxis.set_minor_locator(FixedLocator([128, 256, 512, 2048]))
-    ax.set_xlim(40, 6500)
+    ax.set_xticks([256, 512, 1024, 2048, 4096])
+    ax.set_xticklabels(["256", "512", "1024", "2048", "4096"])
+    ax.xaxis.set_minor_locator(FixedLocator([384, 768, 1536, 3072]))
+    ax.set_xlim(200, 5500)
     ax.set_ylim(1, 1500)
     ax.set_xlabel("Packet size (B)")
     ax.set_ylabel("Store time cost (ns)")
@@ -203,7 +208,7 @@ def main():
     r.append("\n**图：** `paper_figures/fig_exp1a_store.pdf`（同目录 `fig_exp1a_store.png` @300dpi）。\n")
     r.append("\n**图注（名词性短语，交论文 `\\caption{}`）：** Store time cost versus packet size.\n")
     r.append("\n条件（论文 3.1 正文）：N=10240，batch B=8192 主矩阵，R=5 runs，单位 ns；"
-             "B=1024 为交叉验证。横轴 packet size（64/1024/4096 B）、纵轴 store time cost（ns），双对数。"
+             "B=1024 为交叉验证。横轴 packet size（256/512/1024/2048/4096 B）、纵轴 store time cost（ns），双对数。"
              "主指标 p50，次指标 p90（p99 仅 CSV 留痕，~1% 批次遭 ~2ms VM 调度停顿，不可用）。"
              "图内仅 4 方法；index_only 与 dynblock(fixed S=4096) 仅入下表（正文用数字给自适应收益）。\n")
     r.append("\n### 主矩阵 B=8192 · p50 (ns)\n")
