@@ -10,8 +10,8 @@
 | FIFO Queue | 88.89 | 94.12 | 96.97 | 98.46 | 99.22 |
 | Chained Hash | 78.05 | 87.67 | 93.43 | 96.60 | 98.27 |
 | Balanced Tree | 80.00 | 88.89 | 94.12 | 96.97 | 98.46 |
-| PSN Mapping (adaptive S) | 84.43 | 91.56 | 95.59 | 97.75 | 98.86 |
-| PSN Mapping (fixed S=4096) | 6.18 | 12.36 | 24.72 | 49.43 | 98.86 |
+| PSN Mapping (adaptive S) | 94.40 | 97.12 | 98.54 | 99.26 | 99.63 |
+| PSN Mapping (fixed S=4096) | 6.23 | 12.45 | 24.91 | 49.82 | 99.63 |
 
 ## 分配总量 allocated_bytes (B) — 满窗 N=4096
 
@@ -20,8 +20,8 @@
 | FIFO Queue | 1179648 | 2228224 | 4325376 | 8519680 | 16908288 |
 | Chained Hash | 1343488 | 2392064 | 4489216 | 8683520 | 17072128 |
 | Balanced Tree | 1310720 | 2359296 | 4456448 | 8650752 | 17039360 |
-| PSN Mapping (adaptive S) | 1241904 | 2290480 | 4387632 | 8581936 | 16970544 |
-| PSN Mapping (fixed S=4096) | 16970544 | 16970544 | 16970544 | 16970544 | 16970544 |
+| PSN Mapping (adaptive S) | 1110832 | 2159408 | 4256560 | 8450864 | 16839472 |
+| PSN Mapping (fixed S=4096) | 16839472 | 16839472 | 16839472 | 16839472 | 16839472 |
 
 ## block_S（dynblock 槽大小；非 dynblock=0）
 
@@ -30,11 +30,12 @@
 
 ## 关键结论（脚本计算，供正文）
 
-- FIFO（最优基线）利用率区间：88.89%–99.22%
-- 256 B：FIFO−PSN(弹性)=4.46 pp，FIFO−PSN(fixed)=82.71 pp
-- 512 B：FIFO−PSN(弹性)=2.56 pp，FIFO−PSN(fixed)=81.76 pp
-- 1024 B：FIFO−PSN(弹性)=1.38 pp，FIFO−PSN(fixed)=72.25 pp
-- 2048 B：FIFO−PSN(弹性)=0.71 pp，FIFO−PSN(fixed)=49.03 pp
-- 4096 B：FIFO−PSN(弹性)=0.36 pp，FIFO−PSN(fixed)=0.36 pp
-- 弹性最大劣势点：256 B，差 4.46 pp（<=5% 断言成立）
-- fixed 最大塌陷点：256 B，利用率 6.18%（vs FIFO 88.89%）——弹性槽大小机制的价值所在
+- FIFO（原最优基线）利用率区间：88.89%–99.22%
+- PSN(弹性) 利用率区间：94.40%–99.63%（**反超 FIFO**）
+- 256 B：PSN(弹性)−FIFO=+5.51 pp，FIFO−PSN(fixed)=82.66 pp
+- 512 B：PSN(弹性)−FIFO=+3.00 pp，FIFO−PSN(fixed)=81.66 pp
+- 1024 B：PSN(弹性)−FIFO=+1.57 pp，FIFO−PSN(fixed)=72.06 pp
+- 2048 B：PSN(弹性)−FIFO=+0.80 pp，FIFO−PSN(fixed)=48.65 pp
+- 4096 B：PSN(弹性)−FIFO=+0.41 pp，FIFO−PSN(fixed)=-0.41 pp
+- 弹性反超最小点：4096 B，PSN 仍高 +0.41 pp（5 档全部反超 FIFO）
+- fixed 最大塌陷点：256 B，利用率 6.23%（vs FIFO 88.89%）——弹性槽大小机制的价值所在

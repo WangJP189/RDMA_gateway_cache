@@ -48,7 +48,8 @@
                                          * 与旧 N=10240→2048 同比例，保持「打满=紧急」难度不变；见 RING_N_DERIVATION.md） */
 #define CFG_OVF_THRESH          256u    /* τ_o 绝对条数阈值（不依赖 N、不依赖 OVF_CAP）：溢出条数达到此值触发阈值路径扩大。
                                          *  是「扩容灵敏度旋钮」：越小越灵敏，靠 k_dwell 滞后防误触。 */
-#define CFG_HDR_SZ              24u     /* 每块头字节（见 dynblock.h 的 mem_block_header） */
+#define CFG_HDR_SZ              0u      /* 每块头字节（已废弃：24 B 头从 stride 移除、热路径不再写头；
+                                         * 字段保留仅记录历史值 0；stride_of(S)=align16(S)） */
 #define CFG_K_DWELL             2u      /* 连续 K 个纪元同向才切换（>=2） */
 #define CFG_J_QUIET             4u      /* 连续 J 个纪元无溢出才允许缩 */
 #define CFG_SHRINK_GAMMA        0.75    /* 仅当 L_ring <= gamma*S 才缩 */
@@ -60,6 +61,8 @@
 #define CFG_SINGLE_THREAD       1u      /* 1：锁编译为 no-op；基准与模拟器全程单线程 */
 #define CFG_POOL_USE_MMAP       1u      /* 1：mmap(MAP_NORESERVE) 惰性提交，失败回落 malloc */
 #define CFG_ORDER_GUARD         0u      /* 1A：防旧包覆盖护栏；默认 0 保持热路径纯净 */
+#define CFG_ALLOC_MODE          0u      /* 0=pooled(一次性预分配+复用, 主结果) 1=perstore(逐 store malloc/free,
+                                         * 第 5 条分配策略正交：唯一变量=分配策略，容量/淘汰顺序不变) */
 #define CFG_SIM_LINK_GBPS       100u    /* 仅模拟器报告用（trace CSV elapsed_us 时间轴），机制侧绝不读取 */
 #define CFG_SIM_PEND_CAP        4096u   /* NAK 待发列表容量 */
 
@@ -115,17 +118,16 @@
 #define CFG_E3_ABLATE_J_QUIET     1u   /* j_quiet      4→1：1 个安静纪元即允许缩 */
 #define CFG_E3_ABLATE_HIST_DECAY  2u   /* hist_decay   8→2：2 个安静纪元即清空溢出史 */
 
-/* exp3 相位序列（5 档 MTU 跳变 + 256↔4096 ×16 振荡）：
- *   {2,4096} 预热；{8,256}→{8,512}→{8,1024}→{8,2048}→{8,4096} 五档跳变
- *   （8 纪元/档，慢对照 j_quiet=4+k_dwell=2 可收敛，用于对比响应延迟）；
- *   {2,256},{2,4096} ×16 为 256↔4096 快速振荡（每档 2 纪元，测跟踪与稳定性）。
- *   共 38 个相位；e3_phases 数组上限 64（cfg_t 内，含 memset 清零尾部）。 */
-#define CFG_E3_PHASES   { {2u,4096u},{8u,256u},{8u,512u},{8u,1024u},{8u,2048u},{8u,4096u}, \
-                          {2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u}, \
-                          {2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u}, \
-                          {2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u}, \
-                          {2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u},{2u,256u},{2u,4096u} }
-#define CFG_E3_PHASE_N  38u
+/* exp3 相位序列（第 3 条重设计：每档稳定 16 纪元再切换，11 相位 = 1 预热 + 5 升档 + 5 降档）：
+ *   {1,4096} 预热；{16,256}→{16,512}→{16,1024}→{16,2048}→{16,4096} 升档
+ *   （16 纪元/档，慢对照 j_quiet=4+k_dwell=2 可收敛，测增长响应延迟）；
+ *   {16,4096}→{16,2048}→{16,1024}→{16,512}→{16,256} 降档（测收缩响应延迟 + 稳定性）。
+ *   每档稳定 16 纪元：排除切换后首 6 纪元（收敛窗口），余 10 纪元计算相位利用率统计。
+ *   共 11 个相位；e3_phases 数组上限 64（cfg_t 内，含 memset 清零尾部）。 */
+#define CFG_E3_PHASES   { {1u,4096u}, \
+                          {16u,256u},{16u,512u},{16u,1024u},{16u,2048u},{16u,4096u}, \
+                          {16u,4096u},{16u,2048u},{16u,1024u},{16u,512u},{16u,256u} }
+#define CFG_E3_PHASE_N  11u
 #define CFG_E3_MIXED_PHASES  { {6u,1024u},{40u,0u} }  /* 先 6 纪元 1024 缩到 1024，再 40 纪元混合（触发阈值路径） */
 #define CFG_E3_MIXED_PHASE_N  2u
 #define CFG_E3_MIXED_SMALL   1024u
@@ -168,6 +170,7 @@ typedef struct {
     uint32_t single_thread;
     uint32_t pool_use_mmap;
     uint32_t order_guard;
+    uint32_t alloc_mode;         /* 0=pooled 1=perstore（第 5 条分配策略正交） */
     uint32_t sim_link_gbps;
     uint32_t sim_pend_cap;
     /* ---- 计时/复现 ---- */

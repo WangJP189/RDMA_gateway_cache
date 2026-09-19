@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>    /* psn_set 用 malloc/free */
 #include "config.h"
 
 /* ---- rdtsc（裸，无 lfence/rdtscp） ---- */
@@ -74,5 +75,37 @@ void warm_allocator(size_t size, int count);
 
 /* ---- 抗 DCE ---- */
 extern volatile uint64_t g_sink;
+
+/* ---- 请求 PSN 集合（第 4B：SR 统一交付契约「按 PSN 升序」的成员判定） ----
+ * 开地址线性探测，容量为 2 的幂、负载 ≤ 1/2（保证终止）。UINT32_MAX 作空哨兵：
+ * psn 是 24-bit（< 2^24），恒不碰撞哨兵。tree 中序遍历 / psn 映射零排序共用。 */
+typedef struct {
+    uint32_t *t;     /* 槽数组；UINT32_MAX = 空 */
+    uint32_t cap;    /* 2 的幂 */
+    uint32_t mask;
+} psn_set_t;
+
+static inline void psn_set_init(psn_set_t *s, uint32_t n) {
+    uint32_t c = 16u;
+    while (c < n * 2u) c <<= 1u;          /* 负载 ≤ 1/2 */
+    s->cap = c;
+    s->mask = c - 1u;
+    s->t = (uint32_t *)malloc((size_t)c * sizeof(uint32_t));
+    for (uint32_t i = 0; i < c; i++) s->t[i] = UINT32_MAX;
+}
+static inline void psn_set_free(psn_set_t *s) { free(s->t); s->t = NULL; }
+static inline void psn_set_insert(psn_set_t *s, uint32_t psn) {
+    uint32_t i = (psn * 2654435761u) & s->mask;
+    while (s->t[i] != UINT32_MAX) i = (i + 1u) & s->mask;
+    s->t[i] = psn;
+}
+static inline int psn_set_has(const psn_set_t *s, uint32_t psn) {
+    uint32_t i = (psn * 2654435761u) & s->mask;
+    while (s->t[i] != UINT32_MAX) {
+        if (s->t[i] == psn) return 1;
+        i = (i + 1u) & s->mask;
+    }
+    return 0;
+}
 
 #endif /* UTIL_H */

@@ -1,0 +1,7 @@
+# alloc_probe: bare malloc(n)+free(n) per-op ns, batch-amortized (B=2048, reps=5)
+# n_bytes: 32=fifo/hash node, 56=avl node, 64=align16(56), 4128=32+4096(max perstore malloc)
+n_bytes,B,n_batches,reps,mean_ns,std_ns,p50_ns,p90_ns,p99_ns
+32,2048,1000,5,5.274,0.860,4.917,6.307,7.782
+56,2048,1000,5,5.292,0.567,5.014,6.346,6.563
+64,2048,1000,5,5.698,1.363,4.887,7.593,9.219
+4128,2048,1000,5,11.434,0.387,11.303,11.848,12.394

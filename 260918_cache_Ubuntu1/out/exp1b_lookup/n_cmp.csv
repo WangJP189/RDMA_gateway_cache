@@ -1,6 +1,6 @@
 # exp1b n_cmp: retrieve 比较次数(纯取包比较; retrieve 前清零、批后累计)
 # mean_cmp_per_pkt = total_cmp / (n_ops*reps*count); FIFO=O(N)~N/2; tree=O(log N); hash~O(1); dynblock/index_only=0(Φ纯算术)
-# reorder 不影响 n_cmp(排序在缓存外)，故每 (method,mode,N) 只记一行(取 reorder=0)
+# 交付排序不计 n_cmp(n_cmp 只计缓存内检索比较)，每 (method,mode,N) 一行
 method,mode,N,payload,total_packets,total_cmp,mean_cmp_per_pkt
 fifo_bounded,gbn_long64,128,1024,5242880,339159040,64.689
 chained_hash_bounded,gbn_long64,128,1024,5242880,5242880,1.000
@@ -16,13 +16,13 @@ psn_dynblock_adaptive,gbn_short8,128,1024,655360,0,0.000
 index_only,gbn_short8,128,1024,655360,0,0.000
 fifo_bounded,sr_16,128,1024,1310720,84648085,64.581
 chained_hash_bounded,sr_16,128,1024,1310720,1310720,1.000
-balanced_tree_bounded,sr_16,128,1024,1310720,7958730,6.072
+balanced_tree_bounded,sr_16,128,1024,1310720,0,0.000
 psn_dynblock,sr_16,128,1024,1310720,0,0.000
 psn_dynblock_adaptive,sr_16,128,1024,1310720,0,0.000
 index_only,sr_16,128,1024,1310720,0,0.000
 fifo_bounded,sr_64,128,1024,5242880,338210650,64.509
 chained_hash_bounded,sr_64,128,1024,5242880,5242880,1.000
-balanced_tree_bounded,sr_64,128,1024,5242880,31839825,6.073
+balanced_tree_bounded,sr_64,128,1024,5242880,0,0.000
 psn_dynblock,sr_64,128,1024,5242880,0,0.000
 psn_dynblock_adaptive,sr_64,128,1024,5242880,0,0.000
 index_only,sr_64,128,1024,5242880,0,0.000
@@ -40,13 +40,13 @@ psn_dynblock_adaptive,gbn_short8,256,1024,655360,0,0.000
 index_only,gbn_short8,256,1024,655360,0,0.000
 fifo_bounded,sr_16,256,1024,1310720,168304775,128.406
 chained_hash_bounded,sr_16,256,1024,1310720,1310720,1.000
-balanced_tree_bounded,sr_16,256,1024,1310720,9225125,7.038
+balanced_tree_bounded,sr_16,256,1024,1310720,0,0.000
 psn_dynblock,sr_16,256,1024,1310720,0,0.000
 psn_dynblock_adaptive,sr_16,256,1024,1310720,0,0.000
 index_only,sr_16,256,1024,1310720,0,0.000
 fifo_bounded,sr_64,256,1024,5242880,673738600,128.505
 chained_hash_bounded,sr_64,256,1024,5242880,5242880,1.000
-balanced_tree_bounded,sr_64,256,1024,5242880,36895995,7.037
+balanced_tree_bounded,sr_64,256,1024,5242880,0,0.000
 psn_dynblock,sr_64,256,1024,5242880,0,0.000
 psn_dynblock_adaptive,sr_64,256,1024,5242880,0,0.000
 index_only,sr_64,256,1024,5242880,0,0.000
@@ -64,13 +64,13 @@ psn_dynblock_adaptive,gbn_short8,512,1024,655360,0,0.000
 index_only,gbn_short8,512,1024,655360,0,0.000
 fifo_bounded,sr_16,512,1024,1310720,335985500,256.337
 chained_hash_bounded,sr_16,512,1024,1310720,1310720,1.000
-balanced_tree_bounded,sr_16,512,1024,1310720,10520965,8.027
+balanced_tree_bounded,sr_16,512,1024,1310720,0,0.000
 psn_dynblock,sr_16,512,1024,1310720,0,0.000
 psn_dynblock_adaptive,sr_16,512,1024,1310720,0,0.000
 index_only,sr_16,512,1024,1310720,0,0.000
 fifo_bounded,sr_64,512,1024,5242880,1344387570,256.422
 chained_hash_bounded,sr_64,512,1024,5242880,5242880,1.000
-balanced_tree_bounded,sr_64,512,1024,5242880,42060015,8.022
+balanced_tree_bounded,sr_64,512,1024,5242880,0,0.000
 psn_dynblock,sr_64,512,1024,5242880,0,0.000
 psn_dynblock_adaptive,sr_64,512,1024,5242880,0,0.000
 index_only,sr_64,512,1024,5242880,0,0.000
@@ -88,13 +88,13 @@ psn_dynblock_adaptive,gbn_short8,1024,1024,655360,0,0.000
 index_only,gbn_short8,1024,1024,655360,0,0.000
 fifo_bounded,sr_16,1024,1024,1310720,671543920,512.347
 chained_hash_bounded,sr_16,1024,1024,1310720,1310720,1.000
-balanced_tree_bounded,sr_16,1024,1024,1310720,11810255,9.011
+balanced_tree_bounded,sr_16,1024,1024,1310720,0,0.000
 psn_dynblock,sr_16,1024,1024,1310720,0,0.000
 psn_dynblock_adaptive,sr_16,1024,1024,1310720,0,0.000
 index_only,sr_16,1024,1024,1310720,0,0.000
 fifo_bounded,sr_64,1024,1024,5242880,2684346080,511.998
 chained_hash_bounded,sr_64,1024,1024,5242880,5242880,1.000
-balanced_tree_bounded,sr_64,1024,1024,5242880,47239850,9.010
+balanced_tree_bounded,sr_64,1024,1024,5242880,0,0.000
 psn_dynblock,sr_64,1024,1024,5242880,0,0.000
 psn_dynblock_adaptive,sr_64,1024,1024,5242880,0,0.000
 index_only,sr_64,1024,1024,5242880,0,0.000
@@ -112,13 +112,13 @@ psn_dynblock_adaptive,gbn_short8,2048,1024,655360,0,0.000
 index_only,gbn_short8,2048,1024,655360,0,0.000
 fifo_bounded,sr_16,2048,1024,1310720,1344552700,1025.812
 chained_hash_bounded,sr_16,2048,1024,1310720,1310720,1.000
-balanced_tree_bounded,sr_16,2048,1024,1310720,13116070,10.007
+balanced_tree_bounded,sr_16,2048,1024,1310720,0,0.000
 psn_dynblock,sr_16,2048,1024,1310720,0,0.000
 psn_dynblock_adaptive,sr_16,2048,1024,1310720,0,0.000
 index_only,sr_16,2048,1024,1310720,0,0.000
 fifo_bounded,sr_64,2048,1024,5242880,5374456440,1025.096
 chained_hash_bounded,sr_64,2048,1024,5242880,5242880,1.000
-balanced_tree_bounded,sr_64,2048,1024,5242880,52459775,10.006
+balanced_tree_bounded,sr_64,2048,1024,5242880,0,0.000
 psn_dynblock,sr_64,2048,1024,5242880,0,0.000
 psn_dynblock_adaptive,sr_64,2048,1024,5242880,0,0.000
 index_only,sr_64,2048,1024,5242880,0,0.000
@@ -136,13 +136,13 @@ psn_dynblock_adaptive,gbn_short8,4096,1024,655360,0,0.000
 index_only,gbn_short8,4096,1024,655360,0,0.000
 fifo_bounded,sr_16,4096,1024,1310720,2684270910,2047.936
 chained_hash_bounded,sr_16,4096,1024,1310720,1310720,1.000
-balanced_tree_bounded,sr_16,4096,1024,1310720,14418805,11.001
+balanced_tree_bounded,sr_16,4096,1024,1310720,0,0.000
 psn_dynblock,sr_16,4096,1024,1310720,0,0.000
 psn_dynblock_adaptive,sr_16,4096,1024,1310720,0,0.000
 index_only,sr_16,4096,1024,1310720,0,0.000
 fifo_bounded,sr_64,4096,1024,5242880,10735514225,2047.637
 chained_hash_bounded,sr_64,4096,1024,5242880,5242880,1.000
-balanced_tree_bounded,sr_64,4096,1024,5242880,57685310,11.003
+balanced_tree_bounded,sr_64,4096,1024,5242880,0,0.000
 psn_dynblock,sr_64,4096,1024,5242880,0,0.000
 psn_dynblock_adaptive,sr_64,4096,1024,5242880,0,0.000
 index_only,sr_64,4096,1024,5242880,0,0.000
@@ -160,13 +160,13 @@ psn_dynblock_adaptive,gbn_short8,5120,1024,655360,0,0.000
 index_only,gbn_short8,5120,1024,655360,0,0.000
 fifo_bounded,sr_16,5120,1024,1310720,3362120245,2565.094
 chained_hash_bounded,sr_16,5120,1024,1310720,1310720,1.000
-balanced_tree_bounded,sr_16,5120,1024,1310720,14948170,11.405
+balanced_tree_bounded,sr_16,5120,1024,1310720,0,0.000
 psn_dynblock,sr_16,5120,1024,1310720,0,0.000
 psn_dynblock_adaptive,sr_16,5120,1024,1310720,0,0.000
 index_only,sr_16,5120,1024,1310720,0,0.000
 fifo_bounded,sr_64,5120,1024,5242880,13425399015,2560.692
 chained_hash_bounded,sr_64,5120,1024,5242880,5242880,1.000
-balanced_tree_bounded,sr_64,5120,1024,5242880,59791265,11.404
+balanced_tree_bounded,sr_64,5120,1024,5242880,0,0.000
 psn_dynblock,sr_64,5120,1024,5242880,0,0.000
 psn_dynblock_adaptive,sr_64,5120,1024,5242880,0,0.000
 index_only,sr_64,5120,1024,5242880,0,0.000

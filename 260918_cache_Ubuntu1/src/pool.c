@@ -5,8 +5,8 @@
  *          控制位 cfg.pool_use_mmap（默认 1）。
  * 裁决 ④：溢出 = 每项 malloc 变长块（无 arena）；环路径 malloc/store == 0，
  *          溢出路径 malloc 按次计数（n_ovf_alloc / n_ovf_malloc）。
- * 裁决 ⑦：溢出块也写 mem_block_header（hdr_set，stamp = psn）；blk 存块基址，
- *          与环路径 slot() 同构（payload 用 ovf_payload(e) 取，全库唯一指针约定）。
+ * 裁决 ⑦（2026-09-19 修订）：溢出块不再写 24 B 头，payload 即块基址；
+ *          blk 存块基址，与环路径 slot() 同构（payload 用 ovf_payload(e) 取）。
  */
 #include "dynblock.h"
 
@@ -72,10 +72,9 @@ int ovf_alloc(conn_t *c, uint32_t psn, const uint8_t *payload, uint16_t len) {
         if (!c->ovf[oi].used) break;
     if (oi >= c->cfg->ovf_cap) return -1;            /* 防御 */
 
-    uint8_t *base = (uint8_t *)malloc(align16(HDR_SZ + len));
+    uint8_t *base = (uint8_t *)malloc(align16(len));
     if (!base) return -1;
-    hdr_set(base, len, psn, (uint64_t)psn);        /* stamp = psn（统一规则；淘汰是位置淘汰，不读 stamp） */
-    memcpy(base + HDR_SZ, payload, len);
+    memcpy(base, payload, len);                    /* 无 24 B 头：payload 即块基址 */
 
     c->ovf[oi].psn = psn;
     c->ovf[oi].len = len;

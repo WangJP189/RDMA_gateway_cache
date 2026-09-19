@@ -38,7 +38,15 @@ void conn_init(conn_t *c, const cfg_t *cfg, uint32_t mtu_from_cm) {
     c->S = ceil_class(cfg, mtu_from_cm ? mtu_from_cm : cfg->fallback_mtu);
 
     c->cur.gen = 0;
-    pool_alloc(&c->cur, c->N, c->S, cfg->pool_use_mmap); /* MAP_NORESERVE 几乎必成；失败则 base=NULL */
+    if (conn_perstore(c)) {
+        /* perstore：不建环池，槽缓冲按需 malloc。cur 仅保留 gen/stride 记账（base 恒 NULL）。 */
+        c->cur.base = NULL;
+        c->cur.N = c->N; c->cur.S = c->S; c->cur.stride = stride_of(c->S); c->cur.use_mmap = 0;
+        c->slot_ptr  = (void **)calloc(c->N, sizeof(void *));
+        c->slot_used = (unsigned char *)calloc(c->N, 1);
+    } else {
+        pool_alloc(&c->cur, c->N, c->S, cfg->pool_use_mmap); /* MAP_NORESERVE 几乎必成；失败则 base=NULL */
+    }
 
     c->meta = (slot_meta_t *)calloc(c->N, sizeof(slot_meta_t));        /* 全 FREE */
     c->ovf  = (ovf_entry_t *)calloc(cfg->ovf_cap, sizeof(ovf_entry_t));
@@ -47,6 +55,7 @@ void conn_init(conn_t *c, const cfg_t *cfg, uint32_t mtu_from_cm) {
 
 void conn_destroy(conn_t *c) {
     if (!c->cfg) return;                        /* 幂等：未初始化或已销毁 */
+    int perstore = conn_perstore(c);
     for (uint32_t oi = 0; oi < c->cfg->ovf_cap; oi++) {
         if (c->ovf[oi].used) {
             free(c->ovf[oi].blk);               /* blk 是块基址，直接 free */
@@ -55,7 +64,12 @@ void conn_destroy(conn_t *c) {
     }
     free(c->ovf);  c->ovf = NULL;
     free(c->meta); c->meta = NULL;
-    pool_free(&c->cur);
+    if (perstore) {                             /* perstore：逐槽 free 槽缓冲 + 指针数组 */
+        for (uint32_t i = 0; i < c->N; i++) free(c->slot_ptr[i]);
+        free(c->slot_ptr);  c->slot_ptr = NULL;
+        free(c->slot_used); c->slot_used = NULL;
+    }
+    pool_free(&c->cur);                         /* perstore 下 base==NULL，no-op */
     if (c->has_old) pool_free(&c->old);
     c->has_old = 0;
     c->cur_live = c->old_live = 0;
@@ -69,6 +83,9 @@ static void evict_occupant(conn_t *c, uint32_t i) {
     if (m->flag == SLOT_FREE) return;
     if (m->flag == SLOT_IN_RING) {
         if (m->gen == c->cur.gen) c->cur_live--; else c->old_live--;
+        if (conn_perstore(c)) {                /* perstore：槽缓冲显式 free（pooled 由池整体持有） */
+            free(c->slot_ptr[i]); c->slot_ptr[i] = NULL; c->slot_used[i] = 0; c->n_free++;
+        }
     } else {                                   /* 溢出项需显式回收（下标不被索引覆盖） */
         ovf_release(c, m->ovf_idx);
     }
@@ -94,9 +111,14 @@ int conn_store(conn_t *c, uint32_t psn, const uint8_t *payload, uint16_t len) {
     evict_occupant(c, i);
 
     if (len <= c->S) {                          /* 正常路径：进环 */
-        uint8_t *dst = payload_of(&c->cur, i);
-        memcpy(dst, payload, len);
-        hdr_set(slot(&c->cur, i), len, psn, (uint64_t)psn);   /* stamp = psn */
+        uint8_t *dst;
+        if (conn_perstore(c)) {                 /* perstore：槽缓冲按需 malloc（淘汰后 slot_used 已清） */
+            if (!c->slot_used[i]) { c->slot_ptr[i] = malloc(stride_of(c->S)); c->slot_used[i] = 1; c->n_malloc++; }
+            dst = c->slot_ptr[i];
+        } else {
+            dst = payload_of(&c->cur, i);
+        }
+        memcpy(dst, payload, len);              /* 无 24 B 头写入；psn 已由 slot_meta 承载 */
         *m = (slot_meta_t){ .psn = psn, .len = len, .flag = SLOT_IN_RING,
                             .gen = c->cur.gen, .ovf_idx = 0 };
         c->cur_live++;
@@ -132,41 +154,94 @@ done:
 
 /* ==================== lookup / 重传 ==================== */
 
-const uint8_t *conn_lookup(conn_t *c, uint32_t psn, uint16_t *out_len) {
-    uint32_t i = phi(c, psn);
+/* 已知槽下标 i 的一次命中查找（不重算 Φ）：psn 校验 + 返回 payload/len。
+ * 供 conn_lookup（单包）与 conn_retransmit_range（区间顺序读）共用，命中计数一致。 */
+static const uint8_t *slot_lookup(conn_t *c, uint32_t i, uint32_t psn, uint16_t *out_len) {
     slot_meta_t m = c->meta[i];
-    if (m.flag == SLOT_FREE || m.psn != psn) return NULL;   /* 已滑出窗口 */
+    /* 零搜索、一次校验：必须保留 psn 校验（正确性，非性能）。环是位置寻址，
+     * 环回绕后同一槽可能存着 psn+N 的旧包；若不比 psn 就会返回错误包。 */
+    if (m.flag == SLOT_FREE || m.psn != psn) return NULL;
     c->n_lookup++;
     if (m.flag == SLOT_IN_RING) {
-        pool_t *p = pool_for(c, m.gen);
         *out_len = m.len;
+        if (conn_perstore(c)) return c->slot_ptr[i];   /* perstore：payload 即槽缓冲 */
+        pool_t *p = pool_for(c, m.gen);
         return payload_of(p, i);
     }
     *out_len = c->ovf[m.ovf_idx].len;
-    return ovf_payload(&c->ovf[m.ovf_idx]);      /* blk 是块基址，payload = blk+HDR_SZ */
+    return ovf_payload(&c->ovf[m.ovf_idx]);      /* blk 是块基址，payload = blk（无头） */
 }
 
+const uint8_t *conn_lookup(conn_t *c, uint32_t psn, uint16_t *out_len) {
+    return slot_lookup(c, phi(c, psn), psn, out_len);
+}
+
+/* GBN 区间提取（第 4A）：PSN 映射用「一次 Φ(start) + 顺序读 meta[i0..i0+L-1]」。
+ * 数学前提（24-bit 不跨界）：Φ(p+k) ≡ (Φ(p)+k) mod N。
+ *   因 (p+k)&0xFFFFFF = (p&0xFFFFFF)+k（p+k 未越过 2^24 时），
+ *   故 Φ(p+k)=((p&0xFFFFFF)+k)%N = (Φ(p)+k)%N。正确性由 range_equiv_test 断言
+ *   （随机 (start,L)×100k，新路径与逐包 conn_lookup 旧路径输出逐字节一致）。
+ * 跨界（(p_start&0xFFFFFF)+L_req > 2^24）时退化回逐包 Φ：2^24 % N ≠ 0 的一般 N 下
+ *   顺序读下标会错位，正确性优先于那条几乎不可能命中的路径。 */
 int conn_retransmit_range(conn_t *c, uint32_t p_start, uint32_t L_req,
                           uint8_t *out, uint32_t out_cap) {
     uint32_t w = 0;
-    for (uint32_t k = 0; k < L_req; k++) {
-        uint16_t len; const uint8_t *p = conn_lookup(c, p_start + k, &len);
-        if (!p) continue;
-        memcpy(out + w, p, len); w += len;
-        if (w >= out_cap) break;
+    if ((p_start & 0xFFFFFFu) + L_req > 0x1000000u) {   /* 24-bit 跨界：退化逐包 */
+        for (uint32_t k = 0; k < L_req; k++) {
+            uint16_t len; const uint8_t *p = conn_lookup(c, p_start + k, &len);
+            if (!p) continue;
+            if (w + len > out_cap) break;
+            memcpy(out + w, p, len); w += len;
+        }
+        return (int)w;
+    }
+    uint32_t i = phi(c, p_start);
+    for (uint32_t k = 0; k < L_req; k++) {              /* 顺序读 meta[i0..i0+L-1]，环回绕 */
+        uint16_t len;
+        const uint8_t *p = slot_lookup(c, i, p_start + k, &len);
+        if (p) {
+            if (w + len > out_cap) break;
+            memcpy(out + w, p, len); w += len;
+        }
+        i = (i + 1 == c->N) ? 0 : i + 1;                /* 环回绕（i 单调 +1，跨 N 归 0） */
     }
     return (int)w;
 }
 
 int conn_retransmit_set(conn_t *c, const uint32_t *psns, uint32_t n,
                         uint8_t *out, uint32_t out_cap) {
-    uint32_t w = 0;
-    for (uint32_t k = 0; k < n; k++) {
-        uint16_t len; const uint8_t *p = conn_lookup(c, psns[k], &len);
-        if (!p) continue;
-        memcpy(out + w, p, len); w += len;
-        if (w >= out_cap) break;
+    /* SR 统一交付契约（第 4B）：按 PSN 升序交付命中包，零排序。
+     * 位置映射天然可「按 PSN 序扫槽」：活窗连续（无 2^24 回绕，同 GBN range 前提）时，
+     * 从最老驻留 PSN lo 起顺序 psn=lo,lo+1,... 逐个 Φ(psn) 查槽（slot_lookup 已含 psn 校验，
+     * 且对 IN_RING/IN_OVF 都返回 payload），命中且 ∈ 请求集则写出。
+     * 成员判定用 psn_set（O(1) 平均），无比较排序。 */
+    if (n == 0) return 0;
+
+    /* 1) 请求 PSN 集合（O(n)） */
+    psn_set_t hs; psn_set_init(&hs, n);
+    for (uint32_t k = 0; k < n; k++) psn_set_insert(&hs, psns[k]);
+
+    /* 2) 最老驻留 PSN lo = 非空槽 psn 的最小值（一次扫描，O(N)） */
+    uint32_t lo = 0; int have = 0;
+    for (uint32_t i = 0; i < c->N; i++) {
+        if (c->meta[i].flag == SLOT_FREE) continue;
+        if (!have || c->meta[i].psn < lo) { lo = c->meta[i].psn; have = 1; }
     }
+    if (!have) { psn_set_free(&hs); return 0; }
+
+    /* 3) 从 lo 起顺序扫（最多 N 个驻留包），按 PSN 升序 Φ 查槽 */
+    uint32_t w = 0;
+    for (uint32_t d = 0; d < c->N && w < out_cap; d++) {
+        uint32_t psn = lo + d;
+        if (!psn_set_has(&hs, psn)) continue;          /* 非请求包，跳过 */
+        uint16_t len;
+        const uint8_t *p = slot_lookup(c, phi(c, psn), psn, &len);
+        if (!p) continue;                              /* 未命中（该 psn 已淘汰/被覆盖） */
+        if (w + len > out_cap) break;
+        memcpy(out + w, p, len);
+        w += len;
+    }
+    psn_set_free(&hs);
     return (int)w;
 }
 
@@ -249,6 +324,19 @@ static int gen_switch(conn_t *c, uint32_t S_new) {
     if (c->has_old && c->old_live > 0) return 0; /* §2.11-3：旧池未排空 ⇒ 延后，下纪元重试 */
     if (c->has_old) { pool_free(&c->old); c->has_old = 0; }
 
+    if (conn_perstore(c)) {
+        /* perstore：无池可分配。只做双世代记账 + S/stride 更新；槽缓冲仍 slot_ptr[]，
+         * 旧代缓冲在槽被覆写时由 evict_occupant 释放（自适应收敛轨迹与 pooled 一致）。 */
+        c->old = c->cur;                          /* old 仅保留 gen/stride 记账（base 恒 NULL） */
+        c->has_old = 1; c->old_live = c->cur_live;
+        c->cur.gen = (uint8_t)(c->cur.gen + 1);
+        c->cur.stride = stride_of(S_new);
+        c->cur.S = S_new;
+        c->cur_live = 0;
+        c->S = S_new;
+        return 1;
+    }
+
     pool_t np;
     if (pool_alloc(&np, c->N, S_new, c->cfg->pool_use_mmap) < 0) return 0;
     np.gen = (uint8_t)(c->cur.gen + 1);
@@ -283,9 +371,14 @@ static uint32_t drain_overflow(conn_t *c) {
             continue;
         }
         if (e->len > c->S) { residual++; continue; }   /* ③ 超上限项，留在溢出区 */
-        uint8_t *dst = payload_of(&c->cur, i);
-        memcpy(dst, ovf_payload(e), e->len);
-        hdr_set(slot(&c->cur, i), e->len, e->psn, (uint64_t)e->psn);
+        uint8_t *dst;
+        if (conn_perstore(c)) {
+            if (!c->slot_used[i]) { c->slot_ptr[i] = malloc(stride_of(c->S)); c->slot_used[i] = 1; c->n_malloc++; }
+            dst = c->slot_ptr[i];
+        } else {
+            dst = payload_of(&c->cur, i);
+        }
+        memcpy(dst, ovf_payload(e), e->len);    /* 无 24 B 头写入 */
         m->flag = SLOT_IN_RING; m->gen = c->cur.gen; m->len = e->len;
         c->cur_live++;
         ovf_release(c, oi);

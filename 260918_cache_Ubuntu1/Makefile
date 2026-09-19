@@ -10,7 +10,7 @@ SRC_CORE := src/config.c src/util.c src/pool.c src/dynblock.c
 SIM_SRC  := sim/traffic.c sim/loss.c sim/nak.c sim/sim_main.c
 SRC_BASE := baselines/baseline.c
 
-BIN := build/selftest build/sim build/baseline_smoke build/exp1a_store build/exp1b_lookup build/exp2_space
+BIN := build/selftest build/sim build/baseline_smoke build/exp1a_store build/exp1b_lookup build/exp2_space build/range_equiv_test build/alloc_equiv_test build/alloc_probe build/sr_order_test
 
 .PHONY: all smoke run-exp1a run-exp1b run-exp2 clean
 
@@ -48,6 +48,22 @@ build/exp2_space: $(SRC_CORE) $(SRC_BASE) bench/exp2_space.c
 
 run-exp2: build/exp2_space
 	./build/exp2_space
+
+build/range_equiv_test: $(SRC_CORE) bench/range_equiv_test.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
+
+build/alloc_equiv_test: $(SRC_CORE) $(SRC_BASE) bench/alloc_equiv_test.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Ibaselines $^ -o $@ $(LDLIBS)
+
+build/alloc_probe: $(SRC_CORE) $(SRC_BASE) bench/alloc_probe.c
+	@mkdir -p build
+	$(CC) $(BENCH_CFLAGS) -Ibaselines $^ -o $@ $(LDLIBS)
+
+build/sr_order_test: $(SRC_CORE) $(SRC_BASE) bench/sr_order_test.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Ibaselines $^ -o $@ $(LDLIBS)
 
 # A13 运行时部分：sim_link_gbps=1 与 1000 各跑同一序列，S_trace.csv 逐字节一致。
 smoke: $(BIN)

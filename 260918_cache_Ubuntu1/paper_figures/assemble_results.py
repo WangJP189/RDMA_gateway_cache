@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-assemble_results.py —— 把四个实验的脚本提取数字组装成完整 RESULTS.md。
+assemble_results.py —— 把各实验的脚本提取数字组装成完整 RESULTS.md。
 
 数字全部来自各 *_numbers.md（由对应 plot 脚本从 CSV 提取），本脚本只做：
   (1) 写头部 + 章节标题 + 图指针 + 定性结论（不含任何手抄数字；具体值一律指向
@@ -9,11 +9,12 @@ assemble_results.py —— 把四个实验的脚本提取数字组装成完整 R
   (2) 把 *_numbers.md 的正文（去掉各自 H1 标题行）原样拼入对应章节。
 
 因此 RESULTS.md 完全由脚本生成，禁手抄数字。运行：
-  python3 paper_figures/plot_exp1a_store.py   # exp1a 数字 + 图
-  python3 paper_figures/plot_exp1b_lookup.py  # exp1b 数字 + 图
-  python3 paper_figures/plot_exp2_space.py    # exp2 数字 + 图
-  python3 paper_figures/plot_exp3_adapt.py    # exp3 数字 + 图
-  python3 paper_figures/assemble_results.py   # 组装 RESULTS.md
+  python3 paper_figures/plot_exp1a_store.py              # exp1a 数字 + 图
+  python3 paper_figures/plot_exp1a_alloc_sensitivity.py  # 第 5 条：分配敏感性图 + 数字
+  python3 paper_figures/plot_exp1b_lookup.py             # exp1b 数字 + 图
+  python3 paper_figures/plot_exp2_space.py               # exp2 数字 + 图
+  python3 paper_figures/plot_exp3_adapt.py               # exp3 数字 + 图
+  python3 paper_figures/assemble_results.py              # 组装 RESULTS.md
 """
 import os
 
@@ -44,7 +45,7 @@ def main():
         "# RESULTS — 实验结果（数字由脚本从各 CSV 提取）\n\n"
         "> 生成：各实验 `plot_expX_*.py` 写 `*_numbers.md`，再由 "
         "`paper_figures/assemble_results.py` 拼成本文；表内数字禁止手抄。\n"
-        "> 环境：实机 Ubuntu 22.04.5 / HWE 6.8.0-138 / i7-14700K（见 docs/ENV_CHECK.md）。\n"
+        "> 环境：实机（见 docs/ENV_CHECK.md）。\n"
     )
 
     e1a = section(
@@ -52,9 +53,20 @@ def main():
         "paper_figures/fig_exp1a_store.pdf",
         "横轴 packet size（256/512/1024/2048/4096 B，RDMA 5 档 MTU）、纵轴 store time cost（ns），双对数；"
         "N=4096，主指标 p50、次指标 p90。图内 4 方法；index_only 与 PSN(fixed S=4096) 只入下表。"
-        "结论：PSN Mapping 在小包（256B）存时间略慢于 FIFO/Chained Hash，在大包（4096B）反超成为最快——"
-        "验证「PSN 映射小包开销高、大包持平/更快」的假设（自适应 S 收敛到各档，见「收敛后 S」表）。",
+        "结论：PSN Mapping 存时间与 FIFO/Chained Hash 同阶（O(1)）：256B 略慢于 Chained Hash（8.0 vs 7.4 ns）"
+        "但快于 FIFO（9.4 ns），512–2048B 反超成为最快，4096B 与 FIFO/Hash 基本持平（±3%），"
+        "全程远优于 Balanced Tree（O(log N)）——验证「PSN 映射与线性结构同阶、远优于树」（自适应 S 收敛到各档，见「收敛后 S」表）。",
         load_stripped("out/exp1a_store/exp1a_numbers.md"),
+    )
+
+    e1a_alloc = section(
+        "exp1a-alloc — 分配策略敏感性（第 5 条正交矩阵：pooled vs perstore）",
+        "paper_figures/fig_exp1a_alloc_sensitivity.pdf",
+        "横轴 packet size、纵轴 store time cost（ns），双对数；4 结构各两条线（pooled 实线 / perstore 虚线）。"
+        "唯一变量 = 分配策略：pooled 一次性预分配+复用（n_malloc=0）、perstore 逐 store malloc/free "
+        "（n_malloc=n_free=实际 store 次数）；索引结构 / 淘汰 / 计时口径相同（alloc_equiv_test 验证字节一致）。"
+        "结论：perstore 相对 pooled 的固定开销 ≈ 裸 malloc/free 成本，随 payload 增大被 memcpy 摊薄（见下表 Δ/Δ%）。",
+        load_stripped("out/exp1a_store/alloc_sensitivity.md"),
     )
 
     e1b = section(
@@ -62,10 +74,12 @@ def main():
         "paper_figures/fig_exp1b_lookup_gbn64.pdf",
         "横轴 Cache depth N（128/256/512/1024/2048/4096/5120）、纵轴 lookup time cost（ns），双对数；"
         "payload=1024、B=512、reps=5，主指标 p50。两条 PSN 变体：S0=payload（槽大小固定=包长）与 "
-        "adaptive S（弹性槽大小）。结论：① FIFO 呈 O(N)（n_cmp≈N/2）、Tree O(log N)、Hash O(1)，"
-        "而 PSN Mapping 两变体 n_cmp=0、与 index-only Φ 同阶（O(1) 平坦），持平/反超 Hash、远优于 Tree/FIFO；"
-        "② reorder 增量对所有方法对称（见「reorder 增量」表，非 PSN 特有劣势）。"
-        "SR 图另见 `fig_exp1b_lookup_sr64.pdf`（reorder=0 实线 / reorder=1 虚线）。",
+        "adaptive S（弹性槽大小）。第 4B 统一交付契约：retrieve_set 按 PSN 升序交付（fifo/hash qsort、"
+        "tree 中序、dynblock 扫槽；SR 图另见 `fig_exp1b_lookup_sr64.pdf`）。结论：① GBN（retrieve_range "
+        "天然升序）：FIFO O(N)（n_cmp≈N/2）、Tree O(log N)、Hash O(1)，而 PSN Mapping 两变体 n_cmp=0、"
+        "与 index-only Φ 同阶（O(1) 平坦），持平/反超 Hash、远优于 Tree/FIFO；② SR（retrieve_set 升序交付）："
+        "fifo/hash 显式 qsort O(k log k)、tree 中序 O(N)、dynblock 扫槽 O(N)——小 N 下 tree/dynblock 零排序交付占优，"
+        "大 N 下 hash 的 qsort 占优（见 numbers.md 表）。",
         load_stripped("out/exp1b_lookup/exp1b_numbers.md"),
     )
 
@@ -74,8 +88,8 @@ def main():
         "paper_figures/fig_exp2_space.pdf",
         "横轴 packet size（5 档 MTU）、纵轴 space utilization（%，线性 0-100）；"
         "utilization = payload_bytes / allocated_bytes（满窗 N=4096，cache_footprint_bytes sizeof 实测）。"
-        "结论：PSN Mapping（弹性）利用率非最高，但与最优基线 FIFO 的差距 <=5%（断言成立，见「关键结论」表），"
-        "且优于 Chained Hash / Balanced Tree；而 PSN(fixed S=4096) 在 256B 档崩到个位数——"
+        "结论：PSN Mapping（弹性）利用率**反超**原最优基线 FIFO（256B +5.51pp、4096B +0.41pp，5 档全部反超），"
+        "且优于 Chained Hash / Balanced Tree；而 PSN(fixed S=4096) 在 256B 档崩到 6.2%——"
         "证明「弹性内存槽大小机制」解决了固定内存块的空间利用率塌陷。",
         load_stripped("out/exp2_space/exp2_numbers.md"),
     )
@@ -83,15 +97,18 @@ def main():
     e3 = section(
         "exp3 — elastic ablation（弹性消融 / 稳定性）",
         "paper_figures/fig_exp3_adapt.pdf",
-        "横轴 epoch、纵轴 block size S（B，对数 base2）；ablation（去滞后，实线○）vs slow 对照（默认滞后，虚线□），"
-        "背景底纹标 256B/4096B 相位（5 档 MTU 跳变 + 256↔4096 ×16 振荡，两条件同一相位序列，仅弹性旋钮不同）。"
-        "结论：去滞后消融（k_dwell=1/ovf_thresh=1/j_quiet=1/hist_decay=2）对 256↔4096 快速振荡全跟踪、"
-        "零丢包零 miss（代价是 resize 次数更多）；默认滞后缩得太晚 → gen_switch 延后 → 溢出打满 → "
-        "每次振荡扩丢包（见「稳定性（丢包/命中）」与「振荡段跟踪」表）。resize_ns 语义见 numbers.md 内注。",
+        "横轴 epoch、纵轴 block size S（B，对数 base2）；两条件同一相位序列（第 3 条重设计：11 相位 = "
+        "1 预热 + 5 升档 + 5 降档，每档稳定 16 纪元再切换），仅弹性旋钮不同（ablation 去滞后 vs slow 默认滞后对照）。"
+        "另报三指标：① 利用率时间序列（fig_exp3_util）、② 逐相位利用率统计（排除切换后首 6 纪元）、"
+        "③ 收敛时间（每次切换后 S 首次命中目标 MTU 的纪元数）。"
+        "结论：每档稳定 16 纪元下，去滞后消融与默认滞后**都零丢包零 miss**（hit_rate=1.0000，n_drop=0）；"
+        "区别在收敛速度（降档：ablation 0.0 纪元 vs slow 1.4 纪元）与 resize 临界区成本（resize_ns mean："
+        "ablation 2188 vs slow 3715 ns）——默认滞后的 gen_switch 延后到 old_live 归零、旧池同步 munmap，"
+        "故临界区峰值延迟更高（见 numbers.md 收敛时间/逐相位利用率表）。",
         load_stripped("out/exp3_adapt/exp3_numbers.md"),
     )
 
-    text = header + e1a + e1b + e2 + e3 + "\n---\n"
+    text = header + e1a + e1a_alloc + e1b + e2 + e3 + "\n---\n"
     out = os.path.join(ROOT, "RESULTS.md")
     with open(out, "w", encoding="utf-8") as f:
         f.write(text)

@@ -11,8 +11,8 @@ Fig — exp2 space 面板: space utilization (%) vs packet size。
       allocated_bytes = cache_footprint_bytes（池 + 索引/桶 + 元数据，sizeof 实测）
 
 想证的三件事（正文数字全部脚本从 CSV 提取，禁手抄）：
-  ① 我们（弹性）利用率非最高，但与最优基线 FIFO 相差 <=5%（256B ~4.4pp、4096B ~0.3pp）；
-  ② PSN Mapping(fixed S=4096) 在 256B 崩到 ~6%（4128B 槽只装 256B），证明弹性槽大小解决了固定块低利用率；
+  ① 我们（弹性）利用率反超原最优基线 FIFO（第 1 条删 24B 头后 stride=align16(S)：256B +5.51pp、4096B +0.41pp，5 档全部反超）；
+  ② PSN Mapping(fixed S=4096) 在 256B 崩到 ~6%（4096B 槽只装 256B），证明弹性槽大小解决了固定块低利用率；
   ③ 弹性 S 收敛到各 MTU 档（block_S 列）。
 
 视觉规格（沿用 fig_exp1a_store 重画版）：
@@ -178,16 +178,19 @@ def main():
             md.append("- %s: %s" % (LABELS[m], s))
 
     md.append("\n## 关键结论（脚本计算，供正文）\n")
-    fifo_best = max((pct("fifo_bounded", p) for p in PAYLOADS), default=0.0)
-    md.append("- FIFO（最优基线）利用率区间：%.2f%%–%.2f%%" %
-              (min((pct("fifo_bounded", p) for p in PAYLOADS), default=0.0), fifo_best))
+    fifo_lo = min((pct("fifo_bounded", p) for p in PAYLOADS), default=0.0)
+    fifo_hi = max((pct("fifo_bounded", p) for p in PAYLOADS), default=0.0)
+    el_lo = min((pct("psn_dynblock", p) for p in PAYLOADS), default=0.0)
+    el_hi = max((pct("psn_dynblock", p) for p in PAYLOADS), default=0.0)
+    md.append("- FIFO（原最优基线）利用率区间：%.2f%%–%.2f%%" % (fifo_lo, fifo_hi))
+    md.append("- PSN(弹性) 利用率区间：%.2f%%–%.2f%%（**反超 FIFO**）" % (el_lo, el_hi))
     for p in PAYLOADS:
-        gap_el = pct("fifo_bounded", p) - pct("psn_dynblock", p)
-        gap_fx = pct("fifo_bounded", p) - pct("psn_dynblock_fixed", p)
-        md.append("- %d B：FIFO−PSN(弹性)=%.2f pp，FIFO−PSN(fixed)=%.2f pp" % (p, gap_el, gap_fx))
-    worst_el_p = max(PAYLOADS, key=lambda p: pct("fifo_bounded", p) - pct("psn_dynblock", p))
-    worst_el_gap = pct("fifo_bounded", worst_el_p) - pct("psn_dynblock", worst_el_p)
-    md.append("- 弹性最大劣势点：%d B，差 %.2f pp（<=5%% 断言成立）" % (worst_el_p, worst_el_gap))
+        gap_el = pct("psn_dynblock", p) - pct("fifo_bounded", p)   # 正=PSN 更高
+        gap_fx = pct("fifo_bounded", p) - pct("psn_dynblock_fixed", p)  # 正=FIFO 更高（fixed 塌陷）
+        md.append("- %d B：PSN(弹性)−FIFO=%+.2f pp，FIFO−PSN(fixed)=%.2f pp" % (p, gap_el, gap_fx))
+    min_el_p = min(PAYLOADS, key=lambda p: pct("psn_dynblock", p) - pct("fifo_bounded", p))
+    min_el_gap = pct("psn_dynblock", min_el_p) - pct("fifo_bounded", min_el_p)
+    md.append("- 弹性反超最小点：%d B，PSN 仍高 %+.2f pp（5 档全部反超 FIFO）" % (min_el_p, min_el_gap))
     worst_fx_p = min(PAYLOADS, key=lambda p: pct("psn_dynblock_fixed", p))
     worst_fx_util = pct("psn_dynblock_fixed", worst_fx_p)
     md.append("- fixed 最大塌陷点：%d B，利用率 %.2f%%（vs FIFO %.2f%%）——弹性槽大小机制的价值所在" %

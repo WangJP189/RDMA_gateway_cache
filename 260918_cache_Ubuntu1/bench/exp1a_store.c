@@ -56,6 +56,10 @@ static b_cache_t *mk_hash_b(const cfg_t *cfg, uint32_t pl) { return make_chained
 static b_cache_t *mk_tree_b(const cfg_t *cfg, uint32_t pl) { (void)cfg; return make_balanced_tree_bounded(cfg->e1a_n, pl); }
 static b_cache_t *mk_dyn   (const cfg_t *cfg, uint32_t pl) { (void)pl; return make_dynblock(cfg, 4096); } /* S0=ceil_class(4096)=4096 */
 static b_cache_t *mk_idx   (const cfg_t *cfg, uint32_t pl) { (void)pl; return make_index_only(cfg->e1a_n); }
+/* 第 5 条 perstore 工厂：同一索引结构，唯一变量=分配策略（make_dynblock 读 cfg.alloc_mode 自选） */
+static b_cache_t *mk_fifo_p(const cfg_t *cfg, uint32_t pl) { (void)cfg; return make_fifo_perstore(cfg->e1a_n, pl); }
+static b_cache_t *mk_hash_p(const cfg_t *cfg, uint32_t pl) { return make_chained_hash_perstore(cfg->e1a_n, cfg->hash_nbuckets, pl); }
+static b_cache_t *mk_tree_p(const cfg_t *cfg, uint32_t pl) { (void)cfg; return make_balanced_tree_perstore(cfg->e1a_n, pl); }
 
 typedef struct {
     const char *name;
@@ -64,7 +68,8 @@ typedef struct {
     int          is_dynblock; /* 1 = 输出 block_S 列（收敛后/固定块大小） */
 } method_t;
 
-static const method_t METHODS[] = {
+/* pooled（alloc_mode=0，主结果）：5 索引结构 + 固定块对照。index_only 仅 pooled（无 payload 块）。 */
+static const method_t METHODS_POOLED[] = {
     { "fifo_bounded",          mk_fifo_b, 0, 0 },
     { "chained_hash_bounded",  mk_hash_b, 0, 0 },
     { "balanced_tree_bounded", mk_tree_b, 0, 0 },
@@ -72,7 +77,14 @@ static const method_t METHODS[] = {
     { "psn_dynblock_fixed",    mk_dyn,    0, 1 },   /* S=4096 固定（对照） */
     { "index_only",            mk_idx,    0, 0 },
 };
-#define N_METHODS (sizeof(METHODS) / sizeof(METHODS[0]))
+
+/* perstore（alloc_mode=1）：同 4 个真实索引结构，逐 store malloc/free。无 index_only / 无 fixed 对照。 */
+static const method_t METHODS_PERSTORE[] = {
+    { "fifo_perstore",          mk_fifo_p, 0, 0 },
+    { "chained_hash_perstore",  mk_hash_p, 0, 0 },
+    { "balanced_tree_perstore", mk_tree_p, 0, 0 },
+    { "psn_dynblock_perstore",  mk_dyn,    1, 1 },  /* 收敛后冻结（唯一变量=分配策略） */
+};
 
 /* ---- store 批量计时：每批 B 次 store 夹一对 rdtsc，per-op ns 写入 samples ---- */
 static size_t time_store(b_cache_t *c, uint32_t pl, uint32_t B,
@@ -112,6 +124,15 @@ int main(int argc, char **argv) {
     snprintf(cfg.out_dir, sizeof(cfg.out_dir), "out/exp1a_store");
     if (cfg_override_cli(&cfg, argc, argv) != 0) return 1;
 
+    /* 第 5 条：perstore 默认落盘独立目录，避免覆盖 pooled 主结果。 */
+    if (cfg.alloc_mode && strcmp(cfg.out_dir, "out/exp1a_store") == 0)
+        snprintf(cfg.out_dir, sizeof(cfg.out_dir), "out/exp1a_store_perstore");
+    const char  *alloc_mode_str = cfg.alloc_mode ? "perstore" : "pooled";
+    const method_t *methods = cfg.alloc_mode ? METHODS_PERSTORE : METHODS_POOLED;
+    uint32_t n_methods      = cfg.alloc_mode
+                            ? (uint32_t)(sizeof(METHODS_PERSTORE) / sizeof(METHODS_PERSTORE[0]))
+                            : (uint32_t)(sizeof(METHODS_POOLED) / sizeof(METHODS_POOLED[0]));
+
     tsc_calibrate();
     if (mkdir_p(cfg.out_dir) < 0) { fprintf(stderr, "[exp1a] 无法创建输出目录 %s\n", cfg.out_dir); return 1; }
 
@@ -137,8 +158,10 @@ int main(int argc, char **argv) {
             cfg.e1a_batch_ops, cfg.e1a_timed_ops / cfg.e1a_batch_ops,
             cfg.e1a_batch_xval_ops, cfg.e1a_timed_ops / cfg.e1a_batch_xval_ops);
     fprintf(f, "# dynblock: psn_dynblock=收敛后冻结(预热 adaptive=1, 记录收敛 S), psn_dynblock_fixed=S=4096 固定\n");
+    fprintf(f, "# alloc_mode: pooled=一次性预分配复用(主结果) perstore=逐 store malloc/free(第 5 条正交)\n");
     fprintf(f, "# p50=主指标 p90=次指标; p99 仅留痕(实机尾部干净, p99 备查); block_S=0 表示非 dynblock\n");
-    fprintf(f, "method,payload,N,B,n_batches,reps,mean_ns,std_ns,p50_ns,p90_ns,p99_ns,floor_ns,block_S,n_malloc,n_resize\n");
+    fprintf(f, "# n_malloc/n_free: pooled 恒 0; perstore=计时期逐 store malloc/free 实计数(约 reps*timed_ops)\n");
+    fprintf(f, "method,alloc_mode,payload,N,B,n_batches,reps,mean_ns,std_ns,p50_ns,p90_ns,p99_ns,floor_ns,block_S,n_malloc,n_free,n_resize\n");
 
     double *samples = (double *)malloc((size_t)cfg.e1a_timed_ops * reps * sizeof(double));
 
@@ -160,8 +183,8 @@ int main(int argc, char **argv) {
 
         for (uint32_t pi = 0; pi < cfg.e1a_payload_n; pi++) {
             uint32_t pl = cfg.e1a_payload_list[pi];
-            for (uint32_t mi = 0; mi < N_METHODS; mi++) {
-                const method_t *m = &METHODS[mi];
+            for (uint32_t mi = 0; mi < n_methods; mi++) {
+                const method_t *m = &methods[mi];
 
                 /* dynblock 收敛口径：预热期开自适应，让 S 收敛；其余方法/固定块则全程关 */
                 cfg.adaptive_enable = m->converge ? 1u : 0u;
@@ -174,11 +197,15 @@ int main(int argc, char **argv) {
                 uint32_t block_S = m->is_dynblock ? dynblock_cur_S(c) : 0;
                 if (m->converge) cfg.adaptive_enable = 0u;    /* 冻结：计时区间无 resize */
 
-                c->n_malloc = 0; c->n_resize = 0; c->n_cmp = 0;   /* 计时区间计数器归零 */
+                c->n_malloc = 0; c->n_resize = 0; c->n_cmp = 0; c->n_free = 0;   /* 计时区间计数器归零 */
                 size_t ns = time_store(c, pl, B, n_batches, reps, samples);
 
-                if (c->n_malloc != 0) fprintf(stderr, "[exp1a] WARN %s pl=%u B=%u: n_malloc=%llu (expect 0)\n",
-                                              m->name, pl, B, (unsigned long long)c->n_malloc);
+                if (cfg.alloc_mode == 0 && c->n_malloc != 0) {
+                    /* pooled：环路径/池化 store 必须零 malloc（核心不变量 I3）；违反即实现错误 */
+                    fprintf(stderr, "[exp1a] ERROR pooled %s pl=%u B=%u: n_malloc=%llu (pooled 必须为 0)\n",
+                            m->name, pl, B, (unsigned long long)c->n_malloc);
+                    return 1;
+                }
                 if (c->n_resize != 0) fprintf(stderr, "[exp1a] WARN %s pl=%u B=%u: n_resize=%llu (expect 0, adaptive frozen)\n",
                                               m->name, pl, B, (unsigned long long)c->n_resize);
 
@@ -188,13 +215,15 @@ int main(int argc, char **argv) {
                 double p90  = pct_dbl(samples, ns, 90.0);
                 double p99  = pct_dbl(samples, ns, 99.0);
 
-                fprintf(f, "%s,%u,%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%llu,%llu\n",
-                        m->name, pl, N, B, n_batches, reps,
+                fprintf(f, "%s,%s,%u,%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%llu,%llu,%llu\n",
+                        m->name, alloc_mode_str, pl, N, B, n_batches, reps,
                         mean, std, p50, p90, p99, floor_med, block_S,
-                        (unsigned long long)c->n_malloc, (unsigned long long)c->n_resize);
-                printf("  %-22s pl=%4u B=%4u  mean=%8.3f  p50=%8.3f  p90=%8.3f  S=%u  malloc=%llu resize=%llu\n",
+                        (unsigned long long)c->n_malloc, (unsigned long long)c->n_free,
+                        (unsigned long long)c->n_resize);
+                printf("  %-22s pl=%4u B=%4u  mean=%8.3f  p50=%8.3f  p90=%8.3f  S=%u  malloc=%llu free=%llu resize=%llu\n",
                        m->name, pl, B, mean, p50, p90, block_S,
-                       (unsigned long long)c->n_malloc, (unsigned long long)c->n_resize);
+                       (unsigned long long)c->n_malloc, (unsigned long long)c->n_free,
+                       (unsigned long long)c->n_resize);
                 fflush(f); fflush(stdout);
                 c->ops.destroy(c);
             }

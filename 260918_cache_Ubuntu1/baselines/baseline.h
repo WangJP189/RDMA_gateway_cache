@@ -31,19 +31,29 @@ typedef struct {
     /* retrieve_range：GBN 连续区间 [start, start+count)。返回写出字节数（定位+memcpy 全过程）。 */
     uint32_t (*retrieve_range)(b_cache_t *c, uint32_t start, uint32_t count,
                                uint8_t *out, uint32_t out_cap);
-    /* retrieve_set：SR 离散 PSN 集。返回写出字节数。 */
+    /* retrieve_set：SR 离散 PSN 集，按 PSN 升序交付命中包（第 4B 统一交付契约）。返回写出字节数。 */
     uint32_t (*retrieve_set)(b_cache_t *c, const uint32_t *psns, uint32_t n,
                              uint8_t *out, uint32_t out_cap);
     void  (*destroy)(b_cache_t *c);
 } b_ops_t;
 
+/* 预分配空闲链表（node_pool_t）：pooled 模式用。perstore 模式不建池（node_alloc 走 malloc）。 */
+typedef struct {
+    uint8_t *mem;    /* 一次性大块（node_pool_free 用） */
+    void    *head;   /* 空闲链表头 */
+} node_pool_t;
+
 struct b_cache {
     const char *name;
     b_ops_t     ops;
-    uint64_t    n_malloc;  /* store 路径 malloc 调用次数（malloc_per_store 证据：我们/`*_bounded` 恒 0） */
-    uint64_t    n_cmp;     /* retrieve 比较次数（诊断；exp1b 的第三项指标「每次取包比较次数」） */
+    uint64_t    n_malloc;  /* store 路径 malloc 调用次数（pooled *_bounded 恒 0；perstore 每 store +1） */
+    uint64_t    n_cmp;     /* retrieve 比较次数（内部诊断：退出正文，不进 RESULTS.md/图/论文；n_cmp.csv 仍落盘留痕） */
     uint64_t    n_resize;  /* store 路径 resize 次数（exp1a 断言 dynblock 在 adaptive_enable=0 下恒 0） */
     uint64_t    n_live;    /* 当前驻留条数（诊断；smoke 断言 *_bounded 全程 resident==N） */
+    /* ---- 第 5 条分配策略正交：pooled / perstore ---- */
+    int         perstore;  /* 0=pooled(一次性预分配+复用) 1=perstore(逐 store malloc/free) */
+    uint64_t    n_free;    /* perstore 模式淘汰路径 free() 次数（pooled 恒 0） */
+    node_pool_t *pool;     /* pooled 模式空闲链表（node_alloc/node_release 用；perstore 未用） */
 };
 
 /* ---- 无界基线（真实基线参考） ---- */
@@ -55,6 +65,11 @@ b_cache_t *make_balanced_tree(void);
 b_cache_t *make_fifo_bounded(uint32_t capacity, uint32_t payload_len);
 b_cache_t *make_chained_hash_bounded(uint32_t capacity, uint32_t nbuckets, uint32_t payload_len);
 b_cache_t *make_balanced_tree_bounded(uint32_t capacity, uint32_t payload_len);
+
+/* ---- *_perstore（第 5 条：同一索引结构，唯一变量=分配策略；逐 store malloc、淘汰 free） ---- */
+b_cache_t *make_fifo_perstore(uint32_t capacity, uint32_t payload_len);
+b_cache_t *make_chained_hash_perstore(uint32_t capacity, uint32_t nbuckets, uint32_t payload_len);
+b_cache_t *make_balanced_tree_perstore(uint32_t capacity, uint32_t payload_len);
 
 /* ---- psn_dynblock 适配器（我们的方法） ---- */
 b_cache_t *make_dynblock(const cfg_t *cfg, uint32_t mtu_from_cm);

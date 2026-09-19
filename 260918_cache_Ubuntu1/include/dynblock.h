@@ -6,7 +6,8 @@
  *   ④ 溢出 = 每项 malloc 变长块（删 arena）；新增 n_ovf_alloc/n_ovf_malloc；
  *   ⑥ p0 ≡ 0（常量，不进结构体）；删 window_base；next_psn 保留单调插入计数；
  *      phi(psn) = (psn & 0xFFFFFFu) % N（24-bit 归一化）；
- *   ⑦ mem_block_header 逐字沿用 260912（24 B）+ hdr_set（stamp 真写）；
+ *   ⑦ mem_block_header 逐字沿用 260912（24 B）+ hdr_set（stamp 真写）——2026-09-19 第 1 条
+ *     已把 24 B 头从 stride 移除（stride_of(S)=align16(S)），热路径不再写头；见下方结构体注释；
  *   ② 锁：全程单线程（cfg.single_thread 默认 1），编译为 no-op，不计入被测延迟；
  *   1A order_guard 计数 n_ooo_drop；
  *   时间兜底已移除（无 now_ns/vtime/last_check）。
@@ -24,24 +25,27 @@
 #include "config.h"
 #include "util.h"    /* align16 */
 
-/* ---- 数据包头（与 260912 一致，24 B） ---- */
+/* ---- 数据包头（历史遗留，已废弃；2026-09-19 第 1 条） ----
+ * 旧版每个槽前有 24 B 头（data_len/recv_stamp/psn/…），stride_of(S)=align16(24+S)。
+ * 本次把 24 B 头从 stride 中移除：stride_of(S)=align16(S)，热路径只写 payload、
+ * 不再写头（槽内 psn 已由 slot_meta_t.psn 承载，见 dynblock.c 的「零搜索、一次校验」）。
+ * 结构体与 hdr_set/hdr_of/HDR_SZ 仅作历史对照保留，不再被任何热路径调用。 */
 struct mem_block_header {
     int32_t  data_len;    /* +0  */
     uint32_t _pad0;       /* +4  */
-    uint64_t recv_stamp;  /* +8  单调递增包序号，真写 */
+    uint64_t recv_stamp;  /* +8  */
     uint32_t psn;         /* +16 */
     uint32_t _pad1;       /* +20 */
-};  /* 24 B */
+};  /* 24 B（历史） */
 _Static_assert(sizeof(struct mem_block_header) == 24, "hdr must be 24 B");
 
-#define HDR_SZ ((uint32_t)sizeof(struct mem_block_header))
+#define HDR_SZ ((uint32_t)sizeof(struct mem_block_header))   /* 历史遗留；stride 不再含它 */
 
+/* 以下 hdr_set/hdr_of 已废弃（无调用点），仅保留历史参考。 */
 static inline void hdr_set(void *blk, uint16_t len, uint32_t psn, uint64_t stamp) {
     struct mem_block_header *h = (struct mem_block_header *)blk;
     h->data_len = len; h->psn = psn; h->recv_stamp = stamp;
 }
-
-/* 由 payload 指针取回其块头（spec 里的 hdr(dst)）。 */
 static inline struct mem_block_header *hdr_of(uint8_t *payload) {
     return (struct mem_block_header *)(payload - HDR_SZ);
 }
@@ -73,8 +77,8 @@ typedef struct {
     uint8_t *blk;      /* 块基址（malloc 返回值），与环路径 slot() 同构 */
 } ovf_entry_t;
 
-/* 溢出块 payload = 块基址 + HDR_SZ（与 payload_of(pool,i) 同构；全库唯一指针约定） */
-static inline uint8_t *ovf_payload(const ovf_entry_t *e) { return e->blk + HDR_SZ; }
+/* 溢出块 payload = 块基址（无 24 B 头；与 payload_of(pool,i) 同构） */
+static inline uint8_t *ovf_payload(const ovf_entry_t *e) { return e->blk; }
 
 /* ---- 锁：no-op（单线程；论文不声称并发性能，锁不计入被测延迟） ---- */
 typedef struct { int _unused; } spin_t;
@@ -120,6 +124,13 @@ typedef struct {
     uint64_t check_ns;              /* 最近一次 check_and_maybe_resize 扫描+评估耗时（ns） */
     uint64_t resize_ns;             /* 最近一次 gen_switch 耗时（ns；0=本纪元无切换） */
     uint64_t drain_ns;              /* 最近一次 drain_overflow 耗时（ns；0=本纪元无 drain） */
+    /* ---- 第 5 条 perstore 模式（cfg.alloc_mode==1）：环池换成逐槽 malloc/free ----
+     * Φ 索引路径不变（i=phi(psn)）；唯一变量=分配策略：slot_ptr[i] 按需 malloc(stride_of(S))，
+     * 淘汰 free。slot_used 只标「槽缓冲已分配」；IN_OVF 槽的槽缓冲恒已释放（溢出走 ovf[].blk）。 */
+    void          **slot_ptr;   /* [N] 槽缓冲指针（pooled 模式 NULL） */
+    unsigned char  *slot_used;  /* [N] 槽占用标记（pooled 模式 NULL） */
+    uint64_t        n_malloc;   /* 槽 malloc 次数（perstore；pooled 恒 0） */
+    uint64_t        n_free;     /* 槽 free 次数（perstore 淘汰；pooled 恒 0） */
 } conn_t;
 
 /* ---- 模拟器（§P2 照抄） ---- */
@@ -158,18 +169,21 @@ static inline uint32_t phi(const conn_t *c, uint32_t psn) {
     return (psn & 0xFFFFFFu) % c->N;
 }
 static inline uint32_t stride_of(uint32_t S) {
-    return align16(HDR_SZ + S);
+    return align16(S);          /* 24 B 头已移除：stride 不再含 HDR_SZ */
 }
 static inline uint8_t *slot(const pool_t *p, uint32_t i) {
     return p->base + (size_t)i * p->stride;
 }
 static inline uint8_t *payload_of(const pool_t *p, uint32_t i) {
-    return slot(p, i) + HDR_SZ;
+    return slot(p, i);          /* payload 即槽基址（无 24 B 头） */
 }
 static inline pool_t *pool_for(conn_t *c, uint8_t gen) {
     assert(gen == c->cur.gen || (c->has_old && gen == c->old.gen)); /* C-9：gen 必须合法 */
     return (gen == c->cur.gen) ? &c->cur : &c->old;
 }
+
+/* 第 5 条：是否为 perstore 分配模式（cfg.alloc_mode==1）。 */
+static inline int conn_perstore(const conn_t *c) { return c->cfg->alloc_mode == 1; }
 
 /* 1A order_guard：a 是否严格新于 b（24-bit 模序）。a==b 返回 0。 */
 static inline int psn_newer(uint32_t a, uint32_t b) {

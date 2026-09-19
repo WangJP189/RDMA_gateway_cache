@@ -17,17 +17,19 @@
  *                            再 adaptive_enable=0 冻结计时（忠实于自适应机制的「收敛后冻结」）。
  *   两者 S 最终都 = 1024，结果应一致（互证 S0=MTU 是正确初始化）。
  *
- * 重排序维度（2026-09-17 新增，回应「上层是否需要整理」）：
- *   - GBN（连续区间）：所有方法都按 start+k 递增取，输出天然 PSN 序，无需重排 ⇒ reorder 仅 0。
- *   - SR（离散集合）：所有方法都按 psns[k] 查询序取，输出未排序；若上层要按 PSN 序发，需排序。
- *     排序对所有方法对称（同一 64 元素升序插入排序，计时内），故 reorder ∈ {0,1} 两版都跑，
- *     用于对比「计入整理后」相对排序是否改变。
+ * 交付契约（第 4B，2026-09-19）：retrieve_set 统一按 PSN 升序交付命中包。
+ *   - GBN（连续区间）：retrieve_range 天然按 start+k 升序 ⇒ 无需重排。
+ *   - SR（离散集合）：retrieve_set 内部分法各异但同契约——fifo/hash 显式 qsort、
+ *     tree 中序遍历零排序、dynblock 位置映射零排序扫槽；升序成本已含在计时内。
+ *   （原 reorder∈{0,1} 维度因第 4B 升序契约上移到 retrieve_set 内而废止，不再单列。）
  *
  * 计时口径：
  *   - 计时单位 = 一次 retrieve_range / retrieve_set（定位 + memcpy 全过程，即一次 GBN/SR 重传
- *     的完整开销；SR reorder=1 时额外含「把 64 个 PSN 升序整理」这一步）；per-op ns = (t1-t0)/B。
+ *     的完整开销；SR 升序交付成本已含在 retrieve_set 内——fifo/hash qsort、tree/dynblock 零排序）；
+ *     per-op ns = (t1-t0)/B。
  *   - 主指标 p50，次指标 p90；p99 仅 CSV 留痕（实机尾部干净，p99 备查）。
- *   - n_cmp：retrieve 前清零、批后累计，报「每次取包平均比较次数」；排序不在缓存内，不计 n_cmp。
+ *   - n_cmp：内部诊断（retrieve 前清零、批后累计，报「每次取包平均比较次数」）；退出正文——主/次指标
+ *     只用 p50/p90，n_cmp 不进 RESULTS.md/图/论文（n_cmp.csv 仍落盘留痕）；交付排序不计 n_cmp。
  *   - 空批地板：floor ∝ 1/B，同时测 B=512 与 B=32（xval）。
  *
  * 编译：make build/exp1b_lookup && ./build/exp1b_lookup [--out=DIR]
@@ -107,41 +109,24 @@ static void gen_queries(uint32_t *q, const e1b_mode_t *m, uint32_t N,
     }
 }
 
-/* 上层整理：把 PSN 集升序（小规模插入排序，同对所有方法、计入计时） */
-static void ins_sort_u32(uint32_t *a, uint32_t n) {
-    for (uint32_t i = 1; i < n; i++) {
-        uint32_t x = a[i], j = i;
-        while (j > 0 && a[j - 1] > x) { a[j] = a[j - 1]; j--; }
-        a[j] = x;
-    }
-}
-
 /* ---- retrieve 批量计时 + n_cmp：每批 B 次操作夹一对 rdtsc；n_cmp 批前清零、批后累计 ----
- * reorder=1 且 SR：先把该次 64 个 PSN 升序整理，再 retrieve_set（「开始取→整理完可发」）。 */
+ * retrieve_set 按第 4B 升序契约交付（排序在接口内），计时 = 定位 + memcpy + 升序交付全过程。 */
 static size_t time_retrieve(b_cache_t *c, const e1b_mode_t *m, const uint32_t *q,
                             uint32_t B, uint32_t n_batches, uint32_t reps,
-                            uint8_t *out, uint32_t out_cap, int reorder,
+                            uint8_t *out, uint32_t out_cap,
                             double *samples, uint64_t *total_cmp) {
     size_t idx = 0;
     uint64_t cmp = 0;
     uint32_t wsum = 0;
     uint32_t count = m->count, stride = m->is_set ? count : 1u;
-    uint32_t sorted[64];
     for (uint32_t r = 0; r < reps; r++) {
         for (uint32_t b = 0; b < n_batches; b++) {
             const uint32_t *qb = q + (size_t)b * B * stride;
             c->n_cmp = 0;
             uint64_t t0 = rdtsc_raw();
             if (m->is_set) {
-                for (uint32_t k = 0; k < B; k++) {
-                    if (reorder) {
-                        memcpy(sorted, qb + (size_t)k * stride, count * sizeof(uint32_t));
-                        ins_sort_u32(sorted, count);
-                        wsum += c->ops.retrieve_set(c, sorted, count, out, out_cap);
-                    } else {
-                        wsum += c->ops.retrieve_set(c, qb + (size_t)k * stride, count, out, out_cap);
-                    }
-                }
+                for (uint32_t k = 0; k < B; k++)
+                    wsum += c->ops.retrieve_set(c, qb + (size_t)k * stride, count, out, out_cap);
             } else {
                 for (uint32_t k = 0; k < B; k++)
                     wsum += c->ops.retrieve_range(c, qb[(size_t)k * stride], count, out, out_cap);
@@ -229,17 +214,17 @@ int main(int argc, char **argv) {
     fprintf(f, "# exp1b lookup/retrieve time cost (batch-amortized). payload=%u reps=%u B=%u n_batches=%u\n",
             pl, reps, B, n_batches);
     fprintf(f, "# methods: fifo_bounded / chained_hash_bounded / balanced_tree_bounded / psn_dynblock(S0=payload) / psn_dynblock_adaptive(收敛后冻结) / index_only(对照E)\n");
-    fprintf(f, "# modes: gbn_long64(64) / gbn_short8(8) / sr_16(16) / sr_64(64); per-op = 一次 retrieve_range/retrieve_set(定位+memcpy 全过程)\n");
-    fprintf(f, "# reorder: 0=仅取包; 1=取包前先把 PSN 集升序整理(仅 SR; GBN 输出天然有序故恒 0)\n");
+    fprintf(f, "# modes: gbn_long64(64) / gbn_short8(8) / sr_16(16) / sr_64(64); per-op = 一次 retrieve_range/retrieve_set(定位+memcpy+升序交付全过程)\n");
+    fprintf(f, "# SR retrieve_set 按第 4B 升序契约交付(fifo/hash qsort、tree 中序、dynblock 扫槽); GBN retrieve_range 天然升序\n");
     fprintf(f, "# N=缓存深度(工作集条数)=环长(所有方法同义); dynblock 环长=N(Φ=psn%%N O(1)); index_only=Φ纯算术 len=0 无 memcpy\n");
     fprintf(f, "# p50=主指标 p90=次指标; p99 仅留痕(实机尾部干净, p99 备查)\n");
     fprintf(f, "# floor(空批,读钟/B): B=%u median=%.3f ns/op; B=%u(xval) median=%.3f ns/op\n",
             B, floor_main, Bx, floor_xval);
-    fprintf(f, "method,mode,N,payload,B,n_batches,reps,reorder,mean_ns,std_ns,p50_ns,p90_ns,p99_ns\n");
+    fprintf(f, "method,mode,N,payload,B,n_batches,reps,mean_ns,std_ns,p50_ns,p90_ns,p99_ns\n");
 
     fprintf(fc, "# exp1b n_cmp: retrieve 比较次数(纯取包比较; retrieve 前清零、批后累计)\n");
     fprintf(fc, "# mean_cmp_per_pkt = total_cmp / (n_ops*reps*count); FIFO=O(N)~N/2; tree=O(log N); hash~O(1); dynblock/index_only=0(Φ纯算术)\n");
-    fprintf(fc, "# reorder 不影响 n_cmp(排序在缓存外)，故每 (method,mode,N) 只记一行(取 reorder=0)\n");
+    fprintf(fc, "# 交付排序不计 n_cmp(n_cmp 只计缓存内检索比较)，每 (method,mode,N) 一行\n");
     fprintf(fc, "method,mode,N,payload,total_packets,total_cmp,mean_cmp_per_pkt\n");
 
     uint8_t pbuf[4096];
@@ -278,12 +263,11 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[exp1b] WARN %s mode=%s N=%u: populate miss (0=%p N-1=%p)\n",
                             mt->name, m->name, N, (void *)p0, (void *)p1);
 
-                /* reorder 维度：GBN 恒 0（输出天然有序）；SR 跑 0/1 两版对比 */
-                int n_reorder = m->is_set ? 2 : 1;
-                for (int ro = 0; ro < n_reorder; ro++) {
+                /* retrieve_set 按第 4B 升序契约交付（排序在接口内），每 (method,mode,N) 测一次 */
+                {
                     uint64_t total_cmp = 0;
                     size_t ns = time_retrieve(c, m, q, B, n_batches, reps, out, out_cap,
-                                              ro, samples, &total_cmp);
+                                              samples, &total_cmp);
 
                     double mean = mean_dbl(samples, ns);
                     double std  = std_dbl(samples, ns, mean);
@@ -291,19 +275,18 @@ int main(int argc, char **argv) {
                     double p90  = pct_dbl(samples, ns, 90.0);
                     double p99  = pct_dbl(samples, ns, 99.0);
 
-                    fprintf(f, "%s,%s,%u,%u,%u,%u,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                            mt->name, m->name, N, pl, B, n_batches, reps, ro,
+                    fprintf(f, "%s,%s,%u,%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                            mt->name, m->name, N, pl, B, n_batches, reps,
                             mean, std, p50, p90, p99);
 
-                    if (ro == 0) {   /* n_cmp 只记一次（reorder 不影响比较次数） */
-                        uint64_t total_pkts  = (uint64_t)n_ops * reps * m->count;
-                        double   cmp_per_pkt = (total_pkts > 0) ? (double)total_cmp / (double)total_pkts : 0.0;
-                        fprintf(fc, "%s,%s,%u,%u,%llu,%llu,%.3f\n",
-                                mt->name, m->name, N, pl,
-                                (unsigned long long)total_pkts, (unsigned long long)total_cmp, cmp_per_pkt);
-                    }
-                    printf("  %-22s %-11s N=%5u reorder=%d  p50=%9.3f  p90=%9.3f\n",
-                           mt->name, m->name, N, ro, p50, p90);
+                    uint64_t total_pkts  = (uint64_t)n_ops * reps * m->count;
+                    double   cmp_per_pkt = (total_pkts > 0) ? (double)total_cmp / (double)total_pkts : 0.0;
+                    fprintf(fc, "%s,%s,%u,%u,%llu,%llu,%.3f\n",
+                            mt->name, m->name, N, pl,
+                            (unsigned long long)total_pkts, (unsigned long long)total_cmp, cmp_per_pkt);
+
+                    printf("  %-22s %-11s N=%5u  p50=%9.3f  p90=%9.3f\n",
+                           mt->name, m->name, N, p50, p90);
                     fflush(f); fflush(fc); fflush(stdout);
                 }
                 c->ops.destroy(c);

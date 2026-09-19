@@ -55,17 +55,17 @@ static void test_pool(void) {
     pool_t p1, p2;
     const uint32_t N = 1024, S = 1500;
 
-    CHECK(sizeof(struct mem_block_header) == 24, "hdr must be 24 B");
-    CHECK(HDR_SZ == 24, "HDR_SZ == 24");
+    CHECK(sizeof(struct mem_block_header) == 24, "hdr struct historical 24 B (no longer in stride)");
+    CHECK(HDR_SZ == 24, "HDR_SZ == 24 (historical; stride excludes it)");
     CHECK(sizeof(slot_meta_t) == 12, "slot_meta_t natural 12 B");
-    CHECK(stride_of(S) == 1536, "stride_of(1500) == align16(24+1500) == 1536");
+    CHECK(stride_of(S) == 1504, "stride_of(1500) == align16(1500) == 1504");
 
     CHECK(pool_alloc(&p1, N, S, 1) == 0, "pool_alloc mmap");
     CHECK(p1.use_mmap == 1, "mmap backing recorded");
     CHECK(p1.N == N && p1.S == S && p1.stride == stride_of(S), "pool fields");
     CHECK(pool_alloc(&p2, N, 40, 0) == 0, "pool_alloc malloc");
     CHECK(p2.use_mmap == 0, "malloc backing recorded");
-    CHECK(p2.stride == stride_of(40) && stride_of(40) == 64, "stride_of(40)==64");
+    CHECK(p2.stride == stride_of(40) && stride_of(40) == 48, "stride_of(40)==48");
 
     for (uint32_t i = 0; i < N; i++) {
         uint8_t *pl = payload_of(&p1, i);
@@ -75,9 +75,9 @@ static void test_pool(void) {
     for (uint32_t i = 0; i < N; i++) {
         uint8_t *pl = payload_of(&p1, i);
         if (pl[0] != (int)(i * 7u & 0xFF)) { ok = 0; break; }
-        if ((uint8_t *)hdr_of(pl) != slot(&p1, i)) { ok = 0; break; }
+        if (pl != slot(&p1, i)) { ok = 0; break; }   /* payload 即槽基址（无 24 B 头） */
     }
-    CHECK(ok, "ring round-trip + hdr_of/slot 同构");
+    CHECK(ok, "ring round-trip + payload==slot 同构");
 
     pool_free(&p1);
     pool_free(&p2);
@@ -108,10 +108,7 @@ static void test_ovf(const cfg_t *cfg) {
 
     {
         ovf_entry_t *e = &c.ovf[oi1];
-        struct mem_block_header *h = (struct mem_block_header *)e->blk;
-        CHECK(h->data_len == 500 && h->psn == 101 && h->recv_stamp == 101,
-              "ovf hdr: data_len/psn/recv_stamp(=psn)");
-        CHECK((uint8_t *)ovf_payload(e) == e->blk + HDR_SZ, "ovf_payload == blk+HDR_SZ");
+        CHECK(ovf_payload(e) == e->blk, "ovf payload == blk（无 24 B 头）");
         CHECK(memcmp(ovf_payload(e), payload, e->len) == 0, "ovf payload round-trip");
     }
 
@@ -588,7 +585,7 @@ static void test_A12_antiosc(void) {
     }
 }
 
-/* A14：五种 MTU 建环 —— S0=ceil_class(MTU)、stride=align16(24+S0)、N 个 MTU 包全进环、0 溢出 */
+/* A14：五种 MTU 建环 —— S0=ceil_class(MTU)、stride=align16(S0)、N 个 MTU 包全进环、0 溢出 */
 static void test_A14_mtu_init(void) {
     static const uint32_t MTUS[5] = {256, 512, 1024, 2048, 4096};
     for (int m = 0; m < 5; m++) {
@@ -597,7 +594,7 @@ static void test_A14_mtu_init(void) {
         cfg.ring_n = 256;
         conn_t c; conn_init(&c, &cfg, mtu);
         CHECK(c.S == ceil_class(&cfg, mtu), "A14: S0 == ceil_class(MTU)");
-        CHECK(c.cur.stride == stride_of(ceil_class(&cfg, mtu)), "A14: stride == align16(24+S0)");
+        CHECK(c.cur.stride == stride_of(ceil_class(&cfg, mtu)), "A14: stride == align16(S0)");
 
         uint8_t *b = (uint8_t *)malloc(mtu);
         int ok = 1;
@@ -754,7 +751,7 @@ int main(void) {
         fprintf(stderr, "== %d CHECK(s) FAILED ==\n", g_fail);
         return 1;
     }
-    printf("ALL SELF-TESTS PASS (HDR_SZ=%u, slot_meta=%zu B)\n",
-           HDR_SZ, sizeof(slot_meta_t));
+    printf("ALL SELF-TESTS PASS (no 24B header; stride=align16(S); slot_meta=%zu B)\n",
+           sizeof(slot_meta_t));
     return 0;
 }

@@ -48,11 +48,11 @@ static int mkdir_p(const char *path) {
     return 0;
 }
 
-/* 当前溢出区占用字节（align16(HDR+len) 之和），O(OVF_CAP)。 */
+/* 当前溢出区占用字节（align16(len) 之和，无 24 B 头），O(OVF_CAP)。 */
 static uint64_t ovf_bytes(const conn_t *c) {
     uint64_t b = 0;
     for (uint32_t oi = 0; oi < c->cfg->ovf_cap; oi++)
-        if (c->ovf[oi].used) b += align16(HDR_SZ + c->ovf[oi].len);
+        if (c->ovf[oi].used) b += align16(c->ovf[oi].len);
     return b;
 }
 

@@ -15,7 +15,7 @@
 | 结论附原始输出 | 任何「已验证 / 已通过」后接【命令 + 输出】 | §5 证据清单 |
 | 不挑有利跑 | 每格报 `min/median/max`，p50 主 / p90 辅 | store_summary/lookup_summary 含 `std_ns,p50,p90,p99` |
 | 报告离散 | §2 给 run-to-run 离散 | §2 由 `std_ns/mean` 脚本计算 |
-| 条件改动登记 | 每改一条件记 CHANGE_AUDIT 一行 | docs/CHANGE_AUDIT.md #1–#10 |
+| 条件改动登记 | 每改一条件记 CHANGE_AUDIT 一行 | docs/CHANGE_AUDIT.md #1–#16 |
 
 ---
 
@@ -38,27 +38,27 @@
 
 ### exp1a — store（实机 bench，计时）
 
-- ✅ **可主张**：PSN Mapping 存时间 O(1)；256B 略慢于 FIFO/Hash，4096B 反超成为最快（p50 数据支持，见 RESULTS.md §exp1a）。
-- ❌ **不可主张**：PSN Mapping 在所有包长都快（256B 档 9.9ns > FIFO 8.4ns，如实写）。
+- ✅ **可主张**：PSN Mapping 存时间 O(1)，与 FIFO/Hash 同阶：256B 略慢于 Chained Hash（8.03 vs 7.37 ns）但快于 FIFO（9.44 ns）、512–2048B 反超成为最快、4096B 与 FIFO/Hash 基本持平（±3%）、全程远优于 Balanced Tree（见 RESULTS.md §exp1a）。
+- ❌ **不可主张**：PSN Mapping 在所有包长都快（256B 慢于 Hash 8.9%、4096B 慢于 FIFO 3%，如实写）。
 - ❌ **不可主张**：p99 结论（弃用）。
 
 ### exp1b — lookup（实机 bench，计时）
 
-- ✅ **可主张**：PSN Mapping 两变体（S0=payload / adaptive S）lookup O(1)（`n_cmp=0`），与 index-only Φ 同阶，持平/反超 Chained Hash，远优于 Tree(O(log N)) 与 FIFO(O(N))。
-- ✅ **可主张**：reorder 增量对所有方法**对称**（非 PSN 特有劣势）。
-- ❌ **不可主张**：reorder 是 PSN 的短板（数据对称，属全方法共担的排序成本）。
+- ✅ **可主张**：PSN Mapping 两变体（S0=payload / adaptive S）lookup O(1)（`n_cmp=0`），与 index-only Φ 同阶，持平/反超 Chained Hash，远优于 Tree(O(log N)) 与 FIFO(O(N))——指 GBN（retrieve_range，天然升序）。
+- ✅ **可主张**（SR，第 4B 升序契约）：retrieve_set 统一按 PSN 升序交付；fifo/hash 显式 qsort O(k log k)、tree 中序 O(N)、dynblock 扫槽 O(N)——小 N 下 tree/dynblock 零排序占优，大 N 下 hash 的 qsort 占优。
+- ❌ **不可主张**：PSN Mapping 在 SR 大 N（N≫k）下必胜 Hash（大 N 下 hash 的 O(k log k) qsort 快于 PSN 的 O(N) 扫槽；SR 非 PSN 主战场，PSN 主战场是 GBN 区间提取 O(1)）。
 
 ### exp2 — space（实机 bench，`sizeof` 实测）
 
-- ✅ **可主张**：弹性（adaptive S）利用率与最优基线 FIFO 差 **≤5%**（256B 档最大 4.46pp），且优于 Chained Hash / Balanced Tree。
-- ✅ **可主张**：fixed S=4096 在 256B 崩到 6.18%——弹性槽大小机制的价值所在。
-- ❌ **不可主张**：弹性利用率最高（FIFO 更高，88.89% vs 84.43% @256B，如实写）。
+- ✅ **可主张**：弹性（adaptive S）利用率**反超**原最优基线 FIFO（256B +5.51pp、4096B +0.41pp，5 档全部反超），且优于 Chained Hash / Balanced Tree。
+- ✅ **可主张**：fixed S=4096 在 256B 崩到 6.23%——弹性槽大小机制的价值所在。
+- ❌ **不可主张**：弹性利用率「与 FIFO 有 ≤5% 劣势」——已反转（第 1 条删 24B 头后 stride=align16(S)），现为反超，须如实写反超。
 
 ### exp3 — elastic ablation（确定性模拟器 `sim/sim_main.c`，计数器 + 实机 rdtsc）
 
-- ✅ **可主张**：去滞后消融（k_dwell=1/ovf_thresh=1/j_quiet=1/hist_decay=2）对 256↔4096 ×16 快速振荡**全跟踪、零 drop、零 miss**（37 次 resize）；默认滞后缩得太晚 → `gen_switch` 延后 → 溢出打满 → 共丢 19656 包、393 个 NAK miss。
-- ⚠️ **重要边界**：这是**模拟器机制内的 drop**（溢出满 + `gen_switch` 延后丢弃，dynblock.c:110-112），**不是实测网络丢包**；drop/hit/miss 是 seed=42 固定下的确定性计数器，非多次采样。论文须写「simulation」，不得写「measured packet loss」。
-- ⚠️ **resize_ns 语义**：衡量 gen_switch 临界区耗时（pool mmap/munmap + 指针切换）。慢对照均值被 6 次振荡扩的**同步 munmap 旧 16.9MB 池**拉高（其 gen_switch 延后到 old_live 恰好归零的当次 store）；ablation 因提前一纪元排空、旧池在普通 store 里 `release_old_if_drained` 释放（不计时）。两者最终都 munmap 同一池，`resize_ns` 只表「临界区内峰值延迟」，非累计 mmap/munmap 总量（已在 exp3_numbers.md 注明）。
+- ✅ **可主张**：11 相位（每档稳定 16 纪元）下，去滞后消融（k_dwell=1/ovf_thresh=1/j_quiet=1/hist_decay=2）与默认滞后**都零 drop、零 miss**（hit_rate=1.0000，n_drop=0）；区别在收敛速度（降档：ablation 0.0 纪元 vs slow 1.4 纪元）与 resize 临界区成本（resize_ns mean：ablation 2188 vs slow 3715 ns）。
+- ⚠️ **重要边界**：这是**模拟器机制内的 drop/hit/miss**（溢出满 + `gen_switch` 延后丢弃，dynblock.c:110-112），**不是实测网络丢包**；drop/hit/miss 是 seed=42 固定下的确定性计数器，非多次采样。论文须写「simulation」，不得写「measured packet loss」。
+- ⚠️ **resize_ns 语义**：衡量 gen_switch 临界区耗时（pool mmap/munmap + 指针切换）。慢对照均值被降档收缩的**同步 munmap 旧池**拉高（其 gen_switch 延后到 old_live 恰好归零的当次 store）；ablation 因 j_quiet=1/k_dwell=1 提前一纪元排空、旧池在普通 store 里 `release_old_if_drained` 释放（不计时）。两者最终都 munmap 同一池，`resize_ns` 只表「临界区内峰值延迟」，非累计 mmap/munmap 总量（已在 exp3_numbers.md 注明）。
 - ❌ **不可主张**：drop 数可直接与 exp1/exp2 的计时数并列（一个是计数器、一个是 ns）。
 
 ---
@@ -120,4 +120,4 @@ $ ./build/sim --out-dir=out/exp3_slow     --e3-preset=default
 
 ## 6. 一句话总结（可写进论文的诚实表述）
 
-> 在实机（Ubuntu 22.04 / i7-14700K）上，PSN 映射的重传缓存**存/取均为 O(1)**（存大包反超 FIFO、取持平/反超链式哈希），**空间利用率与最优有界 FIFO 相差 ≤5%** 且优于哈希/树；确定性模拟器显示**去滞后弹性消融对 256↔4096 快速振荡零丢包全跟踪**，而默认滞后在振荡下丢 19656 包——证明弹性槽大小 + 去滞后旋钮是稳定性的关键。所有计时为单机 CPU 微基准（p50），网络丢包为模拟器计数器（非实测）。
+> 在实机（Ubuntu 22.04 / i7-14700K）上，PSN 映射的重传缓存**存/取均为 O(1)**（存与 FIFO/Hash 同阶、取持平/反超链式哈希），**空间利用率反超最优有界 FIFO**（5 档 MTU 全部反超）且优于哈希/树；确定性模拟器显示 11 相位（每档稳定 16 纪元）下**去滞后消融与默认滞后都零丢包零 miss**，区别在收敛速度与 resize 临界区成本——证明弹性槽大小机制的空间与时间收益。所有计时为单机 CPU 微基准（p50），网络丢包为模拟器计数器（非实测）。

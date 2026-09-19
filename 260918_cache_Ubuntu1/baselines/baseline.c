@@ -15,10 +15,7 @@
  * 复用节点首 8 字节（fifo/hash 的 next、avl 的 l）作空闲链表 next 指针，节点结构不改
  * （fifo/hash 仍 32B、avl 56B（本版加父指针）⇒ warmup 尺寸表用 sizeof 自适应，不硬编码）。 */
 
-typedef struct {
-    uint8_t *mem;    /* 一次性大块（node_pool_free 用） */
-    void    *head;   /* 空闲链表头 */
-} node_pool_t;
+/* node_pool_t 定义已上移 baseline.h（b_cache.pool 指向它）。此处只保留池操作 + 分配原语。 */
 
 static void pool_init(node_pool_t *p, uint32_t n, size_t node_size) {
     p->mem = (uint8_t *)malloc((size_t)n * node_size);
@@ -41,9 +38,25 @@ static void pool_put(node_pool_t *p, void *node) {
 }
 static void node_pool_free(node_pool_t *p) { free(p->mem); p->mem = NULL; p->head = NULL; }
 
+/* ---- 第 5 条：分配策略正交原语 ----
+ * pooled   ：从预分配空闲链表取/还（零 malloc，n_malloc 恒 0）。
+ * perstore ：逐 store malloc(sizeof(node)+len)、淘汰 free()（n_malloc/n_free 如实计数）。
+ * 唯一变量=分配策略；容量 N、淘汰顺序、索引结构全部不变。 */
+static void *node_alloc(b_cache_t *bc, size_t nbytes) {
+    if (bc->perstore) { bc->n_malloc++; return malloc(nbytes); }
+    return pool_get(bc->pool);
+}
+static void node_release(b_cache_t *bc, void *node) {
+    if (bc->perstore) { bc->n_free++; free(node); return; }
+    pool_put(bc->pool, node);
+}
+
 /* ================= 通用 GBN/SR 重传（定位 + memcpy 全过程） =================
- * 所有无界与 *_bounded 基线共用：按 PSN 逐包 retrieve + memcpy。
- * psn_dynblock 用自己的 conn_retransmit_range/set（同为逐包 conn_lookup 循环，公平）。 */
+ * GBN（retrieve_range）：按 PSN 逐包 retrieve + memcpy（各结构天然升序，无需排序）。
+ * SR（retrieve_set，第 4B 统一交付契约「按 PSN 升序」）：三种口径——
+ *   fifo/hash 无天然 PSN 序 ⇒ 显式 qsort（sorted_retrieve_set）；
+ *   tree 中序遍历天然升序 ⇒ 零排序（tree_retrieve_set / tree_bounded_retrieve_set）；
+ *   psn_dynblock 位置映射 ⇒ 零排序按 PSN 序扫槽（conn_retransmit_set，见 dynblock.c）。 */
 
 static uint32_t generic_retrieve_range(b_cache_t *bc, uint32_t start, uint32_t count,
                                        uint8_t *out, uint32_t out_cap) {
@@ -58,17 +71,30 @@ static uint32_t generic_retrieve_range(b_cache_t *bc, uint32_t start, uint32_t c
     }
     return w;
 }
-static uint32_t generic_retrieve_set(b_cache_t *bc, const uint32_t *psns, uint32_t n,
-                                     uint8_t *out, uint32_t out_cap) {
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* SR（第 4B）：fifo / hash / index_only 无天然 PSN 序，必须显式排序后逐包 retrieve。 */
+static uint32_t sorted_retrieve_set(b_cache_t *bc, const uint32_t *psns, uint32_t n,
+                                    uint8_t *out, uint32_t out_cap) {
+    if (n == 0) return 0;
+    uint32_t *s = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+    if (!s) return 0;
+    memcpy(s, psns, (size_t)n * sizeof(uint32_t));
+    qsort(s, n, sizeof(uint32_t), cmp_u32);
     uint32_t w = 0;
     for (uint32_t k = 0; k < n; k++) {
         uint32_t len = 0;
-        const uint8_t *p = bc->ops.retrieve(bc, psns[k], &len);
+        const uint8_t *p = bc->ops.retrieve(bc, s[k], &len);
         if (!p) continue;
         if (w + len > out_cap) break;
         memcpy(out + w, p, len);
         w += len;
     }
+    free(s);
     return w;
 }
 
@@ -121,7 +147,7 @@ b_cache_t *make_fifo(void) {
     f->base.ops.store = fifo_store;
     f->base.ops.retrieve = fifo_retrieve;
     f->base.ops.retrieve_range = generic_retrieve_range;
-    f->base.ops.retrieve_set = generic_retrieve_set;
+    f->base.ops.retrieve_set = sorted_retrieve_set;
     f->base.ops.destroy = fifo_destroy;
     return &f->base;
 }
@@ -141,10 +167,10 @@ static void fifo_bounded_store(b_cache_t *bc, uint32_t psn, const uint8_t *p, ui
         fifo_node_t *old = f->head;
         f->head = old->next;
         if (!f->head) f->tail = NULL;
-        pool_put(&f->pool, old);
+        node_release(bc, old);
         bc->n_live--;
     }
-    fifo_node_t *n = (fifo_node_t *)pool_get(&f->pool);
+    fifo_node_t *n = (fifo_node_t *)node_alloc(bc, sizeof(*n) + (size_t)len);
     n->next = NULL;
     n->hdr.psn = psn;
     n->hdr.data_len = (int32_t)len;
@@ -166,22 +192,35 @@ static const uint8_t *fifo_bounded_retrieve(b_cache_t *bc, uint32_t psn, uint32_
 
 static void fifo_bounded_destroy(b_cache_t *bc) {
     fifo_bounded_t *f = (fifo_bounded_t *)bc;
+    if (bc->perstore) {                       /* perstore：驻留节点逐个 free（pooled 由池整体释放） */
+        fifo_node_t *n = f->head;
+        while (n) { fifo_node_t *nx = n->next; free(n); n = nx; }
+    }
     node_pool_free(&f->pool);
     free(f);
 }
 
-b_cache_t *make_fifo_bounded(uint32_t capacity, uint32_t payload_len) {
+static b_cache_t *make_fifo_bounded_impl(uint32_t capacity, uint32_t payload_len, int perstore) {
     fifo_bounded_t *f = (fifo_bounded_t *)calloc(1, sizeof(*f));
-    f->base.name = "fifo_bounded";
+    f->base.name = perstore ? "fifo_perstore" : "fifo_bounded";
     f->base.ops.store = fifo_bounded_store;
     f->base.ops.retrieve = fifo_bounded_retrieve; /* 同为线性扫描（但 head 偏移不同，需专用实现） */
     f->base.ops.retrieve_range = generic_retrieve_range;
-    f->base.ops.retrieve_set = generic_retrieve_set;
+    f->base.ops.retrieve_set = sorted_retrieve_set;
     f->base.ops.destroy = fifo_bounded_destroy;
+    f->base.perstore = perstore;
+    f->base.pool = &f->pool;
     f->cap = capacity;
     f->payload_len = payload_len;
-    pool_init(&f->pool, capacity, sizeof(fifo_node_t) + (size_t)payload_len);
+    if (!perstore)
+        pool_init(&f->pool, capacity, sizeof(fifo_node_t) + (size_t)payload_len);
     return &f->base;
+}
+b_cache_t *make_fifo_bounded(uint32_t capacity, uint32_t payload_len) {
+    return make_fifo_bounded_impl(capacity, payload_len, 0);
+}
+b_cache_t *make_fifo_perstore(uint32_t capacity, uint32_t payload_len) {
+    return make_fifo_bounded_impl(capacity, payload_len, 1);
 }
 
 /* ================= Chained hash（Knuth 乘法哈希，取高位） ================= */
@@ -242,7 +281,7 @@ b_cache_t *make_chained_hash(uint32_t nbuckets) {
     h->base.ops.store = hash_store;
     h->base.ops.retrieve = hash_retrieve;
     h->base.ops.retrieve_range = generic_retrieve_range;
-    h->base.ops.retrieve_set = generic_retrieve_set;
+    h->base.ops.retrieve_set = sorted_retrieve_set;
     h->base.ops.destroy = hash_destroy;
     h->nb = nbuckets;
     h->bkt = (hash_node_t **)calloc(nbuckets, sizeof(hash_node_t *));
@@ -268,11 +307,11 @@ static void hash_bounded_store(b_cache_t *bc, uint32_t psn, const uint8_t *p, ui
         hash_node_t **pp = &h->bkt[b];
         while (*pp && *pp != old) pp = &(*pp)->next;
         if (*pp == old) *pp = old->next;
-        pool_put(&h->pool, old);
+        node_release(bc, old);
     } else {
         bc->n_live++;                            /* 位置空：首次填充，驻留 +1（替换路径驻留不变） */
     }
-    hash_node_t *n = (hash_node_t *)pool_get(&h->pool);
+    hash_node_t *n = (hash_node_t *)node_alloc(bc, sizeof(*n) + (size_t)len);
     n->hdr.psn = psn;
     n->hdr.data_len = (int32_t)len;
     n->hdr.recv_stamp = 0;
@@ -294,27 +333,43 @@ static const uint8_t *hash_bounded_retrieve(b_cache_t *bc, uint32_t psn, uint32_
 
 static void hash_bounded_destroy(b_cache_t *bc) {
     hash_bounded_t *h = (hash_bounded_t *)bc;
+    if (bc->perstore) {                       /* perstore：逐桶 free 驻留节点 */
+        for (uint32_t b = 0; b < h->nb; b++) {
+            hash_node_t *n = h->bkt[b];
+            while (n) { hash_node_t *nx = n->next; free(n); n = nx; }
+        }
+    }
     node_pool_free(&h->pool);
     free(h->slot_owner);
     free(h->bkt);
     free(h);
 }
 
-b_cache_t *make_chained_hash_bounded(uint32_t capacity, uint32_t nbuckets, uint32_t payload_len) {
+static b_cache_t *make_chained_hash_bounded_impl(uint32_t capacity, uint32_t nbuckets,
+                                                 uint32_t payload_len, int perstore) {
     hash_bounded_t *h = (hash_bounded_t *)calloc(1, sizeof(*h));
-    h->base.name = "chained_hash_bounded";
+    h->base.name = perstore ? "chained_hash_perstore" : "chained_hash_bounded";
     h->base.ops.store = hash_bounded_store;
     h->base.ops.retrieve = hash_bounded_retrieve; /* 同为桶查找（专用实现，避免布局耦合） */
     h->base.ops.retrieve_range = generic_retrieve_range;
-    h->base.ops.retrieve_set = generic_retrieve_set;
+    h->base.ops.retrieve_set = sorted_retrieve_set;
     h->base.ops.destroy = hash_bounded_destroy;
+    h->base.perstore = perstore;
+    h->base.pool = &h->pool;
     h->nb = nbuckets;
     h->cap = capacity;
     h->payload_len = payload_len;
     h->bkt = (hash_node_t **)calloc(nbuckets, sizeof(hash_node_t *));
     h->slot_owner = (hash_node_t **)calloc(capacity, sizeof(hash_node_t *));
-    pool_init(&h->pool, capacity, sizeof(hash_node_t) + (size_t)payload_len);
+    if (!perstore)
+        pool_init(&h->pool, capacity, sizeof(hash_node_t) + (size_t)payload_len);
     return &h->base;
+}
+b_cache_t *make_chained_hash_bounded(uint32_t capacity, uint32_t nbuckets, uint32_t payload_len) {
+    return make_chained_hash_bounded_impl(capacity, nbuckets, payload_len, 0);
+}
+b_cache_t *make_chained_hash_perstore(uint32_t capacity, uint32_t nbuckets, uint32_t payload_len) {
+    return make_chained_hash_bounded_impl(capacity, nbuckets, payload_len, 1);
 }
 
 /* ================= AVL balanced tree ================= */
@@ -444,6 +499,30 @@ static avl_node_t *avl_remove_ptr(avl_node_t *root, avl_node_t *z) {
     return root;
 }
 
+/* ---- SR 升序交付（第 4B）：AVL 中序遍历天然升序，成员判定用 psn_set（无比较排序） ---- */
+static int tree_emit_inorder(avl_node_t *n, const psn_set_t *hs,
+                             uint8_t *out, uint32_t out_cap, uint32_t *w) {
+    if (!n) return 1;
+    if (!tree_emit_inorder(n->l, hs, out, out_cap, w)) return 0;
+    if (psn_set_has(hs, n->hdr.psn)) {
+        uint32_t len = (uint32_t)n->hdr.data_len;
+        if (*w + len > out_cap) return 0;       /* 截断：停止后续交付（与 sorted 路径语义一致） */
+        memcpy(out + *w, n->data, len);
+        *w += len;
+    }
+    return tree_emit_inorder(n->r, hs, out, out_cap, w);
+}
+static uint32_t tree_set_from_root(avl_node_t *root, const uint32_t *psns, uint32_t n,
+                                   uint8_t *out, uint32_t out_cap) {
+    if (n == 0) return 0;
+    psn_set_t hs; psn_set_init(&hs, n);
+    for (uint32_t k = 0; k < n; k++) psn_set_insert(&hs, psns[k]);
+    uint32_t w = 0;
+    tree_emit_inorder(root, &hs, out, out_cap, &w);
+    psn_set_free(&hs);
+    return w;
+}
+
 static void tree_store(b_cache_t *bc, uint32_t psn, const uint8_t *p, uint32_t len) {
     tree_t *t = (tree_t *)bc;
     t->root = avl_insert_new(bc, t->root, psn, len, p);
@@ -458,6 +537,11 @@ static const uint8_t *tree_retrieve(b_cache_t *bc, uint32_t psn, uint32_t *out_l
         n = (psn < n->hdr.psn) ? n->l : n->r;
     }
     return NULL;
+}
+
+static uint32_t tree_retrieve_set(b_cache_t *bc, const uint32_t *psns, uint32_t n,
+                                  uint8_t *out, uint32_t out_cap) {
+    return tree_set_from_root(((tree_t *)bc)->root, psns, n, out, out_cap);
 }
 
 static void tree_free_nodes(avl_node_t *n) {
@@ -478,7 +562,7 @@ b_cache_t *make_balanced_tree(void) {
     t->base.ops.store = tree_store;
     t->base.ops.retrieve = tree_retrieve;
     t->base.ops.retrieve_range = generic_retrieve_range;
-    t->base.ops.retrieve_set = generic_retrieve_set;
+    t->base.ops.retrieve_set = tree_retrieve_set;
     t->base.ops.destroy = tree_destroy;
     return &t->base;
 }
@@ -500,10 +584,10 @@ static void tree_bounded_store(b_cache_t *bc, uint32_t psn, const uint8_t *p, ui
         avl_node_t *old = t->fifo_node[t->head];
         t->head = (t->head + 1) % t->cap;
         t->root = avl_remove_ptr(t->root, old);
-        pool_put(&t->pool, old);
+        node_release(bc, old);
         bc->n_live--;
     }
-    avl_node_t *n = (avl_node_t *)pool_get(&t->pool);
+    avl_node_t *n = (avl_node_t *)node_alloc(bc, sizeof(*n) + (size_t)len);
     n->l = n->r = n->p = NULL; n->h = 1;
     n->hdr.psn = psn;
     n->hdr.data_len = (int32_t)len;
@@ -525,26 +609,41 @@ static const uint8_t *tree_bounded_retrieve(b_cache_t *bc, uint32_t psn, uint32_
     return NULL;
 }
 
+static uint32_t tree_bounded_retrieve_set(b_cache_t *bc, const uint32_t *psns, uint32_t n,
+                                          uint8_t *out, uint32_t out_cap) {
+    return tree_set_from_root(((tree_bounded_t *)bc)->root, psns, n, out, out_cap);
+}
+
 static void tree_bounded_destroy(b_cache_t *bc) {
     tree_bounded_t *t = (tree_bounded_t *)bc;
+    if (bc->perstore) tree_free_nodes(t->root);  /* perstore：递归 free 驻留节点（pooled 由池整体释放） */
     free(t->fifo_node);
     node_pool_free(&t->pool);
     free(t);
 }
 
-b_cache_t *make_balanced_tree_bounded(uint32_t capacity, uint32_t payload_len) {
+static b_cache_t *make_balanced_tree_bounded_impl(uint32_t capacity, uint32_t payload_len, int perstore) {
     tree_bounded_t *t = (tree_bounded_t *)calloc(1, sizeof(*t));
-    t->base.name = "balanced_tree_bounded";
+    t->base.name = perstore ? "balanced_tree_perstore" : "balanced_tree_bounded";
     t->base.ops.store = tree_bounded_store;
     t->base.ops.retrieve = tree_bounded_retrieve; /* 同为 AVL 查找（专用实现，避免布局耦合） */
     t->base.ops.retrieve_range = generic_retrieve_range;
-    t->base.ops.retrieve_set = generic_retrieve_set;
+    t->base.ops.retrieve_set = tree_bounded_retrieve_set;
     t->base.ops.destroy = tree_bounded_destroy;
+    t->base.perstore = perstore;
+    t->base.pool = &t->pool;
     t->cap = capacity;
     t->payload_len = payload_len;
     t->fifo_node = (avl_node_t **)calloc(capacity, sizeof(avl_node_t *));
-    pool_init(&t->pool, capacity, sizeof(avl_node_t) + (size_t)payload_len);
+    if (!perstore)
+        pool_init(&t->pool, capacity, sizeof(avl_node_t) + (size_t)payload_len);
     return &t->base;
+}
+b_cache_t *make_balanced_tree_bounded(uint32_t capacity, uint32_t payload_len) {
+    return make_balanced_tree_bounded_impl(capacity, payload_len, 0);
+}
+b_cache_t *make_balanced_tree_perstore(uint32_t capacity, uint32_t payload_len) {
+    return make_balanced_tree_bounded_impl(capacity, payload_len, 1);
 }
 
 /* ================= 测试辅助：AVL 不变式校验 =================
@@ -565,7 +664,8 @@ static void verify_avl_inorder(avl_node_t *n, uint32_t *prev, int *first, int *o
 }
 
 int baseline_tree_verify(b_cache_t *bc) {
-    if (strcmp(bc->name, "balanced_tree_bounded") != 0) return 0;  /* 非 tree：无不变式 */
+    if (strcmp(bc->name, "balanced_tree_bounded") != 0 &&
+        strcmp(bc->name, "balanced_tree_perstore") != 0) return 0;  /* 非 tree：无不变式 */
     tree_bounded_t *t = (tree_bounded_t *)bc;
     if (t->root && t->root->p != NULL) return -1;  /* 根父指针必须为 NULL */
     uint32_t prev = 0; int first = 1, ok = 1;
@@ -581,9 +681,13 @@ typedef struct {
 
 static void dynblock_store(b_cache_t *bc, uint32_t psn, const uint8_t *p, uint32_t len) {
     dynblock_t *d = (dynblock_t *)bc;
-    uint64_t mb = d->conn.n_ovf_malloc, rb = d->conn.n_resize;
+    uint64_t mb = d->conn.n_ovf_malloc + d->conn.n_malloc, rb = d->conn.n_resize;
+    uint64_t fb = d->conn.n_free;
     conn_store(&d->conn, psn, p, (uint16_t)len);
-    bc->n_malloc += d->conn.n_ovf_malloc - mb;   /* exp1a 环路径：恒 0 */
+    /* pooled：环路径槽 malloc 恒 0，n_malloc 只记溢出 malloc（tier 包下也恒 0）。
+     * perstore：n_malloc 记逐槽 malloc + 溢出 malloc；n_free 记逐槽淘汰 free。 */
+    bc->n_malloc += (d->conn.n_ovf_malloc + d->conn.n_malloc) - mb;
+    bc->n_free   += d->conn.n_free - fb;
     bc->n_resize += d->conn.n_resize - rb;       /* exp1a adaptive_enable=0：恒 0 */
 }
 
@@ -615,7 +719,7 @@ static void dynblock_destroy(b_cache_t *bc) {
 
 b_cache_t *make_dynblock(const cfg_t *cfg, uint32_t mtu_from_cm) {
     dynblock_t *d = (dynblock_t *)calloc(1, sizeof(*d));
-    d->base.name = "psn_dynblock";
+    d->base.name = cfg->alloc_mode ? "psn_dynblock_perstore" : "psn_dynblock";
     d->base.ops.store = dynblock_store;
     d->base.ops.retrieve = dynblock_retrieve;
     d->base.ops.retrieve_range = dynblock_retrieve_range;
@@ -627,7 +731,7 @@ b_cache_t *make_dynblock(const cfg_t *cfg, uint32_t mtu_from_cm) {
 
 /* 读 dynblock 当前块大小 S（收敛阶段记录用；非 dynblock 返回 0）。 */
 uint32_t dynblock_cur_S(const b_cache_t *bc) {
-    if (strcmp(bc->name, "psn_dynblock") != 0) return 0;
+    if (strcmp(bc->name, "psn_dynblock") != 0 && strcmp(bc->name, "psn_dynblock_perstore") != 0) return 0;
     return ((dynblock_t *)bc)->conn.S;
 }
 
@@ -667,7 +771,7 @@ b_cache_t *make_index_only(uint32_t N) {
     io->base.ops.store = index_only_store;
     io->base.ops.retrieve = index_only_retrieve;
     io->base.ops.retrieve_range = generic_retrieve_range;
-    io->base.ops.retrieve_set = generic_retrieve_set;
+    io->base.ops.retrieve_set = sorted_retrieve_set;
     io->base.ops.destroy = index_only_destroy;
     io->N = N;
     io->meta = (uint32_t *)calloc(N, sizeof(uint32_t));
@@ -702,7 +806,7 @@ uint64_t cache_footprint_bytes(const b_cache_t *bc) {
         bytes += (uint64_t)c->N * sizeof(slot_meta_t);                    /* meta */
         bytes += (uint64_t)c->cfg->ovf_cap * sizeof(ovf_entry_t);         /* 溢出数组 */
         for (uint32_t oi = 0; oi < c->cfg->ovf_cap; oi++)                 /* 溢出块实占（tier 包=0） */
-            if (c->ovf[oi].used) bytes += align16(HDR_SZ + c->ovf[oi].len);
+            if (c->ovf[oi].used) bytes += align16(c->ovf[oi].len);
         return bytes;
     }
     if (strcmp(bc->name, "index_only") == 0) {

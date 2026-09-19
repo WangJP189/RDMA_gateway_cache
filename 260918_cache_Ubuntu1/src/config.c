@@ -51,6 +51,7 @@ static const field_t FIELDS[] = {
     F(single_thread,          T_U32,   1),
     F(pool_use_mmap,          T_U32,   1),
     F(order_guard,            T_U32,   1),
+    F(alloc_mode,             T_U32,   1),
     F(sim_link_gbps,          T_U32,   1),
     F(sim_pend_cap,           T_U32,   1),
     /* ---- 计时/复现 ---- */
@@ -171,6 +172,7 @@ void cfg_default(cfg_t *c) {
     c->single_thread = CFG_SINGLE_THREAD;
     c->pool_use_mmap = CFG_POOL_USE_MMAP;
     c->order_guard = CFG_ORDER_GUARD;
+    c->alloc_mode = CFG_ALLOC_MODE;
     c->sim_link_gbps = CFG_SIM_LINK_GBPS;
     c->sim_pend_cap = CFG_SIM_PEND_CAP;
 
@@ -544,6 +546,12 @@ static uint32_t loss_mode_val(const char *v) {
     return (uint32_t)strtoul(v, NULL, 0);
 }
 
+static uint32_t alloc_mode_val(const char *v) {
+    if (!strcmp(v, "pooled")) return 0;
+    if (!strcmp(v, "perstore")) return 1;
+    return (uint32_t)strtoul(v, NULL, 0);
+}
+
 static void e3_preset(cfg_t *c, const char *v) {
     static const cfg_phase_t phase_a[] = CFG_E3_PHASES;
     static const cfg_phase_t phase_mixed[] = CFG_E3_MIXED_PHASES;
@@ -607,6 +615,7 @@ static void cfg_print_usage(const char *prog) {
     printf("  数组字段用逗号分隔，如 --sc-new=128,256,1024\n");
     printf("  枚举/预设:\n");
     printf("    --e3-nak-mode=sr|gbn|mixed    --sim-loss-mode=uniform|ge\n");
+    printf("    --alloc-mode=pooled|perstore  分配策略（第 5 条正交矩阵）\n");
     printf("    --e3-preset=default|mixed|ablate|slow   --e3-phases=a,b;c,d;...\n");
     printf("    --out=<dir>                   输出目录\n");
 }
@@ -630,6 +639,7 @@ int cfg_override_cli(cfg_t *c, int argc, char **argv) {
         if (!strcmp(keybuf, "help") || !strcmp(keybuf, "h")) { cfg_print_usage(argv[0]); return 0; }
         if (!strcmp(keybuf, "e3-nak-mode"))  { c->e3_nak_mode = nak_mode_val(val); continue; }
         if (!strcmp(keybuf, "sim-loss-mode")){ c->sim_loss_mode = loss_mode_val(val); continue; }
+        if (!strcmp(keybuf, "alloc-mode"))   { c->alloc_mode = alloc_mode_val(val); continue; }
         if (!strcmp(keybuf, "e3-preset"))    { e3_preset(c, val); continue; }
         if (!strcmp(keybuf, "out"))          { snprintf(keybuf, sizeof(keybuf), "out_dir"); }
         const field_t *f = field_by_cli(keybuf);
