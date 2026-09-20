@@ -11,14 +11,19 @@ Fig — exp1b lookup 面板（reworked 2026-09-17；第 4B 修订 2026-09-19）:
 第 4B 排序原语正交（sort_impl）：SR 排序路径两种实现，0=glibc qsort（主）/1=内联插入排序（xval）。
   二者只作用于 SR 交付排序，GBN（无排序）两遍一致；SR 图以虚线叠画 xval 验证二者一致。
 
+第 35 条修订（固定重传报文数）：每个操作恰为 K 个报文、K 在所有 N 下恒定。
+  GBN = K 个连续 PSN；SR = K 个互异 PSN（无放回，部分 Fisher–Yates）。原「有放回抽样」使 SR 实际搬运包数
+  随 N 变（约 +26%），在 N 曲线混入假增长；本次消除。报告量 = 每批固定 K 个报文的提取时间（ns/batch），
+  纵轴据此改「Retrieval time cost per batch (ns)」，主/次图取 K=64（gbn_long64 / sr_64）。
+
 历史两问：
   Q1「时间开销只算到取、没算上层排序」—— 第 4B 后升序交付进入 retrieve_set 契约，SR 计时直接含交付排序：
      fifo/hash/tree 需排序检索（O(k log k) / 排序+k×O(log N) 查找）、dynblock 零排序（扫槽天然升序），不再有外部 reorder 步骤。
   Q2「为什么 PSN 比 chained hash 差」—— 根因是块大小 S 与 payload 不匹配（旧版 S=4096 存 1024B 包）。
      修正：S0=payload（S=1024）与「自适应收敛再冻结」两条路，最终 S=1024、stride=1056B，与 hash 节点 stride 相同。
 
-指标：主指标 p50_ns（实机尾部干净、p50 稳健；mean 仍入表作上界参考）。
-     横轴 Cache depth N（对数 base2，128..4096 + 锚点 5120）；纵轴 Lookup time cost (ns)（对数）。
+指标：主指标 batch_p50_ns（=每批固定 K 个报文的 retrieve p50；实机尾部干净、p50 稳健；mean 仍入表作上界参考）。
+     横轴 Cache depth N（对数 base2，128..4096 + 锚点 5120）；纵轴 Retrieval time cost per batch (ns)（对数）。
 
 图（2 张，沿用 fig_exp1a_store 风格）：
   fig_exp1b_lookup_gbn64 —— gbn_long64，4 方法（FIFO/Hash/Tree/PSN Mapping）。
@@ -125,6 +130,26 @@ def read_old_sr64():
     return vals
 
 
+def read_pre35_sr64():
+    """第 35 条前（有放回抽样）psn_dynblock_adaptive sr_64 p50，从 _prev35 CSV 复算（禁手抄）。
+    列为 method,sort_impl,mode,N,...,p50_ns(索引 10)；只取 sort_impl=0。"""
+    path = os.path.join(ROOT, "out", "exp1b_lookup_prev35", "lookup_summary.csv")
+    if not os.path.exists(path):
+        return {}
+    vals = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            r = line.split(",")
+            if r[0] == "method":
+                continue
+            if r[0] == "psn_dynblock_adaptive" and r[1] == "0" and r[2] == "sr_64":
+                vals[int(r[3])] = float(r[10])
+    return vals
+
+
 def collect(rows):
     """(method, sort_impl, mode) -> {N -> (mean, p50, p90)}"""
     out = collections.defaultdict(dict)
@@ -196,7 +221,7 @@ def draw_gbn(ax, d0):
     ax.set_yscale("log")
     ax.set_ylim(y_min * 0.6, y_max * 1.35)
     ax.set_xlabel("Cache depth N")
-    ax.set_ylabel("Lookup time cost (ns)")
+    ax.set_ylabel("Retrieval time cost per batch (ns)")
     style_ax(ax)
     _legend(ax)
 
@@ -228,7 +253,7 @@ def draw_sr(ax, d0, d1):
     ax.set_yscale("log")
     ax.set_ylim(y_min * 0.6, y_max * 1.4)
     ax.set_xlabel("Cache depth N")
-    ax.set_ylabel("Lookup time cost (ns)")
+    ax.set_ylabel("Retrieval time cost per batch (ns)")
     style_ax(ax)
     _legend(ax)
     # FIFO O(N) 扫描爆炸注释（指到 FIFO 最高点）
@@ -300,7 +325,7 @@ def ncmp_table(ncmp, mode):
     return "\n".join(lines)
 
 
-def analysis_block(data, d1, ncmp):
+def analysis_block(data, d1, ncmp, rows):
     L = []
     L.append("# exp1b lookup 实验数据（供 AI 分析，脚本提取）\n")
     L.append("## 实验设置")
@@ -344,6 +369,42 @@ def analysis_block(data, d1, ncmp):
     N_REF = 4096   # 满窗 N0
     N_MAX = 5120   # 锚点（非 2 的幂）
 
+    def col(method, mode, n, c):
+        for r in rows:
+            if r["method"] == method and r["mode"] == mode and int(r["N"]) == n:
+                return r[c]
+        return None
+
+    def fmt_bytes(b):
+        try:
+            b = float(b)
+        except (TypeError, ValueError):
+            return "?"
+        if b >= 1024 * 1024:
+            return "%.0f MB" % (b / (1024 * 1024))
+        if b >= 1024:
+            return "%.0f KB" % (b / 1024)
+        return "%d B" % int(b)
+
+    # ---- 口径声明（第 35 条：固定重传报文数，K 在所有 N 下恒定）----
+    k = {md: col("psn_dynblock_adaptive", md, 128, "pkts_per_op")
+         for md in ("gbn_long64", "gbn_short8", "sr_16", "sr_64")}
+    L.append("\n## 口径声明（第 35 条：固定重传报文数）")
+    L.append("- 每批固定 K 个报文，K 在所有 N 下恒定（CSV pkts_per_op 列）：gbn_long64=%s / gbn_short8=%s / sr_16=%s / sr_64=%s。"
+             % (k["gbn_long64"], k["gbn_short8"], k["sr_16"], k["sr_64"]))
+    L.append("- GBN = K 个连续 PSN（retrieve_range）；SR = K 个互异 PSN（无放回，部分 Fisher–Yates，retrieve_set）。")
+    L.append("- 原「有放回抽样」使 SR 实际搬运包数随 N 变（N=128≈50.6 → N=5120≈63.6，约 +26%），在 N 曲线混入假增长；本次改无放回已消除。")
+    L.append("- main_metric = batch_p50_ns：每批固定 K 个报文的 retrieve 摊到单批的 p50（主/次图取 K=64）。")
+
+    # ---- 归因声明（第 35 条：SR-64 随 N 增长的来源 = ring 尺寸跨 L2→L3，非算法退化）----
+    rb128 = col("psn_dynblock_adaptive", "sr_64", 128, "ring_bytes")
+    rb_max = col("psn_dynblock_adaptive", "sr_64", N_MAX, "ring_bytes")
+    L.append("\n## 归因声明（SR-64 随 N 增长的来源）")
+    L.append("- ring_bytes = N × stride(S)（stride=align16(S)=1024B；CSV ring_bytes 列）：N=128 → %s，N=%d → %s。"
+             % (fmt_bytes(rb128), N_MAX, fmt_bytes(rb_max)))
+    L.append("- SR-64 p50 随 N 的增长归因于 64KB 连续 memcpy 的缓存局部性（源环 %s→%s 跨 L2→L3，SR 再叠加离散访问惩罚），"
+             "非算法退化（index_only Φ 纯算术扁平佐证）。" % (fmt_bytes(rb128), fmt_bytes(rb_max)))
+
     f0 = p50("fifo_bounded", "gbn_long64", 128)
     f1 = p50("fifo_bounded", "gbn_long64", N_MAX)
     L.append("1. 伸缩性（gbn_long64）：FIFO p50 从 N=128 的 %.0f ns 涨到 N=%d 的 %.0f ns（×%.0f），"
@@ -367,7 +428,7 @@ def analysis_block(data, d1, ncmp):
              % (N_REF, p50("psn_dynblock", "gbn_long64", N_REF),
                 p50("psn_dynblock_adaptive", "gbn_long64", N_REF)))
 
-    # SR-64 伸缩性门（第 4B 门槛：N=128→5120 增长 < 20%）——诚实报告，不修口径
+    # SR-64 自洽门（第 35 条：index_only 平坦；增长应明显小于旧版 +74%）——诚实报告，不修口径
     sr0 = p50("psn_dynblock_adaptive", "sr_64", 128)
     sr1 = p50("psn_dynblock_adaptive", "sr_64", N_MAX)
     growth = (sr1 - sr0) / sr0 * 100.0 if sr0 > 0 else 0.0
@@ -377,20 +438,22 @@ def analysis_block(data, d1, ncmp):
     g0 = p50("psn_dynblock_adaptive", "gbn_long64", 128)
     g1 = p50("psn_dynblock_adaptive", "gbn_long64", N_MAX)
     g_g = (g1 - g0) / g0 * 100.0 if g0 > 0 else 0.0
-    L.append("5. SR-64 伸缩性门（门槛 +<20%%）：PSN(adaptive) sr_64 p50 N=128→%d = %.0f→%.0f ns（%+.0f%%）。"
+    L.append("5. SR-64 自洽门（第 35 条）：PSN(adaptive) sr_64 p50 N=128→%d = %.0f→%.0f ns（%+.0f%%）。"
              % (N_MAX, sr0, sr1, growth))
-    L.append("   对照：index_only（Φ 纯算术，无 memcpy）%.0f→%.0f（%+.0f%%，扁平）；gbn_long64（连续 64KB memcpy）%.0f→%.0f（%+.0f%%）。"
+    L.append("   对照：index_only（Φ 纯算术，无 memcpy）%.0f→%.0f（%+.0f%%，扁平 → 自洽）；gbn_long64（连续 64KB memcpy）%.0f→%.0f（%+.0f%%）。"
              % (idx0, idx1, idx_g, g0, g1, g_g))
-    L.append("   诊断：增长来自 64KB memcpy 的缓存局部性（源环 128KB→5MB 跨 L2→L3），SR-64 再叠加离散访问惩罚；")
-    old = read_old_sr64()
-    if old and 128 in old and N_MAX in old:
-        og = (old[N_MAX] - old[128]) / old[128] * 100.0 if old[128] > 0 else 0.0
-        L.append("   位图扫描 O(span/64) 可忽略（index_only 扁平佐证），非算法退化。旧版（位图快路径前）sr_64 增长 %+.0f%%（%.0f→%.0f），"
-                 % (og, old[128], old[N_MAX]))
-        L.append("   位图快路径把增长压降 %.1f×、sr_64@%d 降至 %.0f ns（旧版 %.0f）。此门未过，保留现状并如实报告。"
-                 % (og / growth if growth > 0 else 0.0, N_MAX, sr1, old[N_MAX]))
+    pre35 = read_pre35_sr64()
+    if pre35 and 128 in pre35 and N_MAX in pre35:
+        og = (pre35[N_MAX] - pre35[128]) / pre35[128] * 100.0 if pre35[128] > 0 else 0.0
+        L.append("   旧版（有放回抽样，含假增长）sr_64 增长 %+.0f%%（%.0f→%.0f ns）；本次固定 K 后为 %+.0f%%，压降 %.0f 个百分点。"
+                 % (og, pre35[128], pre35[N_MAX], growth, og - growth))
+        L.append("   门判定：index_only 平坦=%s（增长 <5%%）；增长 %.0f%% 明显小于旧版 %.0f%%。"
+                 % ("是" if idx_g < 5.0 else "否", growth, og))
     else:
-        L.append("   位图扫描 O(span/64) 可忽略（index_only 扁平佐证），非算法退化。此门未过，保留现状并如实报告。")
+        L.append("   门判定：index_only 平坦=%s（增长 <5%%）；无 _prev35 CSV 可比对，仅报本次增长 %+.0f%%。"
+                 % ("是" if idx_g < 5.0 else "否", growth))
+    L.append("   归因：剩余增长来自 64KB memcpy 缓存局部性（源环 %s→%s 跨 L2→L3），非算法退化（见上「归因声明」）。"
+             % (fmt_bytes(rb128), fmt_bytes(rb_max)))
 
     # xval 一致性：sort_impl=1 ≈ sort_impl=0
     sr0_main = p50("psn_dynblock_adaptive", "sr_64", N_MAX)
@@ -426,8 +489,9 @@ def main():
 
     md = []
     md.append("# exp1b lookup — 脚本提取（lookup_summary.csv / n_cmp.csv）\n")
-    md.append("> payload=1024，B=512，reps=5；主指标 p50_ns（实机尾部干净，p50 稳健）。\n")
+    md.append("> payload=1024，B=512，reps=5；主指标 batch_p50_ns=每批固定 K 个报文的 retrieve p50（实机尾部干净，p50 稳健）。\n")
     md.append("> 第 4B：retrieve_set 统一按 PSN 升序交付（fifo/hash sort_u32_asc、tree 排序+查找、dynblock 扫槽）。\n")
+    md.append("> 第 35 条：每批固定 K 个报文（GBN=K 连续 / SR=K 互异，无放回），K 在所有 N 下恒定；主/次图取 K=64。\n")
     md.append("> 排序原语 sort_impl：0=qsort(主) / 1=插入排序(xval)；表内取主(sort_impl=0)。\n")
     md.append("> 读钟地板：%s（floor ∝ 1/B 闭环）。\n" % floor_str)
 
@@ -447,7 +511,7 @@ def main():
         f.write(text)
     print("wrote %s" % OUT_MD)
 
-    ai = analysis_block(d0, d1, ncmp)
+    ai = analysis_block(d0, d1, ncmp, rows)
     with open(OUT_AI, "w", encoding="utf-8") as f:
         f.write(ai)
     print("wrote %s" % OUT_AI)

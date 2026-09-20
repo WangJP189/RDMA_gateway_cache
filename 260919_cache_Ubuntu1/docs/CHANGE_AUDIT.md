@@ -31,6 +31,7 @@
 | 19 | 排序原语正交维度：`sort_u32_asc`（0=glibc qsort 主 / 1=内联插入排序 xval）；`e1b_sort_impl` 配置 + CSV `sort_impl` 列 | 2026-09-20 P1 排序原语交叉验证（证明排序路径结论不依赖 qsort 实现） | 中性（同一排序路径两原语，仅 SR 排序路径） | 是（sort_impl 列 + xval 一致性） |
 | 20 | `psn_dynblock_fixed` → `ring_fixed` 命名统一（exp1a/exp1b/exp2 全表 + 图） | 2026-09-20 P2 命名清理（论文术语「PSN fixed block (S=4096)」） | 中性（仅命名，机制语义一字未改） | 是 |
 | 21 | exp2 新列 `overhead_per_pkt` / `lower_bound_util` + 新实验 `exp2_tail`（尾包占比 f 敏感性，MTU=4096、N=4096） | 2026-09-20 P2 实验二(b)「单一全局 S 在尺寸尾下的稳定性」 | 中性（新指标/新工作量，不改任何方法口径） | 是 |
+| 22 | exp1b 查询生成器：SR 由「有放回抽样」改为 K 个互不相同的 PSN（部分 Fisher–Yates）；GBN 为 K 个连续 PSN；K 在所有 N 下恒定 | 重传语义下同一报文不会被重复请求；原实现使每次操作实际搬运包数随 N 变化（N=128≈50.6 个 vs N=5120≈63.6 个），在“N 曲线”里混入假增长 | 对己有利（消除对大 N 不利的抽样偏差，会压低 SR 增长）⇒ 必须如实披露 | 是（须写「每批固定 K 个报文」+ pkts_per_op 列） |
 
 ---
 
@@ -153,17 +154,46 @@ stride / pool 字节（N=4096，脚本计算）：
 - 新 bench `exp2_tail_sensitivity.c`：包尺寸 `(1-f)@MTU + f@U[1,MTU]`，f ∈ {0,0.01,0.03,0.06,0.10,0.20,0.30}，MTU=4096、N=4096；输出 `final_S/utilization/overhead_per_pkt/n_ovf_ins/n_drop/n_resize`。
 - 结论：弹性 S 被满 MTU 包钉在 4096，7 档 f 全程零扩缩/零溢出/零丢包，utilization 随 f 单调下降——单全局 S 在尺寸尾下稳定（graceful degradation）。
 
----
+### #22 exp1b 查询生成器固定重传报文数（第 35 条）
+
+- **改前缺陷**：SR 请求集由「有放回抽样」生成（`rng % N` 取 K 次），重复 PSN 被 `retrieve_set` 的位图/psn_set 折叠 ⇒ 每次操作**实际搬运的报文数随 N 变化**（有放回抽样下互异 PSN 数的 coupon-collector 期望：N=128≈50.6 个 vs N=5120≈63.6 个，差约 26%），在「N 曲线」里混入假增长（小 N 处被重复抽样压得偏低 ⇒ 放大了大 N 处的增长）。
+- **改法**（只改 `bench/exp1b_lookup.c` 与 `paper_figures/plot_exp1b_lookup.py`，机制一字未改）：
+  - SR：部分 Fisher–Yates 无放回抽样 K 个互异 PSN（每操作 K 次交换 + 逆序撤销恢复恒等，操作间独立），前置守卫 N ≥ K。
+  - GBN：`start = rng % (N-K+1)`，K 个连续 PSN，前置守卫 N-K+1 > 0。
+  - 查询序列 q 每 (N, mode) 生成一次、跨方法+sort_impl 复用、不进计时区间（公平性不变）。
+- **CSV 新列**：`pkts_per_op`=K（审计「K 不随 N 变」）、`ring_bytes`=N×stride(S)（非 dynblock=0）、`main_metric`=`batch_p50_ns`（语义标注 p50 为「每批 K 个报文」）。
+- **偏差方向**：对己有利（消除对大 N 不利的抽样偏差，会压低 SR 增长）⇒ 如实披露：旧版 sr_64 增长 **+74%**（864→1501 ns），本次固定 K 后 **+49%**（1122→1668 ns），压降 25 个百分点（约等于被消除的 ~26% 假增长——有放回抽样使互异 PSN 数随 N 从 ~50.6→~63.6）。
+- **证据**：5 验收门全过（见下「门（gate）结果」+ exp1b_lookup 控制台 GATE1..GATE5 原始输出）；`_prev35` 快照（有放回抽样版 CSV）保留可复核。
 
 ## 门（gate）结果（2026-09-20，如实报告）
 
-### SR-64 伸缩性门（第 4B/P1 门槛：N=128→5120 增长 < 20%）—— **未过**
+### SR-64 伸缩性门（第 4B/P1 门槛：N=128→5120 增长 < 20%）—— **未过（+74%）；#35 修正后仍 >20%（+47%），但假增长已剥离**
 
-- **实测**：PSN(adaptive S) sr_64 p50 N=128→5120 = 864→1501 ns（**+74%**），> 20% 门槛。
-- **对照**（同表，脚本计算）：index_only（Φ 纯算术，无 memcpy）1755→1778（**+1%**，扁平）；gbn_long64（连续 64KB memcpy）987→1292（**+31%**）。
-- **诊断**：增长来自 64KB memcpy 的缓存局部性（源环 128KB→5MB 跨 L2→L3），SR-64 再叠加离散访问惩罚；位图扫描 O(span/64) 可忽略（index_only 扁平佐证），**非算法退化**。
-- **旧版对比**：位图快路径前 sr_64 增长 **+972%**（1389→14886）；位图快路径把增长压降 **13.2×**、sr_64@5120 降至 1501 ns。
-- **处置**：**保留现状、如实报告，未改基准/未改口径**（纪律：「若任何门未通过，保留现状并报告失败点与诊断」）。完整诊断见 `out/exp1b_lookup/exp1b_analysis_data.md` 关键结论第 5 条。
+- **#35 前实测（有放回抽样，含假增长）**：PSN(adaptive S) sr_64 p50 N=128→5120 = 864→1501 ns（**+74%**），> 20% 门槛。
+- **#35 后实测（固定 K=64，无放回）**：1122→1668 ns（**+49%**）。压降 25 个百分点，约等于被消除的「有放回抽样」假增长（互异 PSN 数随 N 从 ~50.6→~63.6，+26%）。
+- **对照**（同表，脚本计算）：index_only（Φ 纯算术，无 memcpy）1749→1750（**+0%**，扁平）；gbn_long64（连续 64KB memcpy）1026→1186（**+16%**）。
+- **诊断**：剩余 +49% 增长来自 64KB memcpy 的缓存局部性（源环 128KB→5MB 跨 L2→L3），SR-64 再叠加离散访问惩罚；位图扫描 O(span/64) 可忽略（index_only 扁平佐证），**非算法退化**。
+- **旧版对比**：位图快路径前 sr_64 增长 **+972%**（1389→14886）；位图快路径压降 **13.2×**、固定 K 再压降 25 个百分点，sr_64@5120 降至 1668 ns。
+- **处置**：+74% 中的 ~26 pp 为抽样缺陷（非算法），#35 已剥离并如实披露（见 #22）；剩余 +49% 为真实的 memcpy 缓存局部性，**保留现状、如实报告，未改基准/未改口径**。完整诊断见 `out/exp1b_lookup/exp1b_analysis_data.md` 关键结论第 5 条。
+
+### #35 固定重传报文数 — 5 验收门（**全过**，2026-09-20）
+
+运行命令：`make build/exp1b_lookup && taskset -c 0 ./build/exp1b_lookup`；原始输出（控制台 GATE1..GATE5）：
+
+```
+[GATE2 same-K] PASS: gbn_long64 pkts_per_op=64 sr_64 pkts_per_op=64 (=64)
+[GATE3 unique] PASS: gbn_long64/gbn_short8/sr_16/sr_64 各 N 全 16384/16384 ops 通过（4 模式 × 7 N = 28 条 PASS，0 条 FAIL）
+[GATE1 fixed-pkt] PASS: 全方法 Σ交付字节 == n_ops×reps×K×payload（index_only 无 payload 豁免；392 条 PASS，0 条 FAIL）
+[GATE4 floor]     PASS: floor(B=512)=0.195 ns/op vs 最快 op p50=24.655 ns -> 0.793% (阈值 ≤2%)
+[GATE5 self-consistency] PASS: index_only sr_64 1749→1750 (+0.1% 扁平)；psn_dynblock_adaptive 1122→1668 (+48.7% < 旧版 +74%)
+验收硬门：exit code = 0（无 FAIL）
+```
+
+- **GATE1 固定包数门**：Σ交付字节 == `n_ops×reps×K×payload`，逐 (method,sort_impl,mode,N) 校验（7 方法 × 2 sort_impl × 4 模式 × 7 N = 392 格），0 条 FAIL；index_only 为 Φ 纯算术对照（无 payload memcpy、delivered=0）豁免。
+- **GATE2 同 K 门**：gbn_long64 与 sr_64 的 pkts_per_op 均 = 64（配置 `e1b_gbn_long`/`e1b_sr_k2`）。
+- **GATE3 请求集唯一性门**：SR 查 K 个 PSN 互异、GBN 查 start+K-1 不越界，4 模式 × 7 N = 28 全 16384/16384 通过、0 条 FAIL。
+- **GATE4 地板门**：空批地板 0.195 ns/op ≤ 最快 op（index_only p50=24.655 ns）的 0.793%（阈值 1–2%）。
+- **GATE5 自洽门**：index_only sr_64 扁平（+0.1% < 5%）；psn_dynblock_adaptive sr_64 增长 +48.7% 明显小于旧版 +74%。
 
 ---
 

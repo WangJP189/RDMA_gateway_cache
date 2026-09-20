@@ -24,14 +24,23 @@
  *     tree 中序遍历零排序、dynblock 位置映射零排序扫槽；升序成本已含在计时内。
  *   （原 reorder∈{0,1} 维度因第 4B 升序契约上移到 retrieve_set 内而废止，不再单列。）
  *
+ * 负载口径（第 35 条，2026-09-20 修正「固定重传报文数」）：
+ *   - 每个操作（一次重传）恰好 K 个**互不相同**的报文，K 与 N 无关（K 由配置给定：8/16/64）。
+ *   - GBN（连续）＝ K 个连续 PSN（start .. start+K-1）；SR（离散）＝ K 个离散互不相同 PSN（部分 Fisher–Yates 无放回）。
+ *   - 原实现 SR 为「有放回抽样」，重复 PSN 被位图折叠 ⇒ 实际搬运包数随 N 变化（N=128≈50.6 vs N=5120≈63.6，差 26%），
+ *     在「N 曲线」里混入假增长；本次改无放回，消除该偏差。
+ *   - 前置守卫：N ≥ K（最小 N=128 ≥ 64）；GBN 分支 N-K+1 > 0。
+ *
  * 计时口径：
  *   - 计时单位 = 一次 retrieve_range / retrieve_set（定位 + memcpy 全过程，即一次 GBN/SR 重传
  *     的完整开销；SR 升序交付成本已含在 retrieve_set 内——fifo/hash qsort、tree/dynblock 零排序）；
- *     per-op ns = (t1-t0)/B。
- *   - 主指标 p50，次指标 p90；p99 仅 CSV 留痕（实机尾部干净，p99 备查）。
+ *     per-op ns = (t1-t0)/B。**报告量 = 每批次（K 个报文）的完整提取时间（ns/batch），不除以 K。**
+ *   - 主指标 p50（=batch_p50_ns），次指标 p90；p99 仅 CSV 留痕（实机尾部干净，p99 备查）。
  *   - n_cmp：内部诊断（retrieve 前清零、批后累计，报「每次取包平均比较次数」）；退出正文——主/次指标
  *     只用 p50/p90，n_cmp 不进 RESULTS.md/图/论文（n_cmp.csv 仍落盘留痕）；交付排序不计 n_cmp。
  *   - 空批地板：floor ∝ 1/B，同时测 B=512 与 B=32（xval）。
+ *   - CSV 新列（第 35 条）：pkts_per_op=K（审计「K 不随 N 变」）、ring_bytes=N×stride（dynblock 占用面积，
+ *     非 dynblock=0）、main_metric=batch_p50_ns（语义标注 p50_ns 为每批次）。
  *
  * 编译：make build/exp1b_lookup && ./build/exp1b_lookup [--out=DIR]
  * 产物：<out>/lookup_summary.csv + <out>/n_cmp.csv + <out>/resolved_config.json
@@ -96,20 +105,60 @@ typedef struct {
     int         is_set;  /* 1 = SR(retrieve_set)，0 = GBN(retrieve_range) */
 } e1b_mode_t;
 
-/* ---- 查询序列预生成（RNG 不进计时区间；同一 (N, mode) 跨方法复用 ⇒ 公平） ---- */
+/* ---- 查询序列预生成（RNG 不进计时区间；同一 (N, mode) 跨方法复用 ⇒ 公平） ----
+ * 第 35 条修正：每个操作恰好 K 个互不相同的 PSN（SR 无放回，部分 Fisher–Yates；GBN K 个连续）。 */
 static void gen_queries(uint32_t *q, const e1b_mode_t *m, uint32_t N,
                         uint32_t n_ops, uint32_t seed) {
     xorshift32_t rng; xorshift32_seed(&rng, seed);
     uint32_t count = m->count, stride = m->is_set ? count : 1u;
     if (m->is_set) {
-        for (uint32_t i = 0; i < n_ops; i++)
-            for (uint32_t k = 0; k < count; k++)
-                q[(size_t)i * stride + k] = xorshift32_next(&rng) % N;
+        /* SR：部分 Fisher–Yates 无放回抽样 K 个互不相同 PSN（全部落在 [0,N)）。
+         * idx 恒等初始化一次；每操作做 K 次交换抽取后逆序撤销，恢复恒等 ⇒ 操作间独立。 */
+        uint32_t *idx = (uint32_t *)malloc((size_t)N * sizeof(uint32_t));
+        uint32_t *js  = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
+        if (!idx || !js) { fprintf(stderr, "[exp1b] OOM query idx\n"); exit(1); }
+        for (uint32_t i = 0; i < N; i++) idx[i] = i;
+        for (uint32_t i = 0; i < n_ops; i++) {
+            for (uint32_t k = 0; k < count; k++) {
+                uint32_t j = k + xorshift32_next(&rng) % (N - k);
+                uint32_t t = idx[k]; idx[k] = idx[j]; idx[j] = t;
+                js[k] = j;
+                q[(size_t)i * stride + k] = idx[k];
+            }
+            for (uint32_t k = count; k-- > 0;) {   /* 逆序撤销 K 次交换，恢复恒等 */
+                uint32_t t = idx[k]; idx[k] = idx[js[k]]; idx[js[k]] = t;
+            }
+        }
+        free(idx); free(js);
     } else {
-        uint32_t span = N - count + 1u;   /* start ∈ [0, N-count] */
+        /* GBN：start ∈ [0, N-K]，K 个连续 PSN = start .. start+K-1（retrieve_range 自然升序） */
+        uint32_t span = N - count + 1u;
         for (uint32_t i = 0; i < n_ops; i++)
             q[i] = xorshift32_next(&rng) % span;
     }
+}
+
+/* ---- 请求集唯一性门（第 35 条 T4.3）：对每个操作的 K 个 PSN 计数，必须 == K（无重复）。
+ * 返回违规操作数（0 = 全部通过）。SR 查 K 个互异；GBN 查 start+count-1 不越界（连续性由构造保证）。 */
+static uint32_t validate_queries(const uint32_t *q, const e1b_mode_t *m, uint32_t N,
+                                 uint32_t n_ops) {
+    uint32_t count = m->count, bad = 0;
+    if (m->is_set) {
+        uint32_t seen[64];
+        for (uint32_t i = 0; i < n_ops; i++) {
+            uint32_t ns = 0; int dup = 0;
+            for (uint32_t k = 0; k < count && !dup; k++) {
+                uint32_t v = q[(size_t)i * count + k];
+                for (uint32_t s = 0; s < ns; s++) if (seen[s] == v) { dup = 1; break; }
+                seen[ns++] = v;
+            }
+            if (dup) bad++;
+        }
+    } else {
+        for (uint32_t i = 0; i < n_ops; i++)
+            if (q[i] + count > N) bad++;   /* start+count-1 越界（K 个连续 PSN 必须落在 [0,N)） */
+    }
+    return bad;
 }
 
 /* ---- retrieve 批量计时 + n_cmp：每批 B 次操作夹一对 rdtsc；n_cmp 批前清零、批后累计 ----
@@ -117,10 +166,11 @@ static void gen_queries(uint32_t *q, const e1b_mode_t *m, uint32_t N,
 static size_t time_retrieve(b_cache_t *c, const e1b_mode_t *m, const uint32_t *q,
                             uint32_t B, uint32_t n_batches, uint32_t reps,
                             uint8_t *out, uint32_t out_cap,
-                            double *samples, uint64_t *total_cmp) {
+                            double *samples, uint64_t *total_cmp,
+                            uint64_t *delivered_bytes) {
     size_t idx = 0;
     uint64_t cmp = 0;
-    uint32_t wsum = 0;
+    uint64_t wsum = 0;
     uint32_t count = m->count, stride = m->is_set ? count : 1u;
     for (uint32_t r = 0; r < reps; r++) {
         for (uint32_t b = 0; b < n_batches; b++) {
@@ -139,8 +189,9 @@ static size_t time_retrieve(b_cache_t *c, const e1b_mode_t *m, const uint32_t *q
             cmp += c->n_cmp;
         }
     }
-    g_sink ^= (uint64_t)wsum ^ (uint64_t)(out[0] + out[out_cap - 1]);   /* 抗 DCE */
+    g_sink ^= wsum ^ (uint64_t)(out[0] + out[out_cap - 1]);   /* 抗 DCE */
     *total_cmp = cmp;
+    *delivered_bytes = wsum;
     return idx;
 }
 
@@ -187,6 +238,22 @@ int main(int argc, char **argv) {
     };
     const uint32_t N_MODES = sizeof(modes) / sizeof(modes[0]);
 
+    /* ---- 第 35 条验收门状态 ---- */
+    int    gate_fail = 0;                    /* 硬门（T4.1 固定包数 / T4.2 同 K / T4.3 唯一性）任一 FAIL 置 1 */
+    double min_p50  = 1e18;                  /* 全矩阵最小 p50（T4.4 地板门对照） */
+    double idx_sr64_128 = 0, idx_sr64_5120 = 0;   /* T4.5 自洽：index_only sr_64 p50 @ 128/5120（sort_impl=0） */
+    double psn_sr64_128 = 0, psn_sr64_5120 = 0;   /* T4.5 自洽：psn_dynblock_adaptive sr_64 p50 @ 128/5120 */
+
+    /* T4.2 同 K 门：gbn_long64 与 sr_64 的 pkts_per_op 必须都 = 64 */
+    if (cfg.e1b_gbn_long != 64u || cfg.e1b_sr_k2 != 64u) {
+        fprintf(stderr, "[GATE2 same-K] FAIL: gbn_long64=%u sr_64=%u (均须=64)\n",
+                cfg.e1b_gbn_long, cfg.e1b_sr_k2);
+        gate_fail = 1;
+    } else {
+        printf("[GATE2 same-K] PASS: gbn_long64 pkts_per_op=%u sr_64 pkts_per_op=%u (=64)\n",
+               cfg.e1b_gbn_long, cfg.e1b_sr_k2);
+    }
+
     uint32_t max_count = 0;
     for (uint32_t mm = 0; mm < N_MODES; mm++)
         if (modes[mm].count > max_count) max_count = modes[mm].count;
@@ -224,7 +291,10 @@ int main(int argc, char **argv) {
     fprintf(f, "# p50=主指标 p90=次指标; p99 仅留痕(实机尾部干净, p99 备查)\n");
     fprintf(f, "# floor(空批,读钟/B): B=%u median=%.3f ns/op; B=%u(xval) median=%.3f ns/op\n",
             B, floor_main, Bx, floor_xval);
-    fprintf(f, "method,sort_impl,mode,N,payload,B,n_batches,reps,mean_ns,std_ns,p50_ns,p90_ns,p99_ns\n");
+    fprintf(f, "# 第 35 条口径：pkts_per_op=K（每个操作固定 K 个重传报文；SR=K 个互异 PSN、GBN=K 个连续 PSN，K 在所有 N 下恒定）\n");
+    fprintf(f, "# ring_bytes=dynblock 占用面积=N×stride(S)（stride=align16(S)，24B 头不计）；非 dynblock 方法=0（无环缓冲）\n");
+    fprintf(f, "# main_metric=batch_p50_ns（每批固定 K 个报文的 retrieve 摊到单批的 p50，即「每批固定 K 个报文」口径）\n");
+    fprintf(f, "method,sort_impl,mode,N,pkts_per_op,ring_bytes,payload,B,n_batches,reps,mean_ns,std_ns,p50_ns,p90_ns,p99_ns,main_metric\n");
 
     fprintf(fc, "# exp1b n_cmp: retrieve 比较次数(纯取包比较; retrieve 前清零、批后累计)\n");
     fprintf(fc, "# mean_cmp_per_pkt = total_cmp / (n_ops*reps*count); FIFO=O(N)~N/2; tree=O(log N); hash~O(1); dynblock/index_only=0(Φ纯算术)\n");
@@ -244,6 +314,19 @@ int main(int argc, char **argv) {
             uint32_t *q = (uint32_t *)malloc((size_t)n_ops * stride * sizeof(uint32_t));
             if (!q) { fprintf(stderr, "[exp1b] OOM query\n"); return 1; }
             gen_queries(q, m, N, n_ops, cfg.seed + N * 1009u + mm * 917u + 1u);
+
+            /* T4.3 请求集唯一性门：每个操作的 K 个 PSN 无重复（SR）/ start+count-1 不越界（GBN） */
+            {
+                uint32_t bad = validate_queries(q, m, N, n_ops);
+                if (bad) {
+                    fprintf(stderr, "[GATE3 unique] FAIL: %s N=%u %u/%u ops 违规\n",
+                            m->name, N, bad, n_ops);
+                    gate_fail = 1;
+                } else {
+                    printf("[GATE3 unique] PASS: %s N=%u %u/%u ops 全通过\n",
+                           m->name, N, n_ops - bad, n_ops);
+                }
+            }
 
             for (uint32_t mi = 0; mi < N_METHODS; mi++) {
                 const method_t *mt = &METHODS[mi];
@@ -277,8 +360,9 @@ int main(int argc, char **argv) {
                     /* retrieve_set 按第 4B 升序契约交付（排序在接口内），每 (method,sort_impl,mode,N) 测一次 */
                     {
                         uint64_t total_cmp = 0;
+                        uint64_t delivered = 0;
                         size_t ns = time_retrieve(c, m, q, B, n_batches, reps, out, out_cap,
-                                                  samples, &total_cmp);
+                                                  samples, &total_cmp, &delivered);
 
                         double mean = mean_dbl(samples, ns);
                         double std  = std_dbl(samples, ns, mean);
@@ -286,9 +370,41 @@ int main(int argc, char **argv) {
                         double p90  = pct_dbl(samples, ns, 90.0);
                         double p99  = pct_dbl(samples, ns, 99.0);
 
-                        fprintf(f, "%s,%u,%s,%u,%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                                mt->name, si, m->name, N, pl, B, n_batches, reps,
-                                mean, std, p50, p90, p99);
+                        /* ring_bytes：dynblock 占用面积 = N × stride(S)（stride=align16(S)，24B 头不计）；非 dynblock=0 */
+                        uint32_t S = dynblock_cur_S(c);
+                        uint32_t ring_bytes = (S > 0) ? (N * stride_of(S)) : 0u;
+
+                        /* T4.1 固定包数门：Σ交付字节 == n_ops×reps×K×payload（K 恒定 ⇒ 排除变包数假增长）。
+                         * index_only 为 Φ 纯算术对照（len=0、无 payload memcpy），delivered=0 属设计使然，豁免本门。 */
+                        uint64_t expect = (uint64_t)n_ops * reps * m->count * pl;
+                        int is_index_only = (strcmp(mt->name, "index_only") == 0);
+                        if (!is_index_only && delivered != expect) {
+                            fprintf(stderr, "[GATE1 fixed-pkt] FAIL: %s si=%u %s N=%u delivered=%llu expect=%llu\n",
+                                    mt->name, si, m->name, N,
+                                    (unsigned long long)delivered, (unsigned long long)expect);
+                            gate_fail = 1;
+                        } else {
+                            printf("[GATE1 fixed-pkt] PASS: %s si=%u %s N=%u delivered=%llu%s\n",
+                                   mt->name, si, m->name, N, (unsigned long long)delivered,
+                                   is_index_only ? "（index_only 无 payload，豁免）" : " == K×payload");
+                        }
+
+                        if (p50 < min_p50) min_p50 = p50;
+
+                        /* T4.5 自洽门取样：sr_64 sort_impl=0 下 index_only / psn_dynblock_adaptive 的 p50 @ N=128/5120 */
+                        if (si == 0 && strcmp(m->name, "sr_64") == 0) {
+                            if (strcmp(mt->name, "index_only") == 0) {
+                                if (N == 128)  idx_sr64_128  = p50;
+                                if (N == 5120) idx_sr64_5120 = p50;
+                            } else if (strcmp(mt->name, "psn_dynblock_adaptive") == 0) {
+                                if (N == 128)  psn_sr64_128  = p50;
+                                if (N == 5120) psn_sr64_5120 = p50;
+                            }
+                        }
+
+                        fprintf(f, "%s,%u,%s,%u,%u,%u,%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%s\n",
+                                mt->name, si, m->name, N, m->count, ring_bytes, pl, B, n_batches, reps,
+                                mean, std, p50, p90, p99, "batch_p50_ns");
 
                         uint64_t total_pkts  = (uint64_t)n_ops * reps * m->count;
                         double   cmp_per_pkt = (total_pkts > 0) ? (double)total_cmp / (double)total_pkts : 0.0;
@@ -308,7 +424,31 @@ int main(int argc, char **argv) {
     }
 
     fclose(f); fclose(fc);
+
+    /* ---- T4.4 地板门：空批地板 ≤ 最快 op 的 1–2%（读钟摊销已从信号剥离） ---- */
+    if (min_p50 < 1e17) {
+        double ratio = floor_main / min_p50 * 100.0;
+        printf("[GATE4 floor] floor(B=%u)=%.3f ns/op vs 最快 op p50=%.3f ns -> %.3f%% %s (阈值 ≤2%%)\n",
+               B, floor_main, min_p50, ratio, (ratio <= 2.0) ? "PASS" : "WARN");
+    }
+
+    /* ---- T4.5 结果自洽门：index_only 平坦；SR-64 增长应明显 < 旧版 +74%（消除变包数假增长后） ---- */
+    if (idx_sr64_128 > 0 && idx_sr64_5120 > 0 && psn_sr64_128 > 0 && psn_sr64_5120 > 0) {
+        double idx_g = (idx_sr64_5120 - idx_sr64_128) / idx_sr64_128 * 100.0;
+        double psn_g = (psn_sr64_5120 - psn_sr64_128) / psn_sr64_128 * 100.0;
+        printf("[GATE5 self-consistency] sr_64 N=128->5120: index_only %.3f->%.3f (%.1f%%) ; "
+               "psn_dynblock_adaptive %.3f->%.3f (%.1f%%, 旧版 +74%%)\n",
+               idx_sr64_128, idx_sr64_5120, idx_g, psn_sr64_128, psn_sr64_5120, psn_g);
+        printf("   index_only 平坦(增长<5%%): %s ; psn 增长明显小于旧版 +74%%: %s\n",
+               (idx_g < 5.0) ? "是" : "否（见下诊断，如实报告）",
+               (psn_g < 74.0) ? "是" : "否（如实报告，不改口径）");
+    }
+
     free(out); free(samples); free(fs);
+    if (gate_fail) {
+        fprintf(stderr, "exp1b_lookup: 验收硬门 FAIL（见上 GATE1/2/3），退出非 0\n");
+        return 1;
+    }
     printf("exp1b_lookup done -> %s/lookup_summary.csv + %s/n_cmp.csv\n", cfg.out_dir, cfg.out_dir);
     return 0;
 }
