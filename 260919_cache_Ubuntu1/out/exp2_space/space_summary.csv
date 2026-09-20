@@ -1,0 +1,32 @@
+# exp2 space utilization (utilization = payload_bytes / allocated_bytes). N=4096 full window
+# methods: fifo_bounded / chained_hash_bounded / balanced_tree_bounded / psn_dynblock(elastic) / ring_fixed(S=4096)
+# psn_dynblock elastic S=ceil_class(pl)=pl (5 MTU tiers exact); ring_fixed S=4096; block_S=0 for non-dynblock
+# allocated_bytes = cache_footprint_bytes (pool + index/buckets + meta, sizeof measured); utilization is fraction 0..1
+# overhead_per_pkt (B) = (allocated_bytes - payload_bytes) / N：每驻留包分摊的空间开销
+# lower_bound_util = pl / (align16(pl) + sizeof(slot_meta_t))：位置槽理想利用率上界（仅对齐填充+12B meta，无索引/桶/FIFO 指针），方法无关
+method,payload,N,block_S,payload_bytes,allocated_bytes,utilization,overhead_per_pkt,lower_bound_util
+fifo_bounded,256,4096,0,1048576,1179648,0.888889,32.000,0.955224
+chained_hash_bounded,256,4096,0,1048576,1343488,0.780488,72.000,0.955224
+balanced_tree_bounded,256,4096,0,1048576,1310720,0.800000,64.000,0.955224
+psn_dynblock,256,4096,256,1048576,1110832,0.943956,15.199,0.955224
+ring_fixed,256,4096,4096,1048576,16839472,0.062269,3855.199,0.955224
+fifo_bounded,512,4096,0,2097152,2228224,0.941176,32.000,0.977099
+chained_hash_bounded,512,4096,0,2097152,2392064,0.876712,72.000,0.977099
+balanced_tree_bounded,512,4096,0,2097152,2359296,0.888889,64.000,0.977099
+psn_dynblock,512,4096,512,2097152,2159408,0.971170,15.199,0.977099
+ring_fixed,512,4096,4096,2097152,16839472,0.124538,3599.199,0.977099
+fifo_bounded,1024,4096,0,4194304,4325376,0.969697,32.000,0.988417
+chained_hash_bounded,1024,4096,0,4194304,4489216,0.934307,72.000,0.988417
+balanced_tree_bounded,1024,4096,0,4194304,4456448,0.941176,64.000,0.988417
+psn_dynblock,1024,4096,1024,4194304,4256560,0.985374,15.199,0.988417
+ring_fixed,1024,4096,4096,4194304,16839472,0.249076,3087.199,0.988417
+fifo_bounded,2048,4096,0,8388608,8519680,0.984615,32.000,0.994175
+chained_hash_bounded,2048,4096,0,8388608,8683520,0.966038,72.000,0.994175
+balanced_tree_bounded,2048,4096,0,8388608,8650752,0.969697,64.000,0.994175
+psn_dynblock,2048,4096,2048,8388608,8450864,0.992633,15.199,0.994175
+ring_fixed,2048,4096,4096,8388608,16839472,0.498151,2063.199,0.994175
+fifo_bounded,4096,4096,0,16777216,16908288,0.992248,32.000,0.997079
+chained_hash_bounded,4096,4096,0,16777216,17072128,0.982726,72.000,0.997079
+balanced_tree_bounded,4096,4096,0,16777216,17039360,0.984615,64.000,0.997079
+psn_dynblock,4096,4096,4096,16777216,16839472,0.996303,15.199,0.997079
+ring_fixed,4096,4096,4096,16777216,16839472,0.996303,15.199,0.997079

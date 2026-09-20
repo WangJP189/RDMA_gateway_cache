@@ -1,0 +1,13 @@
+# exp2_tail sensitivity: packet size (1-f)@MTU + f@U[1,MTU]. N=4096 MTU=4096 (full window)
+# f scanned from e2_tail_frac_list (n=7); xorshift32 seed = 0x12345678 + frac_index (deterministic)
+# elastic S pinned at MTU by the (1-f) MTU packets -> no grow/shrink, no overflow, no drop
+# utilization = payload_bytes / allocated_bytes; allocated = cache_footprint_bytes (sizeof measured)
+# overhead_per_pkt (B) = (allocated_bytes - payload_bytes) / N
+f,final_S,payload_bytes,allocated_bytes,utilization,overhead_per_pkt,n_ovf_ins,n_drop,n_resize
+0.00,4096,16777216,16839472,0.996303,15.199,0,0,0
+0.01,4096,16702699,16839472,0.991878,33.392,0,0,0
+0.03,4096,16502428,16839472,0.979985,82.286,0,0,0
+0.06,4096,16264505,16839472,0.965856,140.373,0,0,0
+0.10,4096,15973261,16839472,0.948561,211.477,0,0,0
+0.20,4096,15123261,16839472,0.898084,418.997,0,0,0
+0.30,4096,14174454,16839472,0.841740,650.639,0,0,0

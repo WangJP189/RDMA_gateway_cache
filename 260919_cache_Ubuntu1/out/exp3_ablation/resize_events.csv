@@ -1,0 +1,10 @@
+epoch,S_old,S_new,reason,moved_pkts,resize_ns,drain_ns
+1,4096,256,shrink,0,2326,0
+17,256,512,overflow_grow,819,2281,95811
+33,512,1024,overflow_grow,819,2864,194461
+49,1024,2048,overflow_grow,819,1405,367695
+65,2048,4096,overflow_grow,819,1058,746476
+97,4096,2048,shrink,0,3504,0
+113,2048,1024,shrink,0,2960,0
+129,1024,512,shrink,0,2178,0
+145,512,256,shrink,0,1115,0

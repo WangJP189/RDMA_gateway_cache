@@ -1,0 +1,30 @@
+# exp2 space utilization (utilization = payload_bytes / allocated_bytes). N=4096 full window
+# methods: fifo_bounded / chained_hash_bounded / balanced_tree_bounded / psn_dynblock(elastic) / psn_dynblock_fixed(S=4096)
+# psn_dynblock elastic S=ceil_class(pl)=pl (5 MTU tiers exact); fixed S=4096; block_S=0 for non-dynblock
+# allocated_bytes = cache_footprint_bytes (pool + index/buckets + meta, sizeof measured); utilization is fraction 0..1
+method,payload,N,block_S,payload_bytes,allocated_bytes,utilization
+fifo_bounded,256,4096,0,1048576,1179648,0.888889
+chained_hash_bounded,256,4096,0,1048576,1343488,0.780488
+balanced_tree_bounded,256,4096,0,1048576,1310720,0.800000
+psn_dynblock,256,4096,256,1048576,1110832,0.943956
+psn_dynblock_fixed,256,4096,4096,1048576,16839472,0.062269
+fifo_bounded,512,4096,0,2097152,2228224,0.941176
+chained_hash_bounded,512,4096,0,2097152,2392064,0.876712
+balanced_tree_bounded,512,4096,0,2097152,2359296,0.888889
+psn_dynblock,512,4096,512,2097152,2159408,0.971170
+psn_dynblock_fixed,512,4096,4096,2097152,16839472,0.124538
+fifo_bounded,1024,4096,0,4194304,4325376,0.969697
+chained_hash_bounded,1024,4096,0,4194304,4489216,0.934307
+balanced_tree_bounded,1024,4096,0,4194304,4456448,0.941176
+psn_dynblock,1024,4096,1024,4194304,4256560,0.985374
+psn_dynblock_fixed,1024,4096,4096,4194304,16839472,0.249076
+fifo_bounded,2048,4096,0,8388608,8519680,0.984615
+chained_hash_bounded,2048,4096,0,8388608,8683520,0.966038
+balanced_tree_bounded,2048,4096,0,8388608,8650752,0.969697
+psn_dynblock,2048,4096,2048,8388608,8450864,0.992633
+psn_dynblock_fixed,2048,4096,4096,8388608,16839472,0.498151
+fifo_bounded,4096,4096,0,16777216,16908288,0.992248
+chained_hash_bounded,4096,4096,0,16777216,17072128,0.982726
+balanced_tree_bounded,4096,4096,0,16777216,17039360,0.984615
+psn_dynblock,4096,4096,4096,16777216,16839472,0.996303
+psn_dynblock_fixed,4096,4096,4096,16777216,16839472,0.996303

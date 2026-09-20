@@ -1,0 +1,2 @@
+n_store,n_lookup,n_resize,n_drain,n_evict,n_drop,n_ovf_ins,n_ooo_drop,nak_n,hit,miss,bytes_retrans
+659456,5288973,9,3276,655360,0,3280,0,12834,13325,0,21405440
